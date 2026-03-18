@@ -286,6 +286,66 @@ def _precompute_image_embeddings(
 
 
 # ---------------------------------------------------------------------------
+# Segmentation PyTorch Dataset
+# ---------------------------------------------------------------------------
+
+class SegmentationPyTorchDataset(torch.utils.data.Dataset):
+    """
+    PyTorch Dataset for semantic segmentation tasks.
+
+    Each sample yields an ``(image, mask)`` pair where both tensors share
+    the same spatial dimensions.  Augmentation (random flip/rotate) is
+    applied synchronously to both image and mask when ``apply_augmentation``
+    is ``True``.
+
+    Parameters
+    ----------
+    image_paths : list[str]
+        Absolute paths to RGB input images.
+    mask_paths : list[str]
+        Absolute paths to single-channel label masks (pixel values = class
+        indices).
+    preprocessor : SegmentationPreprocessor
+        Callable that resizes + normalises image/mask pairs.
+    apply_augmentation : bool
+        When ``True``, ``preprocessor.augment()`` is called before the
+        deterministic resize/normalise pipeline.
+    """
+
+    def __init__(
+        self,
+        image_paths: List[str],
+        mask_paths: List[str],
+        preprocessor,
+        apply_augmentation: bool = False,
+    ) -> None:
+        if len(image_paths) != len(mask_paths):
+            raise ValueError(
+                f"SegmentationPyTorchDataset: image/mask count mismatch "
+                f"({len(image_paths)} vs {len(mask_paths)})"
+            )
+        self._image_paths = image_paths
+        self._mask_paths = mask_paths
+        self._preprocessor = preprocessor
+        self._augment = apply_augmentation
+
+    def __len__(self) -> int:
+        return len(self._image_paths)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        from PIL import Image as PILImage
+
+        img = PILImage.open(self._image_paths[idx]).convert("RGB")
+        msk = PILImage.open(self._mask_paths[idx]).convert("L")
+
+        if self._augment and hasattr(self._preprocessor, "augment"):
+            img, msk = self._preprocessor.augment(img, msk)
+
+        img_tensor, msk_tensor = self._preprocessor(img, msk)
+        return {"image": img_tensor, "target": msk_tensor}
+
+
+# ---------------------------------------------------------------------------
 # Out-of-core streaming dataset for 100 GB+ datasets
 # ---------------------------------------------------------------------------
 
@@ -924,6 +984,101 @@ class TrainingOrchestrator:
                 y_raw = y_raw[valid_idx].reset_index(drop=True)
                 feature_df = feature_df[valid_idx].reset_index(drop=True)
 
+            # ── Segmentation early-exit: skip target encoding entirely ──
+            if problem_type == "segmentation":
+                from preprocessing.image_preprocessor import SegmentationPreprocessor
+                from data_ingestion.loader import LazySegmentationDataset
+
+                # Collect mask columns from schema
+                all_mask_cols: set = set()
+                for ds_entry in schema_info.get("per_dataset", [{}]):
+                    detected = ds_entry.get("detected_columns", {})
+                    all_mask_cols.update(detected.get("mask", []))
+
+                mask_col = target_col  # schema_detector sets target to mask column
+                image_col = None
+                for ds_entry in schema_info.get("per_dataset", [{}]):
+                    detected = ds_entry.get("detected_columns", {})
+                    img_candidates = detected.get("image", [])
+                    if img_candidates:
+                        image_col = img_candidates[0]
+                        break
+
+                if image_col is None:
+                    # Try directory-convention datasets
+                    seg_dataset = None
+                    for name in self.dataset_registry.list_datasets():
+                        ds = self.dataset_registry.get(name)
+                        if isinstance(ds, LazySegmentationDataset):
+                            seg_dataset = ds
+                            break
+                    if seg_dataset is None:
+                        raise RuntimeError(
+                            "Phase 3 (segmentation): no image column or "
+                            "LazySegmentationDataset found."
+                        )
+                    image_paths = seg_dataset._image_paths
+                    mask_paths = seg_dataset._mask_paths
+                else:
+                    image_paths = feature_df[image_col].tolist()
+                    mask_paths = full_df[mask_col].tolist()
+
+                # Auto-detect num_classes from a sample of mask pixel values
+                from PIL import Image as PILImage
+                _sample_classes: set = set()
+                for mp in mask_paths[:min(50, len(mask_paths))]:
+                    try:
+                        m = PILImage.open(mp).convert("L")
+                        _sample_classes.update(set(np.array(m).flatten()))
+                    except Exception:
+                        pass
+                seg_num_classes = max(len(_sample_classes), 2)
+                self.config.seg_num_classes = seg_num_classes
+                logger.info(
+                    "  Segmentation: %d images, %d masks, %d classes detected",
+                    len(image_paths), len(mask_paths), seg_num_classes,
+                )
+
+                seg_size = (self.config.seg_input_size, self.config.seg_input_size)
+                seg_prep = SegmentationPreprocessor(target_size=seg_size)
+                self.fitted_transformers["seg_preprocessor"] = seg_prep
+
+                self.train_torch_dataset = SegmentationPyTorchDataset(
+                    image_paths=image_paths,
+                    mask_paths=mask_paths,
+                    preprocessor=seg_prep,
+                    apply_augmentation=True,
+                )
+                self.val_torch_dataset = SegmentationPyTorchDataset(
+                    image_paths=image_paths,
+                    mask_paths=mask_paths,
+                    preprocessor=seg_prep,
+                    apply_augmentation=False,
+                )
+                self.torch_dataset = self.val_torch_dataset
+
+                elapsed = time.time() - phase_start
+                results: Dict[str, Any] = {
+                    "preprocessing_stages": [{"stage": "segmentation_preprocessing", "status": "success"}],
+                    "total_samples": len(image_paths),
+                    "output_shapes": {"image": f"(N, 3, {seg_size[0]}, {seg_size[1]})", "mask": f"(N, {seg_size[0]}, {seg_size[1]})"},
+                    "target_column": mask_col,
+                    "problem_type": problem_type,
+                    "seg_num_classes": seg_num_classes,
+                    "text_columns": [],
+                    "image_columns": [image_col] if image_col else [],
+                    "tabular_columns": [],
+                    "duration_seconds": elapsed,
+                }
+                logger.info("\nPhase 3 Summary (segmentation):")
+                logger.info("  Samples  : %d", len(image_paths))
+                logger.info("  Classes  : %d", seg_num_classes)
+                logger.info("  Duration : %.2fs", elapsed)
+
+                self.phase_results[Phase.PREPROCESSING] = results
+                self.current_phase = Phase.MODEL_SELECTION
+                return
+
             if problem_type == "multilabel_classification":
                 # Target values are dict-like strings, e.g. "{'NORM': 100.0, 'SR': 0.0}"
                 # Parse into multi-hot float vectors.
@@ -1240,7 +1395,8 @@ class TrainingOrchestrator:
             raise
     
     def _execute_phase_5_training(self, hp_overrides: Optional[Dict[str, Any]] = None,
-                                    progress_callback: Optional[Any] = None) -> None:
+                                    progress_callback: Optional[Any] = None,
+                                    n_trials: Optional[int] = None) -> None:
         """
         Phase 5: GPU Training – Optuna HPO study with MLflow tracking.
 
@@ -1275,7 +1431,7 @@ class TrainingOrchestrator:
         logger.info("PHASE 5: GPU TRAINING (Optuna + MLflow + Lightning)")
         logger.info("=" * 80)
 
-        N_TRIALS: int = 3       # keep low for interactive use; raise for production
+        N_TRIALS: int = n_trials if n_trials is not None else 10
         VAL_SPLIT: float = 0.2
 
         # When hp_overrides are provided, skip HPO and do a single run
@@ -1302,6 +1458,21 @@ class TrainingOrchestrator:
                     "Phase 5 requires self.torch_dataset from Phase 3. "
                     "Run _execute_phase_3_preprocessing() first."
                 )
+
+            # ----------------------------------------------------------------
+            # 1b  Segmentation fast path
+            # ----------------------------------------------------------------
+            schema_info_early: Dict[str, Any] = self.phase_results.get(
+                Phase.SCHEMA_DETECTION, {}
+            )
+            if schema_info_early.get("global_problem_type") == "segmentation":
+                self._train_segmentation(
+                    hp_overrides=hp_overrides,
+                    progress_callback=progress_callback,
+                    n_trials=N_TRIALS,
+                    phase_start=phase_start,
+                )
+                return
 
             # ----------------------------------------------------------------
             # 2  Derive input_dims from fitted tabular transformer
@@ -1496,6 +1667,7 @@ class TrainingOrchestrator:
             _jit_result = _jit_selector.select(
                 modalities=schema_info.get("global_modalities", self.config.modalities),
                 device=self.device if self.device.type == "cuda" else None,
+                tabular_tier=model_sel.get("tabular_encoder"),
             )
 
             _image_encoder = _jit_result.image_encoder
@@ -1547,17 +1719,23 @@ class TrainingOrchestrator:
             # val only because training images go through random augmentation.
             if _text_encoder is not None and hasattr(_aug_ds, '_text_cols') and _aug_ds._text_cols:
                 logger.info("  Pre-computing text embeddings (%d samples)...", n_total)
+                if progress_callback is not None:
+                    progress_callback.add_message(5, "info", "Pre-computing text embeddings (cached for all trials)...")
                 _precomputed_text = _precompute_text_embeddings(
                     _clean_ds, _text_encoder, self.device, batch_size=batch_size,
                 )
                 _aug_ds._precomputed_text = _precomputed_text
                 _clean_ds._precomputed_text = _precomputed_text
                 logger.info("  Text embeddings cached: shape=%s", list(_precomputed_text.shape))
+                if progress_callback is not None:
+                    progress_callback.add_message(5, "detail", f"Text embeddings cached: {_precomputed_text.shape[0]} samples")
             else:
                 _precomputed_text = None
 
             if _image_encoder is not None and hasattr(_clean_ds, '_image_cols') and _clean_ds._image_cols:
                 logger.info("  Pre-computing image embeddings for val (%d samples)...", n_total)
+                if progress_callback is not None:
+                    progress_callback.add_message(5, "info", "Pre-computing val image embeddings (cached)...")
                 _precomputed_image_val = _precompute_image_embeddings(
                     _clean_ds, _image_encoder, self.device, batch_size=batch_size,
                 )
@@ -1566,6 +1744,8 @@ class TrainingOrchestrator:
                 # Val images: cached (deterministic preprocessing only)
                 _clean_ds._precomputed_image = _precomputed_image_val
                 logger.info("  Image embeddings cached (val only): shape=%s", list(_precomputed_image_val.shape))
+                if progress_callback is not None:
+                    progress_callback.add_message(5, "detail", f"Image embeddings cached (val only): {_precomputed_image_val.shape[0]} samples")
 
             def _sample(trial: optuna.Trial, key: str, default: Any) -> Any:
                 """Sample a value from hpo_space or return the default."""
@@ -1589,6 +1769,8 @@ class TrainingOrchestrator:
             _best_val: List[float] = [float("inf")]
             _best_module_ref: List[Any] = []
             _best_metrics: Dict[str, float] = {"val_acc": 0.0, "val_f1": 0.0, "train_acc": 0.0}
+            _best_actual_epochs: List[int] = [0]
+            _best_stop_reason: List[str] = ["completed"]
 
             def objective(trial: optuna.Trial) -> float:
                 # Report trial number to progress callback
@@ -1600,13 +1782,13 @@ class TrainingOrchestrator:
                     trial_lr      = hp_overrides.get("learning_rate", model_sel.get("learning_rate", 1e-3))
                     trial_wd      = hp_overrides.get("weight_decay", 1e-5)
                     trial_dropout = hp_overrides.get("dropout", 0.1)
-                    trial_epochs  = hp_overrides.get("epochs", model_sel.get("epochs", 10))
+                    trial_epochs  = hp_overrides.get("epochs", model_sel.get("max_epochs", 20))
                     trial_fusion  = hp_overrides.get("fusion_strategy", model_sel.get("fusion_strategy", "concatenation"))
                 else:
                     trial_lr      = _sample(trial, "learning_rate", model_sel.get("learning_rate", 1e-3))
                     trial_wd      = _sample(trial, "weight_decay",  1e-5)
                     trial_dropout = _sample(trial, "dropout",       0.1)
-                    trial_epochs  = _sample(trial, "epochs",        model_sel.get("epochs", 10))
+                    trial_epochs  = model_sel.get("max_epochs", 20)  # fixed ceiling; early stopping handles duration
                     trial_fusion  = _sample(trial, "fusion_strategy", model_sel.get("fusion_strategy", "concatenation"))
 
                 # Create a FRESH tabular encoder for this trial (trainable,
@@ -1639,6 +1821,8 @@ class TrainingOrchestrator:
                         """Forwards per-epoch metrics to the API progress tracker."""
                         def on_validation_epoch_end(self, trainer, pl_module):
                             m = trainer.callback_metrics
+                            if "train_loss" not in m:
+                                return  # skip sanity validation or incomplete epochs
                             progress_callback.log_epoch(
                                 trial=trial.number,
                                 epoch=trainer.current_epoch + 1,
@@ -1652,6 +1836,111 @@ class TrainingOrchestrator:
                             )
                     _pl_callbacks.append(_EpochReporter())
 
+                # SmartTrainingCallback: detects flatline, overfitting,
+                # underfitting, and convergence patterns.  Unlike EarlyStopping
+                # (which only monitors patience), this callback classifies WHY
+                # training stopped and can extend epochs for underfitting.
+                class _SmartTrainingCallback(pl.Callback):
+                    """Analyze training dynamics, trigger stops, and classify stop reason."""
+
+                    def __init__(self, max_epochs: int):
+                        self._history: List[Dict[str, float]] = []
+                        self._flatline_window = 6
+                        self._overfit_window = 5
+                        self._original_max_epochs = max_epochs
+                        self._extended = False
+                        self.detection_reason: Optional[str] = None
+
+                    def on_validation_epoch_end(self, trainer, pl_module):
+                        m = trainer.callback_metrics
+                        if "train_loss" not in m:
+                            return  # skip incomplete epochs
+                        self._history.append({
+                            "train_loss": float(m.get("train_loss", 0)),
+                            "val_loss": float(m.get("val_loss", 0)),
+                        })
+
+                        if len(self._history) < 3:
+                            return
+
+                        recent_val = [h["val_loss"] for h in self._history[-self._flatline_window:]]
+                        recent_train = [h["train_loss"] for h in self._history[-self._overfit_window:]]
+                        recent_val_ov = [h["val_loss"] for h in self._history[-self._overfit_window:]]
+
+                        # FLATLINE: val_loss barely moved over the window
+                        if len(recent_val) >= self._flatline_window:
+                            val_range = max(recent_val) - min(recent_val)
+                            val_mean = abs(sum(recent_val) / len(recent_val)) or 1e-8
+                            if val_range < 0.01 * val_mean:
+                                self.detection_reason = "flatline"
+                                trainer.should_stop = True
+                                if progress_callback is not None:
+                                    progress_callback.add_message(
+                                        5, "smart_stop",
+                                        f"Trial {trial.number + 1}: flatline detected — "
+                                        f"val_loss unchanged for {self._flatline_window} epochs",
+                                    )
+                                return
+
+                        # OVERFITTING: train_loss decreasing while val_loss increasing
+                        if len(recent_train) >= self._overfit_window:
+                            if recent_train[-1] < recent_train[0] and recent_val_ov[-1] > recent_val_ov[0]:
+                                self.detection_reason = "overfitting"
+                                trainer.should_stop = True
+                                if progress_callback is not None:
+                                    progress_callback.add_message(
+                                        5, "smart_stop",
+                                        f"Trial {trial.number + 1}: overfitting detected — "
+                                        f"train_loss↓ but val_loss↑ for {self._overfit_window} epochs",
+                                    )
+                                return
+
+                        # UNDERFITTING: after 40% of epochs, val_loss still near initial
+                        epochs_done = len(self._history)
+                        if (not self._extended
+                                and epochs_done >= int(0.4 * self._original_max_epochs)
+                                and self._history[0]["val_loss"] > 0):
+                            if self._history[-1]["val_loss"] > 0.95 * self._history[0]["val_loss"]:
+                                extended_max = min(
+                                    int(self._original_max_epochs * 1.5),
+                                    self._original_max_epochs * 2,
+                                )
+                                trainer.fit_loop.max_epochs = extended_max
+                                self._extended = True
+                                self.detection_reason = "underfitting_extended"
+                                if progress_callback is not None:
+                                    progress_callback.add_message(
+                                        5, "smart_stop",
+                                        f"Trial {trial.number + 1}: underfitting detected — "
+                                        f"extending epochs {self._original_max_epochs}→{extended_max}",
+                                    )
+                                return
+
+                        # CONVERGENCE: both losses stable and close together
+                        if len(self._history) >= 5:
+                            last_val = [h["val_loss"] for h in self._history[-5:]]
+                            last_train = [h["train_loss"] for h in self._history[-5:]]
+                            val_mean = abs(sum(last_val) / len(last_val)) or 1e-8
+                            train_mean = abs(sum(last_train) / len(last_train)) or 1e-8
+                            # Relative stability: range < 1% of mean
+                            val_stable = (max(last_val) - min(last_val)) < 0.01 * val_mean
+                            train_stable = (max(last_train) - min(last_train)) < 0.01 * train_mean
+                            # Relative gap: |val - train| < 5% of val mean
+                            gap_small = abs(last_val[-1] - last_train[-1]) < 0.05 * val_mean
+                            if val_stable and train_stable and gap_small:
+                                self.detection_reason = "converged"
+                                trainer.should_stop = True
+                                if progress_callback is not None:
+                                    progress_callback.add_message(
+                                        5, "smart_stop",
+                                        f"Trial {trial.number + 1}: converged — "
+                                        f"train/val loss stable and gap < 5% of val_loss",
+                                    )
+                                return
+
+                _smart_cb = _SmartTrainingCallback(max_epochs=trial_epochs)
+                _pl_callbacks.append(_smart_cb)
+
                 # EarlyStopping: halt training if val_loss stalls for 5 epochs.
                 # restore_best_weights via ModelCheckpoint is implicit — Lightning
                 # keeps the in-memory model at the last epoch, and we track the
@@ -1660,7 +1949,7 @@ class TrainingOrchestrator:
                 _pl_callbacks.append(_EarlyStopping(
                     monitor="val_loss",
                     mode="min",
-                    patience=5,
+                    patience=3,
                     verbose=False,
                 ))
 
@@ -1678,6 +1967,7 @@ class TrainingOrchestrator:
                     # AMP 16-bit mixed precision for GPU tensor core saturation;
                     # falls back to 32-bit on CPU where float16 is unsupported.
                     precision="16-mixed" if accelerator == "gpu" else "32-true",
+                    num_sanity_val_steps=0,
                     enable_checkpointing=False,
                     enable_progress_bar=False,
                     logger=False,
@@ -1709,6 +1999,22 @@ class TrainingOrchestrator:
                             trial_val_acc = float(cb_metrics.get("val_acc", 0))
                             trial_val_f1  = float(cb_metrics.get("val_f1", 0))
                             trial_train_acc = float(cb_metrics.get("train_acc", 0))
+
+                            # Capture actual epochs and stop reason
+                            actual_epochs = pl_trainer.current_epoch + 1
+                            if _smart_cb.detection_reason:
+                                stop_reason = _smart_cb.detection_reason
+                            elif actual_epochs < trial_epochs:
+                                stop_reason = "early_stopped"
+                            else:
+                                stop_reason = "completed"
+
+                            if progress_callback is not None:
+                                progress_callback.add_message(
+                                    5, "detail",
+                                    f"Trial {trial.number + 1}: {stop_reason} at epoch "
+                                    f"{actual_epochs}/{trial_epochs}",
+                                )
                         except optuna.exceptions.TrialPruned:
                             logger.info("  Trial %d PRUNED by Optuna", trial.number)
                             if progress_callback is not None:
@@ -1730,6 +2036,8 @@ class TrainingOrchestrator:
                         _best_metrics["val_acc"]   = trial_val_acc
                         _best_metrics["val_f1"]    = trial_val_f1
                         _best_metrics["train_acc"] = trial_train_acc
+                        _best_actual_epochs[0] = actual_epochs
+                        _best_stop_reason[0] = stop_reason
 
                     logger.info(
                         "  Trial %d: lr=%.2e  wd=%.2e  dropout=%.2f  "
@@ -1754,15 +2062,27 @@ class TrainingOrchestrator:
                         torch.cuda.empty_cache()
 
             with mlflow.start_run(run_name="phase5_optuna"):
-                # HyperbandPruner: aggressively prunes underperforming trials
-                # at intermediate epochs, saving GPU compute.
-                _pruner = optuna.pruners.HyperbandPruner(
-                    min_resource=1, max_resource=model_sel.get("epochs", 10),
-                    reduction_factor=3,
-                ) if N_TRIALS > 1 else optuna.pruners.NopPruner()
+                # Adaptive pruner selection based on trial count:
+                #   >= 20 trials → HyperbandPruner (aggressive rung-based SHA)
+                #   < 20 trials  → MedianPruner (robust with fewer candidates)
+                #   1 trial      → NopPruner (no pruning for manual HP runs)
+                if N_TRIALS <= 1:
+                    _pruner = optuna.pruners.NopPruner()
+                elif N_TRIALS >= 20:
+                    _pruner = optuna.pruners.HyperbandPruner(
+                        min_resource=1,
+                        max_resource=model_sel.get("max_epochs", 20),
+                        reduction_factor=3,
+                    )
+                else:
+                    _pruner = optuna.pruners.MedianPruner(
+                        n_startup_trials=3,
+                        n_warmup_steps=2,
+                    )
                 study = optuna.create_study(
                     direction="minimize",
                     pruner=_pruner,
+                    sampler=optuna.samplers.TPESampler(seed=42),
                 )
                 study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=False)
 
@@ -1800,6 +2120,8 @@ class TrainingOrchestrator:
                 "duration_seconds":  elapsed,
                 # Scalar defaults from Phase 4 (kept for Phase 6 / registry)
                 "epochs":            model_sel.get("epochs", 10),
+                "actual_epochs":     _best_actual_epochs[0],
+                "stop_reason":       _best_stop_reason[0],
                 "learning_rate":     model_sel.get("learning_rate", 1e-3),
                 # JIT encoder selection metadata
                 "encoder_selection": {
@@ -1810,7 +2132,9 @@ class TrainingOrchestrator:
                     "total_capacity": _jit_result.total_capacity,
                     "peak_memory_mb": round(_jit_result.total_peak_memory_bytes / 1e6, 2),
                     "vram_budget_mb": round(_jit_result.vram_budget_bytes / 1e6, 2),
+                    "vram_available_mb": round(_jit_result.vram_available_bytes / 1e6, 2),
                     "rationale": _jit_result.rationale,
+                    "per_encoder_profiles": _jit_result.per_encoder_profiles,
                 },
             }
 
@@ -1827,7 +2151,199 @@ class TrainingOrchestrator:
         except Exception as exc:
             logger.error("Phase 5 failed: %s", str(exc))
             raise
-    
+
+    # ------------------------------------------------------------------
+    # Segmentation training sub-routine (called from Phase 5)
+    # ------------------------------------------------------------------
+
+    def _train_segmentation(
+        self,
+        hp_overrides: Optional[Dict[str, Any]],
+        progress_callback: Optional[Any],
+        n_trials: int,
+        phase_start: float,
+    ) -> None:
+        """Segmentation-specific Phase 5: U-Net training with Optuna HPO."""
+        import optuna
+        import mlflow
+        import pytorch_lightning as pl
+        from torch.utils.data import DataLoader, Subset as _Subset
+        from automl.trainer import build_segmentation_trainer
+
+        p3 = self.phase_results.get(Phase.PREPROCESSING, {})
+        seg_num_classes = p3.get("seg_num_classes", self.config.seg_num_classes)
+        model_sel: Dict[str, Any] = self.phase_results.get(Phase.MODEL_SELECTION, {})
+        batch_size: int = model_sel.get("batch_size", 8)
+        hpo_space: Dict[str, Any] = model_sel.get("hpo_space", {})
+
+        _aug_ds = self.train_torch_dataset or self.torch_dataset
+        _clean_ds = self.val_torch_dataset or self.torch_dataset
+        n_total = len(_aug_ds)
+        VAL_SPLIT = 0.2
+        n_val = max(1, int(n_total * VAL_SPLIT))
+        n_train = n_total - n_val
+
+        perm = torch.randperm(
+            n_total,
+            generator=torch.Generator().manual_seed(self.config.seed),
+        ).tolist()
+        train_indices = perm[:n_train]
+        val_indices = perm[n_train:]
+
+        train_sub = _Subset(_aug_ds, train_indices)
+        val_sub = _Subset(_clean_ds, val_indices)
+        train_loader = DataLoader(
+            train_sub, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=torch.cuda.is_available(),
+        )
+        val_loader = DataLoader(
+            val_sub, batch_size=batch_size, shuffle=False,
+            num_workers=0, pin_memory=torch.cuda.is_available(),
+        )
+
+        logger.info("  Seg train=%d  val=%d  classes=%d  batch=%d",
+                     n_train, n_val, seg_num_classes, batch_size)
+
+        _best_val: List[float] = [float("inf")]
+        _best_module_ref: List[Any] = []
+        _best_metrics: Dict[str, float] = {"val_iou": 0.0}
+        _best_actual_epochs: List[int] = [0]
+
+        def _sample(trial: optuna.Trial, key: str, default: Any) -> Any:
+            spec = hpo_space.get(key)
+            if spec is None:
+                return default
+            t = spec.get("type")
+            if t == "int":
+                return trial.suggest_int(key, spec["low"], spec["high"])
+            if t == "float":
+                return trial.suggest_float(key, spec["low"], spec["high"], log=spec.get("log", False))
+            if t == "categorical":
+                return trial.suggest_categorical(key, spec["choices"])
+            return default
+
+        def objective(trial: optuna.Trial) -> float:
+            if progress_callback is not None:
+                progress_callback.set_trial(trial.number + 1, n_trials)
+
+            if hp_overrides:
+                trial_lr = hp_overrides.get("learning_rate", 1e-3)
+                trial_wd = hp_overrides.get("weight_decay", 1e-5)
+                trial_epochs = hp_overrides.get("epochs", model_sel.get("max_epochs", 20))
+            else:
+                trial_lr = _sample(trial, "learning_rate", 1e-3)
+                trial_wd = _sample(trial, "weight_decay", 1e-5)
+                trial_epochs = model_sel.get("max_epochs", 20)
+
+            lightning_module = build_segmentation_trainer(
+                num_classes=seg_num_classes,
+                learning_rate=trial_lr,
+                weight_decay=trial_wd,
+                max_epochs=trial_epochs,
+                pretrained=True,
+                freeze_backbone=True,
+                input_size=self.config.seg_input_size,
+            )
+
+            _pl_callbacks = []
+            if progress_callback is not None:
+                class _EpochReporter(pl.Callback):
+                    def on_validation_epoch_end(self, trainer, pl_module):
+                        m = trainer.callback_metrics
+                        if "train_loss" not in m:
+                            return
+                        progress_callback.log_epoch(
+                            trial=trial.number,
+                            epoch=trainer.current_epoch + 1,
+                            max_epoch=trial_epochs,
+                            train_loss=float(m.get("train_loss", 0)),
+                            val_loss=float(m.get("val_loss", 0)),
+                            train_acc=float(m.get("train_iou", 0)),
+                            val_acc=float(m.get("val_iou", 0)),
+                            train_f1=0.0,
+                            val_f1=0.0,
+                        )
+                _pl_callbacks.append(_EpochReporter())
+
+            early_stop = pl.callbacks.EarlyStopping(
+                monitor="val_loss", patience=5, mode="min",
+            )
+            _pl_callbacks.append(early_stop)
+
+            trainer = pl.Trainer(
+                max_epochs=trial_epochs,
+                accelerator="gpu" if torch.cuda.is_available() else "cpu",
+                devices=1,
+                enable_checkpointing=False,
+                enable_progress_bar=False,
+                callbacks=_pl_callbacks,
+                logger=False,
+            )
+
+            with mlflow.start_run(nested=True):
+                mlflow.log_params({
+                    "learning_rate": trial_lr,
+                    "weight_decay": trial_wd,
+                    "num_classes": seg_num_classes,
+                    "problem_type": "segmentation",
+                })
+                try:
+                    trainer.fit(lightning_module, train_loader, val_loader)
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    import gc; gc.collect()
+
+                best_val = trainer.callback_metrics.get("val_loss", torch.tensor(float("inf")))
+                best_val = float(best_val)
+                mlflow.log_metric("val_loss", best_val)
+
+                val_iou = float(trainer.callback_metrics.get("val_iou", 0))
+                mlflow.log_metric("val_iou", val_iou)
+
+            if best_val < _best_val[0]:
+                _best_val[0] = best_val
+                _best_module_ref.clear()
+                _best_module_ref.append(lightning_module)
+                _best_metrics["val_iou"] = val_iou
+                _best_actual_epochs[0] = trainer.current_epoch + 1
+
+            return best_val
+
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=n_trials)
+
+        best = study.best_trial
+        best_val_loss = best.value
+
+        if _best_module_ref:
+            self.best_lightning_module = _best_module_ref[0]
+        else:
+            self.best_lightning_module = None
+
+        elapsed = time.time() - phase_start
+        results: Dict[str, Any] = {
+            "status": "success",
+            "problem_type": "segmentation",
+            "seg_num_classes": seg_num_classes,
+            "n_trials": n_trials,
+            "best_trial_number": best.number,
+            "best_val_loss": best_val_loss,
+            "best_val_iou": _best_metrics.get("val_iou", 0.0),
+            "best_params": best.params,
+            "actual_epochs": _best_actual_epochs[0],
+            "duration_seconds": elapsed,
+        }
+
+        logger.info("\nPhase 5 Summary (segmentation):")
+        logger.info("  Best val_loss : %.4f", best_val_loss)
+        logger.info("  Best val_iou  : %.4f", _best_metrics.get("val_iou", 0.0))
+        logger.info("  Actual epochs : %d", _best_actual_epochs[0])
+        logger.info("  Duration      : %.2fs", elapsed)
+
+        self.phase_results[Phase.TRAINING] = results
+        self.current_phase = Phase.DRIFT_DETECTION
+
     def _execute_phase_6_drift_detection(self) -> None:
         """
         Phase 6: Drift Detection – compute KS, PSI, and FDD (MMD) statistics.
@@ -1901,6 +2417,12 @@ class TrainingOrchestrator:
 
             ref_array = _to_numeric_array(ref_frames)
             prod_array = _to_numeric_array(prod_frames)
+
+            # Snapshot reference distribution for prediction-time drift checks
+            if ref_array.shape[0] > 0:
+                self._drift_ref_snapshot = ref_array[:5000].copy()
+            else:
+                self._drift_ref_snapshot = None
 
             # ----------------------------------------------------------------
             # 3  Derive feature names from tabular preprocessor (best-effort)
@@ -2210,6 +2732,38 @@ class TrainingOrchestrator:
                 logger.warning("  Schema save FAILED: %s", exc)
 
             # ----------------------------------------------------------------
+            # 5b  Drift reference snapshot (for /predict/drift-check)
+            # ----------------------------------------------------------------
+            drift_ref = getattr(self, "_drift_ref_snapshot", None)
+            if drift_ref is not None:
+                try:
+                    ref_save_path = artifacts_dir / "drift_reference.npy"
+                    np.save(str(ref_save_path), drift_ref)
+                    artifact_paths["drift_reference"] = str(ref_save_path)
+                    logger.info("  Drift ref saved: %s (%d rows)", ref_save_path, drift_ref.shape[0])
+                except Exception as exc:
+                    logger.warning("  Drift reference save FAILED: %s", exc)
+
+            # ----------------------------------------------------------------
+            # 5c  Segmentation config (num_classes, input_size, decoder)
+            # ----------------------------------------------------------------
+            p3 = self.phase_results.get(Phase.PREPROCESSING, {})
+            if p3.get("problem_type") == "segmentation":
+                seg_config = {
+                    "decoder": self.config.seg_decoder,
+                    "num_classes": p3.get("seg_num_classes", self.config.seg_num_classes),
+                    "input_size": self.config.seg_input_size,
+                }
+                seg_config_path = artifacts_dir / "seg_config.json"
+                try:
+                    with open(seg_config_path, "w", encoding="utf-8") as fh:
+                        json.dump(seg_config, fh, indent=2)
+                    artifact_paths["seg_config"] = str(seg_config_path)
+                    logger.info("  Seg config saved: %s", seg_config_path)
+                except Exception as exc:
+                    logger.warning("  Seg config save FAILED: %s", exc)
+
+            # ----------------------------------------------------------------
             # 6  Metadata JSON  (provenance + artifact paths)
             # ----------------------------------------------------------------
             created_at = datetime.now().isoformat()
@@ -2252,15 +2806,29 @@ class TrainingOrchestrator:
             raise
     
     def _summarize_all_phases(self) -> Dict[str, Any]:
-        """Create summary of all phases."""
+        """Create summary of all phases with key metrics for registry display."""
         summary = {}
+        # Keys to carry forward from TRAINING phase for model details display
+        _training_keys = {
+            "best_val_loss", "best_val_acc", "best_val_f1", "best_train_acc",
+            "n_trials", "n_pruned", "n_complete", "batch_size", "problem_type",
+            "num_classes", "actual_epochs", "stop_reason", "epochs",
+            "best_params", "best_trial", "data_split", "encoder_selection",
+            "duration_seconds", "learning_rate",
+        }
         for phase in Phase:
             if phase in self.phase_results:
                 result = self.phase_results[phase]
-                summary[phase.name] = {
+                phase_summary: Dict[str, Any] = {
                     "duration_seconds": result.get("duration_seconds", 0),
-                    "status": "completed"
+                    "status": "completed",
                 }
+                # Carry forward detailed training metrics for model registry UI
+                if phase == Phase.TRAINING:
+                    for key in _training_keys:
+                        if key in result:
+                            phase_summary[key] = result[key]
+                summary[phase.name] = phase_summary
         return summary
     
     def _compile_results(self, total_elapsed: float) -> Dict[str, Any]:

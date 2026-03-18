@@ -75,6 +75,50 @@ class LazyImageDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Lazy segmentation dataset (paired image + mask)
+# ---------------------------------------------------------------------------
+
+class LazySegmentationDataset(Dataset):
+    """
+    PyTorch Dataset for segmentation: stores paired image/mask file paths.
+
+    Like ``LazyImageDataset``, pixels are read strictly inside ``__getitem__``.
+    Masks are loaded as single-channel images (class-index PNGs) — no RGB
+    conversion is applied so pixel values remain as integer class indices.
+
+    Args:
+        image_paths: Paths to input images.
+        mask_paths:  Paths to corresponding ground-truth masks (same order).
+    """
+
+    def __init__(
+        self,
+        image_paths: List[str],
+        mask_paths: List[str],
+    ) -> None:
+        if len(image_paths) != len(mask_paths):
+            raise ValueError(
+                f"image_paths ({len(image_paths)}) and mask_paths "
+                f"({len(mask_paths)}) must have the same length"
+            )
+        self._image_paths: List[str] = image_paths
+        self._mask_paths: List[str] = mask_paths
+
+    def __len__(self) -> int:
+        return len(self._image_paths)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        img_path = self._image_paths[idx]
+        msk_path = self._mask_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(msk_path).convert("L")  # single-channel grayscale
+        return {"image": image, "mask": mask, "path": img_path}
+
+    def __repr__(self) -> str:
+        return f"LazySegmentationDataset(n_pairs={len(self._image_paths)})"
+
+
+# ---------------------------------------------------------------------------
 # Internal helper: lazy tabular scan
 # ---------------------------------------------------------------------------
 
@@ -196,6 +240,31 @@ class DataLoader:
         # Only the first 500_000 paths are collected; for larger datasets
         # callers should use load_images() with an explicit manifest.
         import itertools
+
+        # Check for segmentation directory convention: images/ + masks/
+        images_dir = cache_path / "images"
+        masks_dir = cache_path / "masks"
+        if images_dir.is_dir() and masks_dir.is_dir():
+            img_map: Dict[str, Path] = {}
+            for p in itertools.chain(
+                images_dir.rglob("*.jpg"), images_dir.rglob("*.jpeg"),
+                images_dir.rglob("*.png"),
+            ):
+                img_map[p.stem] = p
+            msk_map: Dict[str, Path] = {}
+            for p in itertools.chain(
+                masks_dir.rglob("*.jpg"), masks_dir.rglob("*.jpeg"),
+                masks_dir.rglob("*.png"),
+            ):
+                msk_map[p.stem] = p
+            # Pair by filename stem
+            common_stems = sorted(set(img_map) & set(msk_map))
+            if common_stems:
+                return LazySegmentationDataset(
+                    image_paths=[str(img_map[s]) for s in common_stems],
+                    mask_paths=[str(msk_map[s]) for s in common_stems],
+                )
+
         image_iter = itertools.chain(
             cache_path.rglob("*.jpg"),
             cache_path.rglob("*.jpeg"),

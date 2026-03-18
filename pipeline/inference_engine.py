@@ -42,6 +42,27 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Lightweight vision encoder wrapper for inference (mirrors JIT selector)
+# ---------------------------------------------------------------------------
+
+class _InferenceVisionWrapper(nn.Module):
+    """Thin wrapper so non-ImageEncoder vision backbones share the same interface."""
+
+    def __init__(self, backbone: nn.Module, projection: nn.Module, output_dim: int) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.projection = projection
+        self._output_dim = output_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x)
+        return self.projection(features)
+
+    def get_output_dim(self) -> int:
+        return self._output_dim
+
+
+# ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
 
@@ -116,6 +137,7 @@ class MultimodalInferenceEngine:
 
         # Load frozen encoders for real multimodal inference
         self._text_encoder: Optional[nn.Module] = self._load_text_encoder()
+        self._image_encoder_name: str = "ResNet-50"  # updated by _load_image_encoder
         self._image_encoder: Optional[nn.Module] = self._load_image_encoder()
         self._image_preprocessor: Optional[Any] = None
         if self._image_encoder is not None:
@@ -139,6 +161,7 @@ class MultimodalInferenceEngine:
     def predict_batch(
         self,
         inputs: Union[List[Dict[str, Any]], pd.DataFrame],
+        threshold: float = 0.5,
     ) -> Dict[str, Any]:
         """
         Run batch inference under ``torch.no_grad()``.
@@ -161,52 +184,59 @@ class MultimodalInferenceEngine:
         batch: Dict[str, torch.Tensor] = self._build_batch(inputs)
         batch = {k: v.to(self.device) for k, v in batch.items()}
 
-        with torch.no_grad():
-            logits: torch.Tensor = self._head(batch)
+        try:
+            with torch.no_grad():
+                logits: torch.Tensor = self._head(batch)
 
-        predictions, confidences = self._decode_logits(logits)
+            predictions, confidences = self._decode_logits(logits, threshold=threshold)
 
-        # Apply inverse_transform to recover original label space
-        pred_list = predictions.tolist()
-        if self.target_encoder is not None:
-            try:
-                if (self.problem_type == "multilabel_classification"
-                        and isinstance(self.target_encoder, dict)
-                        and self.target_encoder.get("type") == "multilabel"):
-                    # Custom dict encoder: decode multi-hot to label lists
-                    all_labels = self.target_encoder["all_labels"]
-                    preds_np = predictions.numpy()
-                    pred_list = [
-                        [all_labels[i] for i in range(preds_np.shape[1])
-                         if preds_np[row, i] >= 1]
-                        for row in range(preds_np.shape[0])
-                    ]
-                elif hasattr(self.target_encoder, "inverse_transform"):
-                    if self.problem_type == "multilabel_classification":
-                        pred_list = self.target_encoder.inverse_transform(
-                            predictions.numpy()
-                        )
-                        pred_list = [list(row) for row in pred_list]
-                    elif (self.problem_type.startswith("classification")
-                          or self.problem_type == "classification_binary"):
-                        pred_list = self.target_encoder.inverse_transform(
-                            predictions.numpy()
-                        ).tolist()
-                    else:
-                        # StandardScaler: reshape for inverse_transform
-                        raw = predictions.numpy().reshape(-1, 1)
-                        pred_list = self.target_encoder.inverse_transform(
-                            raw
-                        ).ravel().tolist()
-            except Exception as exc:
-                logger.warning("target_encoder inverse_transform failed: %s", exc)
+            # Apply inverse_transform to recover original label space
+            pred_list = predictions.tolist()
+            if self.target_encoder is not None:
+                try:
+                    if (self.problem_type == "multilabel_classification"
+                            and isinstance(self.target_encoder, dict)
+                            and self.target_encoder.get("type") == "multilabel"):
+                        # Custom dict encoder: decode multi-hot to label lists
+                        all_labels = self.target_encoder["all_labels"]
+                        preds_np = predictions.numpy()
+                        pred_list = [
+                            [all_labels[i] for i in range(preds_np.shape[1])
+                             if preds_np[row, i] >= 1]
+                            for row in range(preds_np.shape[0])
+                        ]
+                    elif hasattr(self.target_encoder, "inverse_transform"):
+                        if self.problem_type == "multilabel_classification":
+                            pred_list = self.target_encoder.inverse_transform(
+                                predictions.numpy()
+                            )
+                            pred_list = [list(row) for row in pred_list]
+                        elif (self.problem_type.startswith("classification")
+                              or self.problem_type == "classification_binary"):
+                            pred_list = self.target_encoder.inverse_transform(
+                                predictions.numpy()
+                            ).tolist()
+                        else:
+                            # StandardScaler: reshape for inverse_transform
+                            raw = predictions.numpy().reshape(-1, 1)
+                            pred_list = self.target_encoder.inverse_transform(
+                                raw
+                            ).ravel().tolist()
+                except Exception as exc:
+                    logger.warning("target_encoder inverse_transform failed: %s", exc)
 
-        return {
-            "predictions":  pred_list,
-            "confidences":  confidences.tolist(),
-            "problem_type": self.problem_type,
-            "n_samples":    len(pred_list),
-        }
+            return {
+                "predictions":  pred_list,
+                "confidences":  confidences.tolist(),
+                "problem_type": self.problem_type,
+                "n_samples":    len(pred_list),
+            }
+        finally:
+            del batch
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------ #
     # Public API – explainability
@@ -217,9 +247,10 @@ class MultimodalInferenceEngine:
         inputs: Union[List[Dict[str, Any]], pd.DataFrame],
         target_class: int = 0,
         n_steps: int = 50,
+        method: str = "ig",
     ) -> Dict[str, Any]:
         """
-        Compute Captum IntegratedGradients attributions.
+        Compute Captum attributions using the selected method.
 
         Gradients are enabled only during this call; ``predict_batch`` is
         not affected.
@@ -229,17 +260,31 @@ class MultimodalInferenceEngine:
         inputs       : raw inputs (same format as ``predict_batch``).
         target_class : class index for attribution (ignored for regression).
         n_steps      : number of integration steps (higher = more accurate).
+        method       : attribution method — "ig", "gradient_shap", "saliency",
+                       "occlusion", "feature_ablation", or "smoothgrad".
 
         Returns
         -------
         dict with keys:
-            ``method``       – "IntegratedGradients"
-            ``target_class`` – int
-            ``tabular``      – dict | None
-            ``text``         – dict | None
+            ``method``             – display name of the attribution method
+            ``target_class``       – int
+            ``tabular``            – dict | None
+            ``text``               – dict | None
+            ``image``              – dict | None
+            ``attention``          – dict | None
+            ``convergence_delta``  – float | None (for IG/GradientShap)
         """
+        _METHOD_DISPLAY = {
+            "ig": "IntegratedGradients",
+            "gradient_shap": "GradientShap",
+            "saliency": "Saliency",
+            "occlusion": "Occlusion",
+            "feature_ablation": "FeatureAblation",
+            "smoothgrad": "SmoothGrad",
+        }
+
         try:
-            from captum.attr import IntegratedGradients
+            import captum.attr  # noqa: F401 – verify captum available
         except ImportError:
             raise ImportError(
                 "captum is required for XAI.  Install: pip install captum"
@@ -249,111 +294,201 @@ class MultimodalInferenceEngine:
         tabular_tensor: Optional[torch.Tensor] = batch.get("tabular")
 
         explanations: Dict[str, Any] = {
-            "method":       "IntegratedGradients",
+            "method":       _METHOD_DISPLAY.get(method, method),
             "target_class": target_class,
             "tabular":      None,
             "text":         None,
+            "image":        None,
+            "attention":    None,
         }
 
         if tabular_tensor is None:
-            logger.warning("generate_explanations: no tabular data – skipping IG")
+            logger.warning("generate_explanations: no tabular data – skipping tabular attribution")
             return explanations
 
-        # Float tensor that accepts gradients
-        tabular_ig: torch.Tensor = (
-            tabular_tensor.to(self.device).float().requires_grad_(True)
-        )
+        try:
+            # Float tensor that accepts gradients
+            tabular_ig: torch.Tensor = (
+                tabular_tensor.to(self.device).float().requires_grad_(True)
+            )
 
-        # Pre-build frozen tensors for non-tabular modalities so the head
-        # always receives its full expected input dict.  Use real encoder
-        # outputs when available for more accurate attributions.
-        frozen_extras: Dict[str, torch.Tensor] = {}
-        if "text_pooled" in self.input_dims:
-            if self._text_encoder is not None:
-                text_vals = self._extract_text_values(inputs)
-                if text_vals:
-                    while len(text_vals) < len(tabular_ig):
-                        text_vals.append("")
-                    with torch.no_grad():
-                        frozen_extras["text_pooled"] = (
-                            self._text_encoder(text_vals).to(self.device).detach()
+            # Pre-build frozen tensors for non-tabular modalities so the head
+            # always receives its full expected input dict.  Use real encoder
+            # outputs when available for more accurate attributions.
+            frozen_extras: Dict[str, torch.Tensor] = {}
+            if "text_pooled" in self.input_dims:
+                if self._text_encoder is not None:
+                    text_vals = self._extract_text_values(inputs)
+                    if text_vals:
+                        while len(text_vals) < len(tabular_ig):
+                            text_vals.append("")
+                        with torch.no_grad():
+                            frozen_extras["text_pooled"] = (
+                                self._text_encoder(text_vals).to(self.device).detach()
+                            )
+                    else:
+                        frozen_extras["text_pooled"] = torch.full(
+                            (len(tabular_ig), self.TEXT_DIM), 1e-7, device=self.device
                         )
                 else:
                     frozen_extras["text_pooled"] = torch.full(
                         (len(tabular_ig), self.TEXT_DIM), 1e-7, device=self.device
                     )
-            else:
-                frozen_extras["text_pooled"] = torch.full(
-                    (len(tabular_ig), self.TEXT_DIM), 1e-7, device=self.device
-                )
-        if "image_pooled" in self.input_dims:
-            image_tensor = self._extract_image_tensors(inputs)
-            if image_tensor is not None and self._image_encoder is not None:
-                with torch.no_grad():
-                    frozen_extras["image_pooled"] = (
-                        self._image_encoder(image_tensor.to(self.device)).detach()
+            if "image_pooled" in self.input_dims:
+                image_tensor = self._extract_image_tensors(inputs)
+                if image_tensor is not None and self._image_encoder is not None:
+                    with torch.no_grad():
+                        frozen_extras["image_pooled"] = (
+                            self._image_encoder(image_tensor.to(self.device)).detach()
+                        )
+                else:
+                    frozen_extras["image_pooled"] = torch.full(
+                        (len(tabular_ig), self.IMAGE_DIM), 1e-7, device=self.device
                     )
-            else:
-                frozen_extras["image_pooled"] = torch.full(
-                    (len(tabular_ig), self.IMAGE_DIM), 1e-7, device=self.device
+
+            # Captum forward: tabular tensor is the only differentiable input
+            def _forward_tabular(tab: torch.Tensor) -> torch.Tensor:
+                b: Dict[str, torch.Tensor] = {"tabular": tab}
+                b.update(frozen_extras)
+                out: torch.Tensor = self._head(b)
+                if self.problem_type == "classification_binary":
+                    return torch.sigmoid(out.squeeze(-1)).unsqueeze(-1)
+                if self.problem_type == "multilabel_classification":
+                    return torch.sigmoid(out)
+                if self.problem_type.startswith("classification"):
+                    return torch.softmax(out, dim=-1)
+                return out.squeeze(-1).unsqueeze(-1)
+
+            baseline = torch.zeros_like(tabular_ig)
+            tgt: Optional[int] = (
+                target_class
+                if self.problem_type.startswith("classification")
+                   or self.problem_type == "multilabel_classification"
+                else None
+            )
+
+            # Clamp target_class to valid range for the head's output layer
+            if tgt is not None:
+                try:
+                    head_out = self._head.output.out_features  # type: ignore[union-attr]
+                    if tgt < 0 or tgt >= head_out:
+                        logger.warning(
+                            "target_class %d out of range [0, %d); clamping to 0",
+                            tgt, head_out,
+                        )
+                        tgt = 0
+                except Exception:
+                    if tgt < 0:
+                        tgt = 0
+
+            try:
+                attr_method = self._create_tabular_attribution(method, _forward_tabular)
+
+                if method == "occlusion":
+                    attrs = attr_method.attribute(
+                        tabular_ig,
+                        sliding_window_shapes=(1,),
+                        target=tgt,
+                    )
+                elif method == "smoothgrad":
+                    attrs = attr_method.attribute(
+                        tabular_ig,
+                        baselines=baseline,
+                        target=tgt,
+                        n_steps=n_steps,
+                        nt_samples=5,
+                        nt_type="smoothgrad",
+                    )
+                elif method in ("ig", "gradient_shap"):
+                    result = attr_method.attribute(
+                        tabular_ig,
+                        baselines=baseline,
+                        target=tgt,
+                        n_steps=n_steps,
+                        return_convergence_delta=True,
+                    )
+                    if isinstance(result, tuple):
+                        attrs, convergence_delta = result
+                        explanations["convergence_delta"] = float(
+                            convergence_delta.mean().item()
+                        )
+                    else:
+                        attrs = result
+                elif method == "saliency":
+                    attrs = attr_method.attribute(tabular_ig, target=tgt)
+                elif method == "feature_ablation":
+                    attrs = attr_method.attribute(tabular_ig, target=tgt)
+                else:
+                    # Fallback to IG for unknown methods
+                    from captum.attr import IntegratedGradients
+                    attrs = IntegratedGradients(_forward_tabular).attribute(
+                        tabular_ig, baselines=baseline, target=tgt,
+                        n_steps=n_steps,
+                    )
+
+                attrs_np: np.ndarray = attrs.detach().cpu().numpy()
+                # Mean absolute attribution per feature across the batch
+                mean_attrs: List[float] = np.mean(np.abs(attrs_np), axis=0).tolist()
+                feature_names: List[str] = self._get_tabular_feature_names(
+                    tabular_ig.shape[1]
+                )
+                explanations["tabular"] = {
+                    "feature_names":    feature_names,
+                    "attributions":     mean_attrs,
+                    "raw_attributions": attrs_np.tolist(),
+                }
+            except Exception as exc:
+                logger.warning("Tabular %s attribution failed: %s", method, exc, exc_info=True)
+
+            # Text token attributions when tokenizer is loaded
+            if self.tokenizer is not None and "text_pooled" in self.input_dims:
+                text_vals: List[str] = self._extract_text_values(inputs)
+                if text_vals:
+                    explanations["text"] = self._token_attributions(
+                        text=text_vals[0],
+                        target_class=target_class,
+                        n_steps=n_steps,
+                        frozen_tabular=batch.get("tabular"),
+                    )
+
+            # Image saliency attribution
+            if self._image_encoder is not None and "image_pooled" in self.input_dims:
+                explanations["image"] = self._image_attributions(
+                    inputs, target_class=target_class, n_steps=n_steps,
                 )
 
-        # Captum forward: tabular tensor is the only differentiable input
-        def _forward_tabular(tab: torch.Tensor) -> torch.Tensor:
-            b: Dict[str, torch.Tensor] = {"tabular": tab}
-            b.update(frozen_extras)
-            out: torch.Tensor = self._head(b)
-            if self.problem_type == "classification_binary":
-                return torch.sigmoid(out.squeeze(-1)).unsqueeze(-1)
-            if self.problem_type == "multilabel_classification":
-                return torch.sigmoid(out)
-            if self.problem_type.startswith("classification"):
-                return torch.softmax(out, dim=-1)
-            return out.squeeze(-1).unsqueeze(-1)
+            # Attention weight visualization (AttentionFusion only)
+            explanations["attention"] = self._attention_weights(inputs)
 
-        ig = IntegratedGradients(_forward_tabular)
-        baseline = torch.zeros_like(tabular_ig)
-        tgt: Optional[int] = (
-            target_class
-            if self.problem_type.startswith("classification")
-               or self.problem_type == "multilabel_classification"
-            else None
-        )
+            # Build diagnostics for any NULL XAI outputs
+            diag: Dict[str, str] = {}
+            if explanations["tabular"] is None:
+                diag["tabular"] = "Attribution computation failed (see server logs)"
+            if explanations["text"] is None:
+                if self.tokenizer is None:
+                    diag["text"] = "No text tokenizer loaded for this model"
+                elif "text_pooled" not in self.input_dims:
+                    diag["text"] = "Text modality was not detected during training"
+                else:
+                    diag["text"] = "Text attribution computation returned no results"
+            if explanations["image"] is None:
+                if self._image_encoder is None:
+                    diag["image"] = "No image encoder loaded for this model"
+                elif "image_pooled" not in self.input_dims:
+                    diag["image"] = "Image modality was not detected during training"
+                else:
+                    diag["image"] = "Image attribution computation returned no results"
+            if explanations["attention"] is None:
+                diag["attention"] = "Model uses ConcatenationFusion (no attention weights)"
+            if diag:
+                explanations["diagnostics"] = diag
 
-        try:
-            attrs: torch.Tensor = ig.attribute(
-                tabular_ig,
-                baselines=baseline,
-                target=tgt,
-                n_steps=n_steps,
-                return_convergence_delta=False,
-            )
-            attrs_np: np.ndarray = attrs.detach().cpu().numpy()
-            # Mean absolute attribution per feature across the batch
-            mean_attrs: List[float] = np.mean(np.abs(attrs_np), axis=0).tolist()
-            feature_names: List[str] = self._get_tabular_feature_names(
-                tabular_ig.shape[1]
-            )
-            explanations["tabular"] = {
-                "feature_names":    feature_names,
-                "attributions":     mean_attrs,
-                "raw_attributions": attrs_np.tolist(),
-            }
-        except Exception as exc:
-            logger.warning("Tabular IG attribution failed: %s", exc)
-
-        # Approximate text token attributions when tokenizer is loaded
-        if self.tokenizer is not None and "text_pooled" in self.input_dims:
-            text_vals: List[str] = self._extract_text_values(inputs)
-            if text_vals:
-                explanations["text"] = self._token_attributions(
-                    text=text_vals[0],
-                    target_class=target_class,
-                    n_steps=n_steps,
-                    frozen_tabular=batch.get("tabular"),
-                )
-
-        return explanations
+            return explanations
+        finally:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------ #
     # Artifact loaders
@@ -491,7 +626,12 @@ class MultimodalInferenceEngine:
             return None
 
     def _load_image_encoder(self) -> Optional[nn.Module]:
-        """Load frozen ImageEncoder from saved state dict (no safe fallback)."""
+        """Load frozen image encoder from saved state dict.
+
+        Reads the actual encoder name from training metadata so the correct
+        architecture (ResNet-50, EfficientNet-B0, ViT-B-16, etc.) is loaded
+        instead of always defaulting to ResNet-50.
+        """
         if "image" not in self.modalities:
             return None
 
@@ -505,10 +645,16 @@ class MultimodalInferenceEngine:
             )
             return None
 
-        try:
-            from modelss.encoders.image import ImageEncoder
+        # Determine actual encoder name from training metadata
+        enc_name = "ResNet-50"  # default fallback
+        phases = self.metadata.get("phases_summary", {})
+        training = phases.get("TRAINING", {})
+        enc_sel = training.get("encoder_selection", {})
+        if enc_sel.get("image_encoder"):
+            enc_name = enc_sel["image_encoder"]
 
-            encoder = ImageEncoder(pretrained=True, freeze_backbone=True)
+        try:
+            encoder = self._create_image_encoder_by_name(enc_name)
             state_dict = torch.load(state_path, map_location="cpu", weights_only=True)
             encoder.load_state_dict(state_dict, strict=True)
 
@@ -517,12 +663,66 @@ class MultimodalInferenceEngine:
                 p.requires_grad = False
             encoder.to(self.device)
 
-            logger.info("ImageEncoder loaded from saved state dict")
+            self._image_encoder_name: str = enc_name
+            logger.info("ImageEncoder loaded: %s", enc_name)
             return encoder
 
         except Exception as exc:
-            logger.warning("Could not load ImageEncoder: %s", exc)
+            logger.warning("Could not load ImageEncoder '%s': %s", enc_name, exc)
             return None
+
+    def _create_image_encoder_by_name(self, name: str) -> nn.Module:
+        """Dispatch table for image encoder architectures."""
+        import torchvision.models as tv
+
+        if name == "ResNet-50":
+            from modelss.encoders.image import ImageEncoder
+            return ImageEncoder(pretrained=True, freeze_backbone=True)
+
+        if name == "MobileNetV3-Small":
+            try:
+                backbone = tv.mobilenet_v3_small(weights=tv.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+            except (TypeError, AttributeError):
+                backbone = tv.mobilenet_v3_small(pretrained=True)
+            in_features = backbone.classifier[-1].in_features
+            backbone.classifier = nn.Identity()
+            projection = nn.Sequential(nn.Linear(in_features, 512), nn.ReLU())
+            return _InferenceVisionWrapper(backbone, projection, 512)
+
+        if name == "EfficientNet-B0":
+            try:
+                backbone = tv.efficientnet_b0(weights=tv.EfficientNet_B0_Weights.IMAGENET1K_V1)
+            except (TypeError, AttributeError):
+                backbone = tv.efficientnet_b0(pretrained=True)
+            in_features = backbone.classifier[-1].in_features
+            backbone.classifier = nn.Identity()
+            projection = nn.Sequential(nn.Linear(in_features, 512), nn.ReLU())
+            return _InferenceVisionWrapper(backbone, projection, 512)
+
+        if name == "ConvNeXt-Tiny":
+            try:
+                backbone = tv.convnext_tiny(weights=tv.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+            except (TypeError, AttributeError):
+                backbone = tv.convnext_tiny(pretrained=True)
+            in_features = backbone.classifier[-1].in_features
+            backbone.classifier = nn.Identity()
+            projection = nn.Sequential(nn.Linear(in_features, 512), nn.ReLU())
+            return _InferenceVisionWrapper(backbone, projection, 512)
+
+        if name == "ViT-B-16":
+            try:
+                backbone = tv.vit_b_16(weights=tv.ViT_B_16_Weights.IMAGENET1K_V1)
+            except (TypeError, AttributeError):
+                backbone = tv.vit_b_16(pretrained=True)
+            in_features = backbone.heads[0].in_features
+            backbone.heads = nn.Identity()
+            projection = nn.Sequential(nn.Linear(in_features, 512), nn.ReLU())
+            return _InferenceVisionWrapper(backbone, projection, 512)
+
+        # Unknown encoder — fall back to ResNet-50
+        logger.warning("Unknown image encoder '%s', falling back to ResNet-50", name)
+        from modelss.encoders.image import ImageEncoder
+        return ImageEncoder(pretrained=True, freeze_backbone=True)
 
     def _load_head(self) -> Tuple[nn.Module, Dict[str, int]]:
         """
@@ -656,6 +856,7 @@ class MultimodalInferenceEngine:
         N = len(df)
 
         batch: Dict[str, torch.Tensor] = {}
+        self._last_warnings: List[str] = []
 
         # ── Tabular ─────────────────────────────────────────────────────
         if "tabular" in self.input_dims:
@@ -663,6 +864,30 @@ class MultimodalInferenceEngine:
                 self.tabular_prep, "_feature_names_in", None
             )
             if expected_cols is not None:
+                # Gather text/image columns so they are not flagged as "extra"
+                _schema_ds = self.schema.get("per_dataset", [{}])
+                _det = _schema_ds[0].get("detected_columns", {}) if _schema_ds else {}
+                _non_tabular: set = set(
+                    _det.get("text", [])
+                    + _det.get("image", [])
+                    + ["text", "report", "description", "content", "body",
+                       "image", "image_path", "img_path", "photo"]
+                )
+
+                # Track schema mismatches for caller visibility
+                missing_cols = [c for c in expected_cols if c not in df.columns]
+                extra_cols = [
+                    c for c in df.columns
+                    if c not in expected_cols and c not in _non_tabular
+                ]
+                if missing_cols:
+                    self._last_warnings.append(
+                        f"Missing columns (zero-filled): {missing_cols}"
+                    )
+                if extra_cols:
+                    self._last_warnings.append(
+                        f"Extra columns (ignored): {extra_cols}"
+                    )
                 # Zero-fill missing training columns; drop unrecognised ones
                 for col in expected_cols:
                     if col not in df.columns:
@@ -738,9 +963,15 @@ class MultimodalInferenceEngine:
     def _decode_logits(
         self,
         logits: torch.Tensor,
+        threshold: float = 0.5,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Convert raw model output tensors to (predictions, confidences).
+
+        Parameters
+        ----------
+        logits    : raw head output
+        threshold : decision boundary for binary / multilabel (default 0.5)
 
         Returns
         -------
@@ -749,11 +980,11 @@ class MultimodalInferenceEngine:
         """
         if self.problem_type == "classification_binary":
             probs = torch.sigmoid(logits.squeeze(-1))      # (N,)
-            preds = (probs >= 0.5).long()
+            preds = (probs >= threshold).long()
             confidences = torch.where(preds.bool(), probs, 1.0 - probs)
         elif self.problem_type == "multilabel_classification":
             probs = torch.sigmoid(logits)                  # (N, C)
-            preds = (probs >= 0.5).long()                  # (N, C) multi-hot
+            preds = (probs >= threshold).long()             # (N, C) multi-hot
             confidences = probs                            # (N, C) per-class conf
         elif self.problem_type.startswith("classification"):
             probs = torch.softmax(logits, dim=-1)          # (N, C)
@@ -796,12 +1027,19 @@ class MultimodalInferenceEngine:
         """
         Return feature names from the fitted ColumnTransformer if available,
         or generic ``feature_0 … feature_N-1`` labels otherwise.
+
+        When a tabular encoder (GRN/MLP) is present the encoded dimension
+        differs from the raw feature count, so use ``encoded_0 … encoded_N``.
         """
+        if self._tabular_encoder is not None:
+            return [f"encoded_{i}" for i in range(n_features)]
         if self.tabular_prep is not None:
             transformer = getattr(self.tabular_prep, "_transformer", None)
             if transformer is not None:
                 try:
-                    return list(transformer.get_feature_names_out())
+                    names = list(transformer.get_feature_names_out())
+                    if len(names) == n_features:
+                        return names
                 except Exception:
                     pass
         return [f"feature_{i}" for i in range(n_features)]
@@ -976,7 +1214,7 @@ class MultimodalInferenceEngine:
             }
 
         except Exception as exc:
-            logger.warning("Real BERT token attribution failed: %s", exc)
+            logger.warning("Real BERT token attribution failed: %s", exc, exc_info=True)
             return None
 
     # ------------------------------------------------------------------ #
@@ -1090,7 +1328,7 @@ class MultimodalInferenceEngine:
             }
 
         except Exception as exc:
-            logger.warning("Token attribution failed: %s", exc)
+            logger.warning("Token attribution failed: %s", exc, exc_info=True)
             return None
         finally:
             # Free the per-call simulated embedding layer from GPU
@@ -1151,22 +1389,563 @@ class MultimodalInferenceEngine:
         if col is None:
             return None
 
-        from PIL import Image as PILImage
-
         tensors: List[torch.Tensor] = []
-        for path_val in df[col]:
+        for img_val in df[col]:
             try:
-                pil_img = PILImage.open(str(path_val)).convert("RGB")
+                pil_img = self._resolve_image(img_val)
                 tensor = self._image_preprocessor.preprocess(pil_img)
                 tensors.append(tensor)
             except Exception as exc:
-                logger.warning("Image load failed for '%s': %s", path_val, exc)
+                logger.warning("Image load failed for input: %s", exc)
                 tensors.append(torch.zeros(3, 224, 224, dtype=torch.float32))
 
         return torch.stack(tensors) if tensors else None
 
     # ------------------------------------------------------------------ #
+    # Helper: resolve image from path, base64, or bytes
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _resolve_image(value: Any) -> "PILImage.Image":
+        """
+        Resolve an image value to a PIL Image.
+
+        Accepts:
+          - Raw ``bytes`` — opened directly via ``BytesIO``.
+          - A data-URI string (``data:image/...;base64,...``) — base64-decoded.
+          - A long string without path separators — attempted base64 decode.
+          - Anything else — treated as a filesystem path.
+        """
+        from PIL import Image as PILImage
+        import base64
+        import io
+
+        if isinstance(value, bytes):
+            return PILImage.open(io.BytesIO(value)).convert("RGB")
+
+        value_str = str(value)
+
+        # Handle data URI: "data:image/png;base64,iVBOR..."
+        if value_str.startswith("data:image"):
+            _, encoded = value_str.split(",", 1)
+            img_bytes = base64.b64decode(encoded)
+            return PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        # Heuristic: long string that doesn't look like a path → try base64
+        # Base64 alphabet includes '/' so we can't filter on path separators;
+        # instead check that the string doesn't start with common path prefixes.
+        _looks_like_path = (
+            value_str.startswith("/")
+            or value_str.startswith("\\")
+            or (len(value_str) > 1 and value_str[1] == ":")  # Windows drive
+            or value_str.startswith("./")
+            or value_str.startswith("../")
+        )
+        if len(value_str) > 200 and not _looks_like_path:
+            try:
+                img_bytes = base64.b64decode(value_str, validate=True)
+                return PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+            except Exception:
+                pass  # fall through to URL / file path
+
+        # URL: fetch image over HTTP(S)
+        if value_str.startswith("http://") or value_str.startswith("https://"):
+            import urllib.request
+            with urllib.request.urlopen(value_str, timeout=30) as resp:
+                img_bytes = resp.read()
+            return PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        # Default: filesystem path
+        return PILImage.open(value_str).convert("RGB")
+
+    # ------------------------------------------------------------------ #
+    # Multi-method attribution factory
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _create_tabular_attribution(method: str, forward_fn):
+        """Create a Captum attribution object for the given method."""
+        from captum.attr import (
+            IntegratedGradients,
+            GradientShap,
+            Saliency,
+            Occlusion,
+            FeatureAblation,
+            NoiseTunnel,
+        )
+
+        _dispatch = {
+            "ig":               lambda: IntegratedGradients(forward_fn),
+            "gradient_shap":    lambda: GradientShap(forward_fn),
+            "saliency":         lambda: Saliency(forward_fn),
+            "occlusion":        lambda: Occlusion(forward_fn),
+            "feature_ablation": lambda: FeatureAblation(forward_fn),
+            "smoothgrad":       lambda: NoiseTunnel(IntegratedGradients(forward_fn)),
+        }
+
+        factory = _dispatch.get(method)
+        if factory is None:
+            logger.warning("Unknown attribution method '%s', falling back to IG", method)
+            return IntegratedGradients(forward_fn)
+        return factory()
+
+    # ------------------------------------------------------------------ #
+    # Image saliency – GradCAM / IG fallback
+    # ------------------------------------------------------------------ #
+
+    def _get_gradcam_target_layer(self) -> Optional[nn.Module]:
+        """Return the last convolutional layer for GradCAM, or None for ViT."""
+        if self._image_encoder is None:
+            return None
+
+        name = getattr(self, "_image_encoder_name", "ResNet-50")
+        encoder = self._image_encoder
+
+        try:
+            if name == "ResNet-50":
+                # ImageEncoder wraps resnet50 — backbone.layer4[-1]
+                return encoder.backbone.layer4[-1]
+            if name in ("MobileNetV3-Small", "EfficientNet-B0", "ConvNeXt-Tiny"):
+                return encoder.backbone.features[-1]
+            if name == "ViT-B-16":
+                # ViT has no conv layers — GradCAM not applicable
+                return None
+        except (AttributeError, IndexError) as exc:
+            logger.warning("Could not resolve GradCAM layer for '%s': %s", name, exc)
+        return None
+
+    def _image_attributions(
+        self,
+        inputs: Union[List[Dict[str, Any]], pd.DataFrame],
+        target_class: int = 0,
+        n_steps: int = 50,
+    ) -> Optional[Dict[str, Any]]:
+        """Compute image saliency via GradCAM (preferred) or IG fallback."""
+        if self._image_encoder is None:
+            return None
+
+        image_tensor = self._extract_image_tensors(inputs)
+        if image_tensor is None:
+            return None
+
+        try:
+            img_input = image_tensor[:1].to(self.device).float().requires_grad_(True)
+
+            # Build forward function: image → encoder → fusion head → output
+            batch_base: Dict[str, torch.Tensor] = self._build_batch(inputs)
+
+            frozen_extras: Dict[str, torch.Tensor] = {}
+            if "tabular" in self.input_dims:
+                tab = batch_base.get("tabular")
+                frozen_extras["tabular"] = (
+                    tab[:1].to(self.device).float()
+                    if tab is not None
+                    else torch.full((1, self.input_dims["tabular"]), 1e-7, device=self.device)
+                )
+            if "text_pooled" in self.input_dims:
+                if self._text_encoder is not None:
+                    text_vals = self._extract_text_values(inputs)
+                    if text_vals:
+                        with torch.no_grad():
+                            frozen_extras["text_pooled"] = (
+                                self._text_encoder(text_vals[:1]).to(self.device).detach()
+                            )
+                    else:
+                        frozen_extras["text_pooled"] = torch.full(
+                            (1, self.TEXT_DIM), 1e-7, device=self.device
+                        )
+                else:
+                    frozen_extras["text_pooled"] = torch.full(
+                        (1, self.TEXT_DIM), 1e-7, device=self.device
+                    )
+
+            tgt: Optional[int] = (
+                target_class
+                if self.problem_type.startswith("classification")
+                   or self.problem_type == "multilabel_classification"
+                else None
+            )
+
+            def _forward_image(img: torch.Tensor) -> torch.Tensor:
+                pooled = self._image_encoder(img)
+                b: Dict[str, torch.Tensor] = {"image_pooled": pooled}
+                b.update(frozen_extras)
+                out = self._head(b)
+                if self.problem_type == "classification_binary":
+                    return torch.sigmoid(out.squeeze(-1)).unsqueeze(-1)
+                if self.problem_type == "multilabel_classification":
+                    return torch.sigmoid(out)
+                if self.problem_type.startswith("classification"):
+                    return torch.softmax(out, dim=-1)
+                return out.squeeze(-1).unsqueeze(-1)
+
+            # Try GradCAM first
+            gradcam_layer = self._get_gradcam_target_layer()
+            used_method = "GradCAM"
+
+            if gradcam_layer is not None:
+                try:
+                    from captum.attr import LayerGradCam
+
+                    gc_attr = LayerGradCam(_forward_image, gradcam_layer)
+                    attribution = gc_attr.attribute(img_input, target=tgt)
+
+                    # Upsample to input spatial dims
+                    saliency = torch.nn.functional.interpolate(
+                        attribution.abs(),
+                        size=(224, 224),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)  # (224, 224)
+
+                    saliency_b64 = self._saliency_to_base64(img_input[0], saliency)
+                    return {
+                        "saliency_base64": saliency_b64,
+                        "method": "GradCAM",
+                        "note": f"GradCAM saliency via {self._image_encoder_name}",
+                    }
+                except Exception as exc:
+                    logger.warning("GradCAM failed, falling back to IG: %s", exc)
+                    used_method = "IntegratedGradients"
+
+            # Fallback: IG on raw pixels
+            from captum.attr import IntegratedGradients
+
+            ig = IntegratedGradients(_forward_image)
+            attrs = ig.attribute(
+                img_input,
+                baselines=torch.zeros_like(img_input),
+                target=tgt,
+                n_steps=min(n_steps, 30),  # fewer steps for large image tensors
+            )
+            # Sum along channel dim → (224, 224)
+            saliency = attrs.detach().abs().squeeze(0).sum(dim=0)
+            saliency_b64 = self._saliency_to_base64(img_input[0], saliency)
+            return {
+                "saliency_base64": saliency_b64,
+                "method": used_method,
+                "note": f"Pixel-level IG saliency via {self._image_encoder_name}",
+            }
+
+        except Exception as exc:
+            logger.warning("Image attribution failed: %s", exc, exc_info=True)
+            return None
+
+    @staticmethod
+    def _saliency_to_base64(
+        original_image: torch.Tensor,
+        saliency: torch.Tensor,
+    ) -> str:
+        """Blend saliency heatmap with original image and return base64 PNG."""
+        import base64
+        import io
+
+        from PIL import Image as PILImage
+
+        # Normalize saliency to [0, 1]
+        sal_np = saliency.detach().cpu().float().numpy()
+        sal_min, sal_max = sal_np.min(), sal_np.max()
+        if sal_max - sal_min > 1e-8:
+            sal_np = (sal_np - sal_min) / (sal_max - sal_min)
+        else:
+            sal_np = np.zeros_like(sal_np)
+
+        # Apply jet colormap
+        try:
+            import matplotlib.cm as cm
+            heatmap_rgba = cm.jet(sal_np)  # (H, W, 4)
+            heatmap_rgb = (heatmap_rgba[:, :, :3] * 255).astype(np.uint8)
+        except ImportError:
+            # Fallback: simple red channel intensity
+            heatmap_rgb = np.zeros((*sal_np.shape, 3), dtype=np.uint8)
+            heatmap_rgb[:, :, 0] = (sal_np * 255).astype(np.uint8)
+
+        # Denormalize original image for blending
+        img_np = original_image.detach().cpu().float().numpy()  # (3, H, W)
+        img_np = np.transpose(img_np, (1, 2, 0))  # (H, W, 3)
+        # Reverse ImageNet normalization
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img_np = img_np * std + mean
+        img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+
+        # Resize heatmap to match image dims if needed
+        if heatmap_rgb.shape[:2] != img_np.shape[:2]:
+            heatmap_pil = PILImage.fromarray(heatmap_rgb).resize(
+                (img_np.shape[1], img_np.shape[0]),
+                PILImage.BILINEAR,
+            )
+            heatmap_rgb = np.array(heatmap_pil)
+
+        # Blend: 60% original + 40% heatmap
+        blended = (0.6 * img_np.astype(float) + 0.4 * heatmap_rgb.astype(float))
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+        # Encode to base64 PNG
+        pil_out = PILImage.fromarray(blended)
+        buf = io.BytesIO()
+        pil_out.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    # ------------------------------------------------------------------ #
+    # Attention weight extraction (no Captum dependency)
+    # ------------------------------------------------------------------ #
+
+    def _attention_weights(
+        self,
+        inputs: Union[List[Dict[str, Any]], pd.DataFrame],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract per-modality attention weights from AttentionFusion if used."""
+        try:
+            # Find AttentionFusion module inside the head
+            from modelss.fusion import AttentionFusion
+
+            fusion_module: Optional[AttentionFusion] = None
+            for module in self._head.modules():
+                if isinstance(module, AttentionFusion):
+                    fusion_module = module
+                    break
+
+            if fusion_module is None:
+                return None
+
+            # Build batch and get encoder outputs
+            batch = self._build_batch(inputs)
+
+            # Collect modality features in the same order as fusion expects
+            features: List[torch.Tensor] = []
+            modality_names: List[str] = []
+
+            # The head's input_dims ordering determines the feature order
+            for key in sorted(self.input_dims.keys()):
+                if key == "tabular":
+                    tab = batch.get("tabular")
+                    if tab is not None:
+                        features.append(tab[:1].to(self.device).float())
+                        modality_names.append("Tabular")
+                    else:
+                        features.append(
+                            torch.full((1, self.input_dims[key]), 1e-7, device=self.device)
+                        )
+                        modality_names.append("Tabular")
+                elif key == "image_pooled":
+                    if self._image_encoder is not None:
+                        img_tensor = self._extract_image_tensors(inputs)
+                        if img_tensor is not None:
+                            with torch.no_grad():
+                                pooled = self._image_encoder(img_tensor[:1].to(self.device))
+                            features.append(pooled)
+                        else:
+                            features.append(
+                                torch.full((1, self.IMAGE_DIM), 1e-7, device=self.device)
+                            )
+                    else:
+                        features.append(
+                            torch.full((1, self.IMAGE_DIM), 1e-7, device=self.device)
+                        )
+                    modality_names.append("Image")
+                elif key == "text_pooled":
+                    if self._text_encoder is not None:
+                        text_vals = self._extract_text_values(inputs)
+                        if text_vals:
+                            with torch.no_grad():
+                                pooled = self._text_encoder(text_vals[:1]).to(self.device)
+                            features.append(pooled)
+                        else:
+                            features.append(
+                                torch.full((1, self.TEXT_DIM), 1e-7, device=self.device)
+                            )
+                    else:
+                        features.append(
+                            torch.full((1, self.TEXT_DIM), 1e-7, device=self.device)
+                        )
+                    modality_names.append("Text")
+
+            if not features:
+                return None
+
+            # Run through AttentionFusion internals to extract weights
+            with torch.no_grad():
+                projected = [
+                    proj(feat.detach())
+                    for proj, feat in zip(fusion_module.projections, features)
+                ]
+                stacked = torch.stack(projected, dim=1)  # (1, n_mod, latent_dim)
+                scores = fusion_module.attention_scoring(stacked)  # (1, n_mod, 1)
+                weights = torch.softmax(scores, dim=1)  # (1, n_mod, 1)
+
+            weight_list = weights.squeeze(0).squeeze(-1).cpu().tolist()
+
+            return {
+                "modality_names": modality_names,
+                "weights": [round(w, 4) for w in weight_list],
+                "note": "Per-modality attention weights from the AttentionFusion layer.",
+            }
+
+        except Exception as exc:
+            logger.debug("Attention weight extraction failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------ #
     # Static: safe JSON loader
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _load_json(path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as exc:
+            logger.warning("JSON load failed for %s: %s", path, exc)
+            return {}
+
+
+# ---------------------------------------------------------------------------
+# Segmentation inference engine
+# ---------------------------------------------------------------------------
+
+
+class SegmentationInferenceEngine:
+    """
+    Load Phase-7 segmentation model artifacts and run per-pixel inference.
+
+    Artifacts consumed
+    ------------------
+    models/registry/{model_id}/artifacts/
+    ├── model_weights.pth   ← SegmentationModel state dict
+    ├── seg_config.json     ← {decoder, num_classes, input_size}
+    └── schema.json         ← GlobalSchema (problem_type == "segmentation")
+
+    ``predict_batch`` returns per-pixel class indices and (optionally) the
+    softmax probability map.
+    """
+
+    def __init__(self, model_id: str) -> None:
+        self.model_id = model_id
+        registry_root = Path("models") / "registry" / model_id
+        self.artifacts_dir = registry_root / "artifacts"
+
+        if not self.artifacts_dir.exists():
+            raise FileNotFoundError(
+                f"Segmentation model artifacts not found at {self.artifacts_dir}."
+            )
+
+        self.metadata: Dict[str, Any] = self._load_json(registry_root / "metadata.json")
+        self.schema: Dict[str, Any] = self._load_json(self.artifacts_dir / "schema.json")
+        self.seg_config: Dict[str, Any] = self._load_json(self.artifacts_dir / "seg_config.json")
+
+        self.problem_type = "segmentation"
+        self.num_classes: int = self.seg_config.get("num_classes", 2)
+        self.input_size: int = self.seg_config.get("input_size", 256)
+
+        # Build model and load weights
+        from modelss.decoders.unet import SegmentationModel
+
+        self._model = SegmentationModel(
+            num_classes=self.num_classes,
+            pretrained=False,
+            freeze_backbone=False,
+        )
+        weights_path = self.artifacts_dir / "model_weights.pth"
+        if weights_path.exists():
+            state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+            self._model.load_state_dict(state_dict)
+            logger.info("Segmentation model loaded: %s (%d classes)", model_id, self.num_classes)
+        else:
+            logger.warning("No model_weights.pth found for segmentation model %s", model_id)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._model.to(self.device)
+        self._model.eval()
+
+        # Preprocessor
+        from preprocessing.image_preprocessor import SegmentationPreprocessor
+        self._preprocessor = SegmentationPreprocessor(
+            target_size=(self.input_size, self.input_size)
+        )
+
+    # ------------------------------------------------------------------ #
+    # Prediction
+    # ------------------------------------------------------------------ #
+
+    def predict_batch(
+        self,
+        inputs: Any,
+        threshold: float = 0.5,
+    ) -> Dict[str, Any]:
+        """
+        Run segmentation inference on one or more images.
+
+        Parameters
+        ----------
+        inputs : list[dict] | pd.DataFrame
+            Each element must contain an ``"image_path"`` key pointing to
+            an image file, or an ``"image"`` key with a PIL Image.
+
+        Returns
+        -------
+        dict with keys:
+            ``predictions``  – list of 2D numpy arrays (H×W class indices)
+            ``confidences``  – list of floats (mean max softmax probability)
+            ``prob_maps``    – list of 3D numpy arrays (C×H×W softmax probs)
+            ``problem_type`` – ``"segmentation"``
+            ``n_samples``    – int
+        """
+        from PIL import Image as PILImage
+
+        if isinstance(inputs, pd.DataFrame):
+            rows = inputs.to_dict(orient="records")
+        elif isinstance(inputs, list):
+            rows = inputs
+        else:
+            rows = [inputs]
+
+        img_tensors: List[torch.Tensor] = []
+        for row in rows:
+            if "image_path" in row:
+                img = PILImage.open(row["image_path"]).convert("RGB")
+            elif "image" in row:
+                img = row["image"]
+                if isinstance(img, str):
+                    img = PILImage.open(img).convert("RGB")
+            else:
+                raise ValueError("Segmentation prediction requires 'image_path' or 'image' key.")
+
+            # Create a dummy mask for preprocessing (we only need the image tensor)
+            dummy_mask = PILImage.new("L", img.size, 0)
+            img_t, _ = self._preprocessor(img, dummy_mask)
+            img_tensors.append(img_t)
+
+        batch = torch.stack(img_tensors).to(self.device)
+
+        try:
+            with torch.no_grad():
+                logits = self._model(batch)  # (N, C, H, W)
+                probs = torch.softmax(logits, dim=1)  # (N, C, H, W)
+                preds = logits.argmax(dim=1)  # (N, H, W)
+
+            pred_list = [p.cpu().numpy() for p in preds]
+            prob_list = [p.cpu().numpy() for p in probs]
+            conf_list = [float(p.max(dim=0).values.mean()) for p in probs]
+
+            return {
+                "predictions": pred_list,
+                "confidences": conf_list,
+                "prob_maps": prob_list,
+                "problem_type": "segmentation",
+                "n_samples": len(pred_list),
+            }
+        finally:
+            del batch
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------ #
+    # Static helpers
     # ------------------------------------------------------------------ #
 
     @staticmethod

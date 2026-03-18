@@ -11,9 +11,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 import uvicorn
 import pandas as pd
@@ -55,6 +56,34 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# API key authentication (opt-in)
+# ---------------------------------------------------------------------------
+# Set APEX_API_KEY env var to enable.  When unset, all requests pass through.
+_API_KEY: Optional[str] = os.environ.get("APEX_API_KEY")
+_AUTH_EXEMPT_PATHS = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+
+
+class _APIKeyMiddleware(BaseHTTPMiddleware):
+    """Reject requests missing a valid ``X-API-Key`` header."""
+
+    async def dispatch(self, request: Request, call_next):
+        if _API_KEY and request.url.path not in _AUTH_EXEMPT_PATHS:
+            key = request.headers.get("X-API-Key", "")
+            if key != _API_KEY:
+                return JSONResponse(
+                    {"error": "Invalid or missing API key."},
+                    status_code=401,
+                )
+        return await call_next(request)
+
+
+if _API_KEY:
+    app.add_middleware(_APIKeyMiddleware)
+    logger.info("API key authentication ENABLED (APEX_API_KEY is set)")
+else:
+    logger.info("API key authentication DISABLED (set APEX_API_KEY to enable)")
+
+# ---------------------------------------------------------------------------
 # GPU detection
 # ---------------------------------------------------------------------------
 GPU_AVAILABLE: bool = torch.cuda.is_available()
@@ -90,6 +119,11 @@ def _resolve_xai_target(target_class: int, result: Dict[str, Any]) -> int:
     if isinstance(first_pred, list) and confs:
         first_conf = confs[0] if isinstance(confs[0], list) else confs
         return int(max(range(len(first_conf)), key=lambda i: first_conf[i]))
+    # Multiclass with string labels: argmax of the confidence vector
+    if confs:
+        first_conf = confs[0] if isinstance(confs[0], list) else confs
+        if isinstance(first_conf, list) and first_conf:
+            return int(max(range(len(first_conf)), key=lambda i: first_conf[i]))
     return 0
 
 
@@ -147,6 +181,88 @@ session_ingested_hashes: Dict[str, Dict[str, Any]] = {}
 _MAX_ENGINES: int = 5
 _engine_cache: collections.OrderedDict[str, Any] = collections.OrderedDict()
 _engine_cache_lock = threading.Lock()
+
+# Image upload directory for /upload/image
+_UPLOAD_DIR: Path = apex_dir / "uploads" / "predict_images"
+_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Prediction input buffer for lightweight drift monitoring
+import numpy as np
+
+_prediction_buffer: Dict[str, List[np.ndarray]] = {}  # key: model_id
+_prediction_buffer_lock = threading.Lock()
+_PREDICTION_BUFFER_MAX: int = 1000
+
+
+# ---------------------------------------------------------------------------
+# Engine cache helpers (shared by /predict, /predict-async, /ws/predict)
+# ---------------------------------------------------------------------------
+
+
+async def _get_or_load_engine(model_id: str) -> Any:
+    """Retrieve a cached inference engine or load a new one (async)."""
+    from pipeline.inference_engine import MultimodalInferenceEngine
+
+    with _engine_cache_lock:
+        if model_id in _engine_cache:
+            _engine_cache.move_to_end(model_id)
+            return _engine_cache[model_id]
+
+    # Check if this is a segmentation model
+    seg_config_path = Path("models") / "registry" / model_id / "artifacts" / "seg_config.json"
+    if seg_config_path.exists():
+        from pipeline.inference_engine import SegmentationInferenceEngine
+        engine = await asyncio.to_thread(SegmentationInferenceEngine, model_id=model_id)
+    else:
+        engine = await asyncio.to_thread(MultimodalInferenceEngine, model_id=model_id)
+
+    with _engine_cache_lock:
+        _engine_cache[model_id] = engine
+        while len(_engine_cache) > _MAX_ENGINES:
+            _engine_cache.popitem(last=False)
+
+    return engine
+
+
+def _get_or_load_engine_sync(model_id: str) -> Any:
+    """Retrieve a cached inference engine or load a new one (synchronous)."""
+    from pipeline.inference_engine import MultimodalInferenceEngine
+
+    with _engine_cache_lock:
+        if model_id in _engine_cache:
+            _engine_cache.move_to_end(model_id)
+            return _engine_cache[model_id]
+
+    seg_config_path = Path("models") / "registry" / model_id / "artifacts" / "seg_config.json"
+    if seg_config_path.exists():
+        from pipeline.inference_engine import SegmentationInferenceEngine
+        engine = SegmentationInferenceEngine(model_id=model_id)
+    else:
+        engine = MultimodalInferenceEngine(model_id=model_id)
+
+    with _engine_cache_lock:
+        _engine_cache[model_id] = engine
+        while len(_engine_cache) > _MAX_ENGINES:
+            _engine_cache.popitem(last=False)
+
+    return engine
+
+
+def _buffer_prediction_inputs(model_id: str, df: pd.DataFrame) -> None:
+    """Buffer numeric prediction inputs for drift monitoring (best-effort)."""
+    try:
+        numeric_df = df.select_dtypes(include=[np.number]).fillna(0.0)
+        if numeric_df.empty:
+            return
+        rows = numeric_df.values.astype(np.float64)
+        with _prediction_buffer_lock:
+            buf = _prediction_buffer.setdefault(model_id, [])
+            for row in rows:
+                buf.append(row)
+            if len(buf) > _PREDICTION_BUFFER_MAX:
+                _prediction_buffer[model_id] = buf[-_PREDICTION_BUFFER_MAX:]
+    except Exception:
+        pass  # Never let buffering break prediction
 
 
 
@@ -229,6 +345,54 @@ async def cache_clear() -> Dict[str, Any]:
         mgr.clear_cache()
         return {"message": "Cache cleared successfully", "status": "success"}
     return await asyncio.to_thread(_clear_sync)
+
+
+@app.post("/ingest/check-cache")
+async def check_cache(request: Request) -> Dict[str, Any]:
+    """
+    Check cache status for a list of dataset URLs without downloading.
+
+    REQUEST BODY
+    ------------
+    ``urls``: list of dataset source URLs / paths.
+
+    FRONTEND CONTRACT
+    -----------------
+    Returns::
+
+        {
+          "results": [
+            {"url": str, "hash": str, "cached": bool, "size_mb": float|null},
+            ...
+          ]
+        }
+    """
+    body = await request.json()
+    urls: List[str] = body.get("urls", [])
+    if not urls:
+        return {"results": []}
+
+    def _check_sync() -> List[Dict[str, Any]]:
+        from data_ingestion.ingestion_manager import DataIngestionManager
+        mgr = DataIngestionManager()
+        results = []
+        for url in urls:
+            source_hash = mgr._generate_hash(url)
+            cached = source_hash in mgr.cache_metadata
+            size_mb = None
+            if cached:
+                meta = mgr.cache_metadata[source_hash]
+                size_mb = meta.get("size_mb")
+            results.append({
+                "url": url,
+                "hash": source_hash,
+                "cached": cached,
+                "size_mb": size_mb,
+            })
+        return results
+
+    results = await asyncio.to_thread(_check_sync)
+    return {"results": results}
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +505,7 @@ async def ingest_datasets_endpoint(
                                 "shape": list(shape) if shape is not None else None,
                                 "columns": columns,
                                 "status": "success",
+                                "from_cache": ingest_meta.get("cache_status", {}).get(source_url) == "cached",
                             }
                             tracker.report_dataset(ds_info)
                             session_hashes[source_hash] = {
@@ -477,6 +642,7 @@ async def detect_schema(request: Request) -> Dict[str, Any]:
 
         body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         _sid = body.get("session_id") if isinstance(body, dict) else None
+        _dataset_group = body.get("dataset_group") if isinstance(body, dict) else None
 
         # STRICT SESSION ISOLATION: reject if no active session
         with _session_lock:
@@ -513,7 +679,8 @@ async def detect_schema(request: Request) -> Dict[str, Any]:
 
         detector = MultiDatasetSchemaDetector()
         global_schema = await asyncio.to_thread(
-            detector.detect_global_schema, lazy_datasets
+            detector.detect_global_schema, lazy_datasets,
+            dataset_group=_dataset_group,
         )
 
         result: Dict[str, Any] = dc_asdict(global_schema)
@@ -889,6 +1056,7 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
         problem_type: str = body.get("problem_type", "classification_binary")
         modalities: List[str] = body.get("modalities", ["tabular"])
         hp_overrides: Optional[Dict[str, Any]] = body.get("hp_overrides")
+        n_trials: Optional[int] = body.get("n_trials")
 
         sources: List[str] = [
             meta.get("source_url", hid)
@@ -973,8 +1141,9 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
                 # Phase 5 — Training
                 tracker.set_phase(5, "Training", 55)
                 if orchestrator.fitted_transformers.get("text") is not None:
+                    text_enc_name = model_sel.get("text_encoder_name", "text encoder")
                     tracker.add_message(5, "info",
-                        "Loading BERT encoder (~440MB on first run)...")
+                        f"Loading {text_enc_name} text encoder...")
                 if hp_overrides:
                     tracker.add_message(5, "info",
                         f"Using manual HP overrides: {hp_overrides}")
@@ -994,7 +1163,7 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
                 _orch_logger.addHandler(_handler)
                 try:
                     await asyncio.to_thread(orchestrator._execute_phase_5_training,
-                                            hp_overrides, tracker)
+                                            hp_overrides, tracker, n_trials)
                 finally:
                     _orch_logger.removeHandler(_handler)
 
@@ -1058,6 +1227,10 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
                             "problem_type":  phase5.get("problem_type", problem_type),
                             "gpu_enabled":   GPU_AVAILABLE,
                             "data_split":    phase5.get("data_split", {}),
+                            "encoder_selection": phase5.get("encoder_selection", {}),
+                            "stop_reason":   phase5.get("stop_reason", ""),
+                            "actual_epochs": phase5.get("actual_epochs"),
+                            "epochs":        phase5.get("epochs"),
                         },
                         "deployment_ready": deployment_ready,
                     },
@@ -1226,6 +1399,32 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
                     "/monitor/drift: model_id '%s' not found at %s", model_id, meta_file
                 )
 
+        # Build actionable recommendations based on which metrics drifted
+        metrics_vals = p6["metrics"]
+        thresholds = p6["thresholds"]
+        status_per = p6["status"]
+        recommendations: List[str] = []
+        if status_per.get("psi"):
+            recommendations.append(
+                f"PSI ({metrics_vals.get('psi', 0):.4f}) exceeds threshold "
+                f"({thresholds.get('psi', 0.25)}): feature distributions have shifted. "
+                "Consider retraining with recent data."
+            )
+        if status_per.get("ks_statistic"):
+            recommendations.append(
+                f"KS statistic ({metrics_vals.get('ks_statistic', 0):.4f}) exceeds threshold "
+                f"({thresholds.get('ks_statistic', 0.30)}): significant distributional change detected. "
+                "Review input data for quality issues or population changes."
+            )
+        if status_per.get("fdd"):
+            recommendations.append(
+                f"FDD/MMD ({metrics_vals.get('fdd', 0):.4f}) exceeds threshold "
+                f"({thresholds.get('fdd', 0.50)}): multivariate feature drift detected. "
+                "Retraining is recommended to maintain prediction accuracy."
+            )
+        if not recommendations:
+            recommendations.append("All metrics within acceptable thresholds. No action needed.")
+
         return {
             "status": "success",
             "data": {
@@ -1238,6 +1437,7 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
                 "n_features":       p6["n_features"],
                 "model_id":         model_id,
                 "stored_phase6_summary": stored_drift,
+                "recommendations":  recommendations,
             },
         }
 
@@ -1414,6 +1614,16 @@ async def model_info(model_id: str) -> Dict[str, Any]:
             else [c for c in tabular_cols if c != target_col]
         )
 
+        # Segmentation config (if applicable)
+        seg_config: Dict[str, Any] = {}
+        seg_config_path = registry_root / "artifacts" / "seg_config.json"
+        if seg_config_path.exists():
+            try:
+                with open(seg_config_path, encoding="utf-8") as fh:
+                    seg_config = _json.load(fh)
+            except Exception:
+                pass
+
         return {
             "model_id": model_id,
             "problem_type": schema.get("global_problem_type", ""),
@@ -1426,9 +1636,233 @@ async def model_info(model_id: str) -> Dict[str, Any]:
             },
             "effective_features": effective_features,
             "dropped_columns": dropped_columns,
+            "seg_config": seg_config,
         }
 
     return await asyncio.to_thread(_load_model_info_sync)
+
+
+# ---------------------------------------------------------------------------
+# Model delete endpoint
+# ---------------------------------------------------------------------------
+
+@app.delete("/model-registry/{model_id}")
+async def delete_model(model_id: str) -> Dict[str, Any]:
+    """Delete a registered model and all its artifacts."""
+    model_id = _sanitize_model_id(model_id)
+    registry_path = Path("models") / "registry" / model_id
+
+    if not registry_path.exists() or not registry_path.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model_id}' not found in registry.",
+        )
+
+    import shutil
+    shutil.rmtree(registry_path)
+
+    # Evict from inference engine cache
+    with _engine_cache_lock:
+        _engine_cache.pop(model_id, None)
+
+    # Evict from prediction buffer
+    with _prediction_buffer_lock:
+        _prediction_buffer.pop(model_id, None)
+
+    logger.info("Deleted model '%s' from registry.", model_id)
+    return {"status": "success", "model_id": model_id, "message": "Model deleted."}
+
+
+# ---------------------------------------------------------------------------
+# Model rename endpoint
+# ---------------------------------------------------------------------------
+
+@app.patch("/model-registry/{model_id}/rename")
+async def rename_model(model_id: str, request: Request) -> Dict[str, Any]:
+    """Set a display_name for a registered model (metadata-only, no directory rename)."""
+    model_id = _sanitize_model_id(model_id)
+    registry_path = Path("models") / "registry" / model_id
+
+    if not registry_path.exists() or not registry_path.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model_id}' not found in registry.",
+        )
+
+    body = await request.json()
+    new_name = str(body.get("display_name", "")).strip()
+    if not new_name:
+        raise HTTPException(
+            status_code=400,
+            detail="display_name must be a non-empty string.",
+        )
+
+    import json as _json
+
+    meta_file = registry_path / "metadata.json"
+    if meta_file.exists():
+        meta = _json.loads(meta_file.read_text())
+    else:
+        meta = {"model_id": model_id}
+
+    meta["display_name"] = new_name
+    meta_file.write_text(_json.dumps(meta, indent=2, default=str))
+
+    logger.info("Renamed model '%s' → display_name='%s'.", model_id, new_name)
+    return {"status": "success", "model_id": model_id, "display_name": new_name}
+
+@app.get("/model-registry/{model_id}/download")
+async def download_model(model_id: str):
+    """Download a registered model as a ZIP archive."""
+    import io as _io
+    import zipfile as _zipfile
+    from fastapi.responses import StreamingResponse
+
+    model_id = _sanitize_model_id(model_id)
+    registry_path = Path("models") / "registry" / model_id
+
+    if not registry_path.exists() or not registry_path.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model_id}' not found in registry.",
+        )
+
+    def _create_zip() -> _io.BytesIO:
+        buf = _io.BytesIO()
+        with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+            for file_path in registry_path.rglob("*"):
+                if file_path.is_file():
+                    arcname = str(file_path.relative_to(registry_path))
+                    zf.write(file_path, arcname)
+        buf.seek(0)
+        return buf
+
+    buf = await asyncio.to_thread(_create_zip)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{model_id}.zip"',
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Image upload endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/upload/image")
+async def upload_image(
+    file: UploadFile = File(...),
+) -> Dict[str, Any]:
+    """
+    Upload an image file for use in subsequent prediction requests.
+
+    Returns a server-side reference path that can be passed as
+    ``image_path`` in the prediction input dict.
+    """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image.")
+
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image exceeds 10 MB limit.")
+
+    ext = Path(file.filename or "image.jpg").suffix or ".jpg"
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    dest = _UPLOAD_DIR / unique_name
+    dest.write_bytes(contents)
+
+    return {
+        "status": "success",
+        "image_ref": str(dest),
+        "filename": file.filename,
+        "size_bytes": len(contents),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prediction-time drift monitoring
+# ---------------------------------------------------------------------------
+
+@app.post("/predict/drift-check")
+async def predict_drift_check(request: Request) -> Dict[str, Any]:
+    """
+    Lightweight drift detection on buffered prediction inputs vs. training
+    reference distribution.  Much faster than ``/monitor/drift`` because it
+    skips the full Phase 1-3-6 re-run.
+    """
+    body = await request.json()
+    model_id = body.get("model_id")
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required.")
+    model_id = _sanitize_model_id(model_id)
+
+    with _prediction_buffer_lock:
+        buf = _prediction_buffer.get(model_id, [])
+        if len(buf) < 10:
+            return {
+                "status": "insufficient_data",
+                "message": f"Only {len(buf)} predictions buffered. Need at least 10.",
+                "n_buffered": len(buf),
+            }
+        production_array = np.array(buf)
+
+    ref_path = Path("models") / "registry" / model_id / "artifacts" / "drift_reference.npy"
+    if not ref_path.exists():
+        return {
+            "status": "no_reference",
+            "message": "No training reference distribution saved for this model. "
+                       "Re-train to generate the reference snapshot.",
+        }
+
+    try:
+        reference_array = np.load(str(ref_path))
+
+        # Align feature dimensions
+        n_feat = min(reference_array.shape[1], production_array.shape[1])
+        reference_array = reference_array[:, :n_feat]
+        production_array = production_array[:, :n_feat]
+
+        from monitoring.drift_detector import DriftDetector
+        detector = DriftDetector()
+        report = await asyncio.to_thread(
+            detector.detect, reference_array, production_array,
+        )
+
+        return {
+            "status": "success",
+            "data": {
+                "drift_detected": report.drift_detected,
+                "metrics": {
+                    "psi": report.psi,
+                    "ks_statistic": report.ks_statistic,
+                    "fdd": report.fdd,
+                },
+                "thresholds": {"psi": 0.25, "ks_statistic": 0.30, "fdd": 0.50},
+                "status_per_metric": report.status,
+                "n_reference": report.n_reference,
+                "n_production": report.n_production,
+                "n_features": report.n_features,
+                "model_id": model_id,
+            },
+        }
+    except Exception as exc:
+        logger.error("/predict/drift-check error: %s", exc, exc_info=True)
+        return JSONResponse(
+            {"error": "Drift check failed. Check server logs."},
+            status_code=500,
+        )
+
+
+@app.get("/predict/buffer-stats/{model_id}")
+async def predict_buffer_stats(model_id: str) -> Dict[str, Any]:
+    """Return the number of buffered prediction inputs for a model."""
+    model_id = _sanitize_model_id(model_id)
+    with _prediction_buffer_lock:
+        count = len(_prediction_buffer.get(model_id, []))
+    return {"model_id": model_id, "n_buffered": count, "max_buffer": _PREDICTION_BUFFER_MAX}
 
 
 # ---------------------------------------------------------------------------
@@ -1442,6 +1876,8 @@ def _run_inference_task(
     explain: bool,
     target_class: int,
     n_steps: int,
+    method: str = "ig",
+    threshold: float = 0.5,
 ) -> None:
     """
     Background worker that wraps the existing synchronous inference path.
@@ -1453,27 +1889,20 @@ def _run_inference_task(
     task_db.update_status(task_id, "PROCESSING")
 
     try:
-        from pipeline.inference_engine import MultimodalInferenceEngine
-
-        # Re-use cached engine (same LRU logic as /predict)
-        with _engine_cache_lock:
-            if model_id in _engine_cache:
-                _engine_cache.move_to_end(model_id)
-                engine = _engine_cache[model_id]
-            else:
-                engine = None
-
-        if engine is None:
-            engine = MultimodalInferenceEngine(model_id=model_id)
-            with _engine_cache_lock:
-                _engine_cache[model_id] = engine
-                while len(_engine_cache) > _MAX_ENGINES:
-                    _engine_cache.popitem(last=False)
+        engine = _get_or_load_engine_sync(model_id)
 
         df: pd.DataFrame = pd.DataFrame(raw_inputs)
+        _buffer_prediction_inputs(model_id, df)
 
         # Core inference – identical to the synchronous /predict path
-        result: Dict[str, Any] = engine.predict_batch(df)
+        result: Dict[str, Any] = engine.predict_batch(df, threshold=threshold)
+
+        # Segmentation results need numpy→list conversion for JSON
+        if result.get("problem_type") == "segmentation":
+            result["predictions"] = [p.tolist() for p in result["predictions"]]
+            result["confidences"] = [float(c) for c in result["confidences"]]
+            # prob_maps are too large for JSON; drop them from task result
+            result.pop("prob_maps", None)
 
         # XAI (optional)
         explanations: Optional[Dict[str, Any]] = None
@@ -1482,6 +1911,7 @@ def _run_inference_task(
 
             explanations = engine.generate_explanations(
                 df, target_class=effective_target, n_steps=n_steps,
+                method=method,
             )
 
         payload = {
@@ -1492,6 +1922,11 @@ def _run_inference_task(
             "n_samples":    result["n_samples"],
             "explanations": explanations,
         }
+
+        # Surface schema mismatch warnings from inference engine
+        warnings = getattr(engine, "_last_warnings", [])
+        if warnings:
+            payload["warnings"] = warnings
 
         task_db.update_result(task_id, "COMPLETED", payload)
 
@@ -1529,6 +1964,8 @@ async def predict_async(request: Request, background_tasks: BackgroundTasks) -> 
     explain: bool     = bool(body.get("explain", False))
     target_class: int = int(body.get("target_class", -1))
     n_steps: int      = int(body.get("n_steps", 50))
+    method: str       = str(body.get("method", "ig"))
+    threshold: float  = float(body.get("threshold", 0.5))
 
     task_id: str = str(uuid.uuid4())
     task_db.insert_task(
@@ -1540,7 +1977,8 @@ async def predict_async(request: Request, background_tasks: BackgroundTasks) -> 
 
     background_tasks.add_task(
         _run_inference_task,
-        task_id, model_id, raw_inputs, explain, target_class, n_steps,
+        task_id, model_id, raw_inputs, explain, target_class, n_steps, method,
+        threshold,
     )
 
     return {"task_id": task_id, "status": "PENDING"}
@@ -1625,27 +2063,13 @@ async def ws_predict(websocket: WebSocket) -> None:
         explain: bool = bool(body.get("explain", False))
         target_class: int = int(body.get("target_class", -1))
         n_steps: int = int(body.get("n_steps", 50))
+        method: str = str(body.get("method", "ig"))
+        threshold: float = float(body.get("threshold", 0.5))
 
         # 3. Load or retrieve inference engine
         await websocket.send_json({"type": "status", "status": "LOADING_MODEL"})
 
-        from pipeline.inference_engine import MultimodalInferenceEngine
-
-        with _engine_cache_lock:
-            if model_id in _engine_cache:
-                _engine_cache.move_to_end(model_id)
-                engine = _engine_cache[model_id]
-            else:
-                engine = None
-
-        if engine is None:
-            engine = await asyncio.to_thread(
-                MultimodalInferenceEngine, model_id=model_id,
-            )
-            with _engine_cache_lock:
-                _engine_cache[model_id] = engine
-                while len(_engine_cache) > _MAX_ENGINES:
-                    _engine_cache.popitem(last=False)
+        engine = await _get_or_load_engine(model_id)
 
         # 4. Run inference — chunk large batches for progress streaming
         await websocket.send_json({
@@ -1656,9 +2080,10 @@ async def ws_predict(websocket: WebSocket) -> None:
 
         CHUNK_SIZE: int = 100
         df_full: pd.DataFrame = pd.DataFrame(raw_inputs)
+        _buffer_prediction_inputs(model_id, df_full)
 
         if len(raw_inputs) <= CHUNK_SIZE:
-            result = await asyncio.to_thread(engine.predict_batch, df_full)
+            result = await asyncio.to_thread(engine.predict_batch, df_full, threshold)
         else:
             all_predictions: List[Any] = []
             all_confidences: List[Any] = []
@@ -1670,7 +2095,7 @@ async def ws_predict(websocket: WebSocket) -> None:
                 end = min(start + CHUNK_SIZE, len(raw_inputs))
                 chunk_df = df_full.iloc[start:end]
 
-                chunk_result = await asyncio.to_thread(engine.predict_batch, chunk_df)
+                chunk_result = await asyncio.to_thread(engine.predict_batch, chunk_df, threshold)
                 all_predictions.extend(chunk_result["predictions"])
                 all_confidences.extend(chunk_result["confidences"])
                 problem_type = chunk_result["problem_type"]
@@ -1705,6 +2130,7 @@ async def ws_predict(websocket: WebSocket) -> None:
                 df_full,
                 target_class=effective_target,
                 n_steps=n_steps,
+                method=method,
             )
 
         # 6. Send complete result
@@ -1818,30 +2244,22 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
         explain: bool      = bool(body.get("explain", False))
         target_class: int  = int(body.get("target_class", -1))
         n_steps: int        = int(body.get("n_steps", 50))
+        method: str         = str(body.get("method", "ig"))
+        threshold: float    = float(body.get("threshold", 0.5))
 
-        from pipeline.inference_engine import MultimodalInferenceEngine
-
-        # Re-use cached engine with LRU eviction (thread-safe)
-        with _engine_cache_lock:
-            if model_id in _engine_cache:
-                _engine_cache.move_to_end(model_id)
-                engine = _engine_cache[model_id]
-            else:
-                engine = None
-
-        if engine is None:
-            engine = await asyncio.to_thread(
-                MultimodalInferenceEngine, model_id=model_id,
-            )
-            with _engine_cache_lock:
-                _engine_cache[model_id] = engine
-                while len(_engine_cache) > _MAX_ENGINES:
-                    _engine_cache.popitem(last=False)
+        engine = await _get_or_load_engine(model_id)
 
         df: pd.DataFrame = pd.DataFrame(raw_inputs)
+        _buffer_prediction_inputs(model_id, df)
 
         # Offload blocking inference to worker thread (CRIT-1 fix)
-        result: Dict[str, Any] = await asyncio.to_thread(engine.predict_batch, df)
+        result: Dict[str, Any] = await asyncio.to_thread(engine.predict_batch, df, threshold)
+
+        # Segmentation results need numpy→list conversion for JSON
+        if result.get("problem_type") == "segmentation":
+            result["predictions"] = [p.tolist() if hasattr(p, "tolist") else p for p in result["predictions"]]
+            result["confidences"] = [float(c) for c in result["confidences"]]
+            result.pop("prob_maps", None)
 
         # Captum XAI – gradients enabled only inside generate_explanations
         explanations: Optional[Dict[str, Any]] = None
@@ -1853,9 +2271,10 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
                 df,
                 target_class=effective_target,
                 n_steps=n_steps,
+                method=method,
             )
 
-        return {
+        response: Dict[str, Any] = {
             "status":       "success",
             "predictions":  result["predictions"],
             "confidences":  result["confidences"],
@@ -1863,6 +2282,13 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
             "n_samples":    result["n_samples"],
             "explanations": explanations,
         }
+
+        # Surface schema mismatch warnings from inference engine
+        warnings = getattr(engine, "_last_warnings", [])
+        if warnings:
+            response["warnings"] = warnings
+
+        return response
 
     except HTTPException:
         raise

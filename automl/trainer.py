@@ -489,3 +489,184 @@ def build_trainer(
         tabular_encoder=tabular_encoder,
         class_weights=class_weights,
     )
+
+
+# ---------------------------------------------------------------------------
+# Segmentation LightningModule
+# ---------------------------------------------------------------------------
+
+class SegmentationLightningModule(pl.LightningModule):
+    """
+    PyTorch Lightning wrapper for semantic segmentation (U-Net style).
+
+    Loss: CrossEntropy + Dice (weighted sum).
+    Metrics: mean IoU via ``torchmetrics.JaccardIndex``.
+
+    Parameters
+    ----------
+    model : nn.Module
+        ``SegmentationModel`` from ``modelss.decoders.unet`` —
+        forward(x) → ``(N, C, H, W)`` logits.
+    num_classes : int
+        Number of semantic classes (including background).
+    learning_rate : float
+        Initial AdamW learning rate.
+    weight_decay : float
+        L2 penalty coefficient.
+    max_epochs : int
+        Epoch ceiling for cosine LR scheduler.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        num_classes: int = 2,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 1e-5,
+        max_epochs: int = 20,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters(ignore=["model"])
+
+        self.model = model
+        self.num_classes = num_classes
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
+
+        # ── Loss: CrossEntropy + Dice ──
+        self.ce_loss = nn.CrossEntropyLoss()
+
+        # ── Metrics: Jaccard (IoU) ──
+        task = "binary" if num_classes == 2 else "multiclass"
+        jac_kwargs: Dict[str, Any] = {"task": task}
+        if task == "multiclass":
+            jac_kwargs["num_classes"] = num_classes
+        self.train_iou = torchmetrics.JaccardIndex(**jac_kwargs)
+        self.val_iou = torchmetrics.JaccardIndex(**jac_kwargs)
+
+    # ------------------------------------------------------------------
+    # Dice loss helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dice_loss(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
+        """Soft Dice loss over all classes (1 − Dice coefficient)."""
+        probs = torch.softmax(logits, dim=1)
+        n_classes = logits.shape[1]
+        # One-hot encode targets: (N, H, W) → (N, C, H, W)
+        one_hot = torch.zeros_like(probs)
+        one_hot.scatter_(1, targets.unsqueeze(1), 1)
+
+        dims = (0, 2, 3)  # reduce over batch + spatial
+        intersection = (probs * one_hot).sum(dim=dims)
+        union = probs.sum(dim=dims) + one_hot.sum(dim=dims)
+        dice = (2.0 * intersection + smooth) / (union + smooth)
+        return 1.0 - dice.mean()
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        images = batch["image"]
+        masks = batch["target"]
+        logits = self(images)
+
+        ce = self.ce_loss(logits, masks)
+        dice = self._dice_loss(logits, masks)
+        loss = ce + dice
+
+        preds = logits.argmax(dim=1)
+        self.train_iou(preds, masks)
+
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train_iou", self.train_iou, prog_bar=True, on_epoch=True)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        return loss
+
+    # ------------------------------------------------------------------
+    # Validation step
+    # ------------------------------------------------------------------
+
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        images = batch["image"]
+        masks = batch["target"]
+        logits = self(images)
+
+        ce = self.ce_loss(logits, masks)
+        dice = self._dice_loss(logits, masks)
+        loss = ce + dice
+
+        preds = logits.argmax(dim=1)
+        self.val_iou(preds, masks)
+
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
+        self.log("val_iou", self.val_iou, prog_bar=True, on_epoch=True)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        return loss
+
+    # ------------------------------------------------------------------
+    # Optimiser + scheduler
+    # ------------------------------------------------------------------
+
+    def configure_optimizers(self):
+        optimizer = AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.max_epochs)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
+
+
+# ---------------------------------------------------------------------------
+# Segmentation trainer factory
+# ---------------------------------------------------------------------------
+
+def build_segmentation_trainer(
+    num_classes: int = 2,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-5,
+    max_epochs: int = 20,
+    pretrained: bool = True,
+    freeze_backbone: bool = True,
+    input_size: int = 256,
+) -> SegmentationLightningModule:
+    """
+    Build a :class:`SegmentationLightningModule` wrapping a U-Net model.
+
+    Returns
+    -------
+    SegmentationLightningModule ready for ``pytorch_lightning.Trainer``.
+    """
+    from modelss.decoders.unet import SegmentationModel
+
+    seg_model = SegmentationModel(
+        num_classes=num_classes,
+        pretrained=pretrained,
+        freeze_backbone=freeze_backbone,
+    )
+    return SegmentationLightningModule(
+        model=seg_model,
+        num_classes=num_classes,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        max_epochs=max_epochs,
+    )

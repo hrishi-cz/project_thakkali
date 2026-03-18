@@ -99,6 +99,16 @@ class DataIngestionManager:
             if len(parts) == 2:
                 dataset_slug = parts[1].strip("/")
                 return f"kaggle://datasets/{dataset_slug}"
+        # HuggingFace canonical form: hf://datasets/{owner}/{name}
+        if "huggingface.co" in host and "/datasets/" in path:
+            parts = path.split("/datasets/", 1)
+            if len(parts) == 2:
+                dataset_slug = parts[1].strip("/")
+                # Strip sub-paths like /viewer, /tree/main, etc.
+                slug_parts = dataset_slug.split("/")
+                if len(slug_parts) >= 2:
+                    dataset_slug = f"{slug_parts[0]}/{slug_parts[1]}"
+                return f"hf://datasets/{dataset_slug}"
         return f"{parsed.scheme}://{host}{path}"
 
     def _generate_hash(self, source: str) -> str:
@@ -113,6 +123,10 @@ class DataIngestionManager:
     @staticmethod
     def _is_kaggle_url(url: str) -> bool:
         return "kaggle.com/datasets" in url
+
+    @staticmethod
+    def _is_huggingface_url(url: str) -> bool:
+        return "huggingface.co/datasets" in url
 
     # ------------------------------------------------------------------ #
     # DVC integration
@@ -186,10 +200,10 @@ class DataIngestionManager:
                 metadata["failed"][source] = "Ingestion returned no data"
                 logger.error("Ingestion returned None for [%s]", source)
             else:
-                lazy_ref, cache_path = result
+                lazy_ref, cache_path, from_cache = result
                 lazy_datasets[source_hash] = lazy_ref
                 metadata["cached_hashes"][source] = source_hash
-                metadata["cache_status"][source] = "ok"
+                metadata["cache_status"][source] = "cached" if from_cache else "downloaded"
 
         return lazy_datasets, metadata
 
@@ -201,9 +215,12 @@ class DataIngestionManager:
         self,
         source: str,
         force_download: bool,
-    ) -> Optional[Tuple[Any, Path]]:
+    ) -> Optional[Tuple[Any, Path, bool]]:
         """
-        Ingest one source.  Returns (lazy_ref, cache_path) or raises.
+        Ingest one source.  Returns ``(lazy_ref, cache_path, from_cache)``
+        or raises.  ``from_cache`` is ``True`` when the dataset was served
+        from the local cache without downloading.
+
         Exceptions propagate to asyncio.gather for per-URL isolation.
 
         Backward compatibility: if the normalised hash produces a cache miss,
@@ -223,7 +240,7 @@ class DataIngestionManager:
                 lazy_ref = self._loader.load_cached(cache_path)
                 if lazy_ref is not None:
                     logger.info("Cache HIT  [%s] -> %s", source_hash, source)
-                    return lazy_ref, cache_path
+                    return lazy_ref, cache_path, True
 
             # Try legacy hash (raw string, pre-normalisation era)
             legacy_hash = self._legacy_hash(source)
@@ -242,13 +259,15 @@ class DataIngestionManager:
                     # Rename directory so future lookups use the normalised hash
                     if legacy_path.exists() and not cache_path.exists():
                         legacy_path.rename(cache_path)
-                    return lazy_ref, cache_path if cache_path.exists() else legacy_path
+                    return lazy_ref, cache_path if cache_path.exists() else legacy_path, True
 
         logger.info("Cache MISS [%s] -> downloading %s", source_hash, source)
 
         # Route to the right downloader
         if self._is_kaggle_url(source):
             cache_path = await self._ingest_kaggle(source, cache_path)
+        elif self._is_huggingface_url(source):
+            cache_path = await self._ingest_huggingface(source, cache_path)
         elif source.startswith(("http://", "https://")):
             cache_path = await self._ingest_remote_url(source, cache_path)
         else:
@@ -268,7 +287,7 @@ class DataIngestionManager:
                 f"Cache directory {cache_path} has no recognised data files "
                 "after ingestion."
             )
-        return lazy_ref, cache_path
+        return lazy_ref, cache_path, False
 
     # ------------------------------------------------------------------ #
     # Remote URL downloader (aiohttp – truly async)
@@ -421,6 +440,69 @@ class DataIngestionManager:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         logger.info("Kaggle dataset %s cached at %s", dataset_id, cache_path)
+        return cache_path
+
+    # ------------------------------------------------------------------ #
+    # HuggingFace downloader (sync, run in thread-pool executor)
+    # ------------------------------------------------------------------ #
+
+    async def _ingest_huggingface(self, url: str, cache_path: Path) -> Path:
+        """Offload blocking HuggingFace datasets download to a thread."""
+        return await asyncio.to_thread(
+            self._ingest_huggingface_sync, url, cache_path
+        )
+
+    def _ingest_huggingface_sync(self, url: str, cache_path: Path) -> Path:
+        """Download a HuggingFace dataset and export to Parquet."""
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError(
+                "The 'datasets' package is required for HuggingFace ingestion. "
+                "Install it with: pip install datasets"
+            )
+
+        # Extract dataset ID: "owner/name" from URL path
+        parsed = urlparse(url)
+        path = parsed.path.strip("/")
+        # path looks like: "datasets/owner/name" or "datasets/owner/name/..."
+        parts = path.split("/")
+        if len(parts) < 3 or parts[0] != "datasets":
+            raise ValueError(
+                f"Cannot parse HuggingFace dataset ID from URL: {url}"
+            )
+        dataset_id = f"{parts[1]}/{parts[2]}"
+
+        logger.info("Loading HuggingFace dataset: %s", dataset_id)
+        try:
+            ds = load_dataset(dataset_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load HuggingFace dataset '{dataset_id}': {exc}"
+            ) from exc
+
+        # Export the best split to Parquet in cache_path
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+        # Pick the most useful split: train > test > validation > first available
+        if hasattr(ds, "keys"):
+            # DatasetDict with splits
+            for preferred in ("train", "test", "validation"):
+                if preferred in ds:
+                    split_ds = ds[preferred]
+                    break
+            else:
+                split_ds = ds[next(iter(ds))]
+        else:
+            # Single Dataset (no splits)
+            split_ds = ds
+
+        out_path = cache_path / "data.parquet"
+        split_ds.to_parquet(str(out_path))
+        logger.info(
+            "HuggingFace dataset %s (%d rows) cached at %s",
+            dataset_id, len(split_ds), out_path,
+        )
         return cache_path
 
     # ------------------------------------------------------------------ #

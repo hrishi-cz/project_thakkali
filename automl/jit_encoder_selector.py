@@ -211,6 +211,59 @@ def _make_convnext_tiny() -> nn.Module:
     return _freeze_and_eval(encoder)
 
 
+def _make_efficientnet_b0() -> nn.Module:
+    """EfficientNet-B0 backbone with projection to 512-dim output.
+
+    Fills the capacity gap between MobileNetV3-Small (2.5M) and
+    ResNet-50 (25.6M).  Uses the compound-scaling architecture from
+    *EfficientNet: Rethinking Model Scaling for CNNs*.
+    """
+    import torchvision.models as tv
+
+    try:
+        weights = tv.EfficientNet_B0_Weights.IMAGENET1K_V1
+        backbone = tv.efficientnet_b0(weights=weights)
+    except (TypeError, AttributeError):
+        backbone = tv.efficientnet_b0(pretrained=True)
+
+    # EfficientNet-B0 classifier[-1].in_features == 1280
+    in_features = backbone.classifier[-1].in_features
+    backbone.classifier = nn.Identity()
+
+    projection = nn.Sequential(
+        nn.Linear(in_features, 512),
+        nn.ReLU(),
+    )
+    encoder = _VisionEncoderWrapper(backbone, projection, output_dim=512)
+    return _freeze_and_eval(encoder)
+
+
+def _make_vit_b_16() -> nn.Module:
+    """ViT-B/16 (Vision Transformer) with projection to 512-dim output.
+
+    SOTA vision transformer ceiling (~86M params).  Uses the class token
+    output (hidden_dim=768) projected to the fusion-layer-expected 512-dim.
+    """
+    import torchvision.models as tv
+
+    try:
+        weights = tv.ViT_B_16_Weights.IMAGENET1K_V1
+        backbone = tv.vit_b_16(weights=weights)
+    except (TypeError, AttributeError):
+        backbone = tv.vit_b_16(pretrained=True)
+
+    # ViT heads is a single Linear(768, 1000); replace with Identity
+    in_features = backbone.heads[0].in_features  # 768
+    backbone.heads = nn.Identity()
+
+    projection = nn.Sequential(
+        nn.Linear(in_features, 512),
+        nn.ReLU(),
+    )
+    encoder = _VisionEncoderWrapper(backbone, projection, output_dim=512)
+    return _freeze_and_eval(encoder)
+
+
 # ── Text encoder factories ────────────────────────────────────────────────
 
 def _make_minilm() -> nn.Module:
@@ -252,6 +305,38 @@ def _make_deberta() -> nn.Module:
     return _freeze_and_eval(enc)
 
 
+def _make_albert() -> nn.Module:
+    """ALBERT-base-v2 — ultra-lightweight text encoder (~11.7M params).
+
+    Fills the gap below MiniLM-L6-v2 (22.7M).  Uses parameter sharing
+    and factorized embeddings, producing native 768-dim output (no
+    projection needed).  CLS-token pooling.
+    """
+    from modelss.encoders.text import TextEncoder
+    enc = TextEncoder(
+        model_name="albert-base-v2",
+        max_length=128,
+        freeze_backbone=True,
+    )
+    return _freeze_and_eval(enc)
+
+
+def _make_distilbert() -> nn.Module:
+    """DistilBERT-base-uncased — efficient BERT distillation (~66M params).
+
+    Fills the capacity gap between MiniLM (22.7M) and BERT-base (109.5M).
+    Six-layer distilled transformer with 768-dim native output (no
+    projection needed).  CLS-token pooling.
+    """
+    from modelss.encoders.text import TextEncoder
+    enc = TextEncoder(
+        model_name="distilbert-base-uncased",
+        max_length=128,
+        freeze_backbone=True,
+    )
+    return _freeze_and_eval(enc)
+
+
 # ── Dummy input generators ────────────────────────────────────────────────
 
 def _dummy_image(batch_size: int, device: torch.device) -> torch.Tensor:
@@ -277,6 +362,13 @@ VISION_REGISTRY: List[EncoderSpec] = [
         dummy_input_fn=_dummy_image,
     ),
     EncoderSpec(
+        name="EfficientNet-B0",
+        factory=_make_efficientnet_b0,
+        output_dim=512,
+        capacity=5_300_000,       # ~5.3M params
+        dummy_input_fn=_dummy_image,
+    ),
+    EncoderSpec(
         name="ResNet-50",
         factory=_make_resnet50,
         output_dim=512,
@@ -290,14 +382,35 @@ VISION_REGISTRY: List[EncoderSpec] = [
         capacity=28_600_000,      # ~28.6M params
         dummy_input_fn=_dummy_image,
     ),
+    EncoderSpec(
+        name="ViT-B-16",
+        factory=_make_vit_b_16,
+        output_dim=512,
+        capacity=86_000_000,      # ~86M params
+        dummy_input_fn=_dummy_image,
+    ),
 ]
 
 TEXT_REGISTRY: List[EncoderSpec] = [
+    EncoderSpec(
+        name="ALBERT-base-v2",
+        factory=_make_albert,
+        output_dim=768,
+        capacity=11_700_000,      # ~11.7M params
+        dummy_input_fn=_dummy_text,
+    ),
     EncoderSpec(
         name="MiniLM-L6-v2",
         factory=_make_minilm,
         output_dim=768,
         capacity=22_700_000,      # ~22.7M params
+        dummy_input_fn=_dummy_text,
+    ),
+    EncoderSpec(
+        name="DistilBERT",
+        factory=_make_distilbert,
+        output_dim=768,
+        capacity=66_000_000,      # ~66M params
         dummy_input_fn=_dummy_text,
     ),
     EncoderSpec(
@@ -561,6 +674,7 @@ class JITSelectionResult:
     total_peak_memory_bytes: int = 0
     vram_available_bytes: int = 0
     vram_budget_bytes: int = 0          # η · V_avail
+    per_encoder_profiles: List[Dict[str, Any]] = field(default_factory=list)
     selection_method: str = "jit_profiler"
     rationale: Dict[str, str] = field(default_factory=dict)
 
@@ -605,6 +719,7 @@ class JITEncoderSelector:
         self,
         modalities: List[str],
         device: Optional[torch.device] = None,
+        tabular_tier: Optional[str] = None,
     ) -> JITSelectionResult:
         """
         Select the highest-capacity encoder combination that fits in VRAM.
@@ -616,6 +731,10 @@ class JITEncoderSelector:
             ``["image", "text", "tabular"]``.
         device : torch.device or None
             Target CUDA device.  Auto-detected when ``None``.
+        tabular_tier : str or None
+            Heuristic tier from Phase 4 (``"simple"`` → MLP,
+            ``"interpretable"``/``"sota"`` → GRN).  When ``None``,
+            the highest-capacity tabular encoder is selected.
 
         Returns
         -------
@@ -628,12 +747,21 @@ class JITEncoderSelector:
         need_tabular = "tabular" in modalities
 
         # ── Tabular encoder selection (no VRAM profiling needed) ───────
-        # Tabular encoders are tiny (~5-12K params) and trainable, so we
-        # simply pick the highest-capacity type.  The orchestrator will
+        # Tabular encoders are tiny (~5-12K params) and trainable.
+        # Respect the heuristic tier from Phase 4 when provided;
+        # otherwise pick highest-capacity.  The orchestrator will
         # instantiate a fresh copy per Optuna trial.
+        _TIER_TO_NAME = {"simple": "MLP", "interpretable": "GRN", "sota": "GRN"}
         _tab_spec: Optional[TabularEncoderSpec] = None
         if need_tabular and TABULAR_REGISTRY:
-            _tab_spec = TABULAR_REGISTRY[0]   # highest capacity (GRN)
+            _target_name = _TIER_TO_NAME.get(tabular_tier) if tabular_tier else None
+            if _target_name:
+                _tab_spec = next(
+                    (s for s in TABULAR_REGISTRY if s.name == _target_name),
+                    TABULAR_REGISTRY[0],
+                )
+            else:
+                _tab_spec = TABULAR_REGISTRY[0]
             logger.info(
                 "JITEncoderSelector: tabular encoder type = %s "
                 "(capacity=%d, trainable per-trial)",
@@ -738,6 +866,9 @@ class JITEncoderSelector:
 
         combos.sort(key=lambda c: c[2], reverse=True)
 
+        # Accumulate per-encoder profiling entries for the benchmarks tab
+        all_profiles: List[Dict[str, Any]] = []
+
         # ── Profile each combination until one fits ───────────────────
         for v_spec, t_spec, total_cap in combos:
             combo_name = (
@@ -749,28 +880,30 @@ class JITEncoderSelector:
             total_peak = 0
             img_enc = None
             txt_enc = None
+            v_peak_bytes = 0
+            t_peak_bytes = 0
 
             try:
                 # Profile vision encoder
                 if v_spec is not None:
                     img_enc = v_spec.factory()
                     dummy = v_spec.dummy_input_fn(self._batch_size, device)
-                    v_peak = estimate_peak_memory(img_enc, dummy, device)
-                    total_peak += v_peak
+                    v_peak_bytes = estimate_peak_memory(img_enc, dummy, device)
+                    total_peak += v_peak_bytes
                     logger.info(
                         "    %s peak: %.2f MB",
-                        v_spec.name, v_peak / 1e6,
+                        v_spec.name, v_peak_bytes / 1e6,
                     )
 
                 # Profile text encoder
                 if t_spec is not None:
                     txt_enc = t_spec.factory()
                     dummy = t_spec.dummy_input_fn(self._batch_size, device)
-                    t_peak = estimate_peak_memory(txt_enc, dummy, device)
-                    total_peak += t_peak
+                    t_peak_bytes = estimate_peak_memory(txt_enc, dummy, device)
+                    total_peak += t_peak_bytes
                     logger.info(
                         "    %s peak: %.2f MB",
-                        t_spec.name, t_peak / 1e6,
+                        t_spec.name, t_peak_bytes / 1e6,
                     )
 
                 # ── Check constraint: F_peak ≤ η · V_avail ───────────
@@ -779,6 +912,22 @@ class JITEncoderSelector:
                         "  >> Selected %s -- peak %.2f MB <= budget %.2f MB",
                         combo_name, total_peak / 1e6, budget_bytes / 1e6,
                     )
+
+                    # Record profiling entries for selected combination
+                    if v_spec is not None:
+                        all_profiles.append({
+                            "modality": "image", "name": v_spec.name,
+                            "capacity": v_spec.capacity,
+                            "peak_memory_mb": round(v_peak_bytes / 1e6, 2),
+                            "status": "selected",
+                        })
+                    if t_spec is not None:
+                        all_profiles.append({
+                            "modality": "text", "name": t_spec.name,
+                            "capacity": t_spec.capacity,
+                            "peak_memory_mb": round(t_peak_bytes / 1e6, 2),
+                            "status": "selected",
+                        })
 
                     # Move selected encoders to GPU for training
                     if img_enc is not None:
@@ -809,6 +958,7 @@ class JITEncoderSelector:
                         total_peak_memory_bytes=total_peak,
                         selection_method="jit_profiler",
                         rationale=rationale,
+                        per_encoder_profiles=all_profiles,
                     )
 
                 else:
@@ -816,6 +966,21 @@ class JITEncoderSelector:
                         "  xx Rejected %s -- peak %.2f MB > budget %.2f MB",
                         combo_name, total_peak / 1e6, budget_bytes / 1e6,
                     )
+                    # Record profiling entries for rejected combination
+                    if v_spec is not None:
+                        all_profiles.append({
+                            "modality": "image", "name": v_spec.name,
+                            "capacity": v_spec.capacity,
+                            "peak_memory_mb": round(v_peak_bytes / 1e6, 2),
+                            "status": "rejected",
+                        })
+                    if t_spec is not None:
+                        all_profiles.append({
+                            "modality": "text", "name": t_spec.name,
+                            "capacity": t_spec.capacity,
+                            "peak_memory_mb": round(t_peak_bytes / 1e6, 2),
+                            "status": "rejected",
+                        })
                     # Clean up rejected encoders
                     self._cleanup_encoder(img_enc)
                     self._cleanup_encoder(txt_enc)
@@ -826,6 +991,18 @@ class JITEncoderSelector:
                 logger.warning(
                     "  xx Profiling failed for %s: %s", combo_name, exc,
                 )
+                if v_spec is not None:
+                    all_profiles.append({
+                        "modality": "image", "name": v_spec.name,
+                        "capacity": v_spec.capacity,
+                        "peak_memory_mb": 0, "status": "error",
+                    })
+                if t_spec is not None:
+                    all_profiles.append({
+                        "modality": "text", "name": t_spec.name,
+                        "capacity": t_spec.capacity,
+                        "peak_memory_mb": 0, "status": "error",
+                    })
                 self._cleanup_encoder(img_enc)
                 self._cleanup_encoder(txt_enc)
                 img_enc = None

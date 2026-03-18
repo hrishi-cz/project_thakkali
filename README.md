@@ -23,11 +23,11 @@ Training machine learning models on **multimodal data** (images, free-text, and 
 
 1. **Data Fusion Friction** -- Most AutoML frameworks (Auto-sklearn, AutoGluon, FLAML) treat modalities in isolation. Practitioners must manually engineer cross-modal feature pipelines, reconcile preprocessing schemas, and build custom fusion heads -- a process that is error-prone, time-consuming, and non-repeatable.
 
-2. **Compute Waste During HPO** -- Standard hyperparameter optimization loops instantiate heavyweight pretrained encoders (BERT: ~440 MB, ResNet-50: ~100 MB) *per trial*, exhausting GPU VRAM after 2--3 trials and causing silent OOM crashes or "zombie" trials that leak GPU memory without contributing to the search.
+2. **Compute Waste During HPO** -- Standard hyperparameter optimization loops instantiate heavyweight pretrained encoders (BERT: ~440 MB, ResNet-50: ~100 MB) _per trial_, exhausting GPU VRAM after 2--3 trials and causing silent OOM crashes or "zombie" trials that leak GPU memory without contributing to the search.
 
 3. **Feature Leakage at Scale** -- Raw datasets contain ID columns, datetime stamps, and high-cardinality strings that survive default preprocessing pipelines. Models train on these noise features, achieve artificially high validation scores, and **fail catastrophically in production**.
 
-4. **Black-Box Inference** -- After training, prediction UIs blindly ask users to fill in *every* column from the original dataset -- including leaked IDs and dates the model never used -- while providing **zero guidance** on expected input schema.
+4. **Black-Box Inference** -- After training, prediction UIs blindly ask users to fill in _every_ column from the original dataset -- including leaked IDs and dates the model never used -- while providing **zero guidance** on expected input schema.
 
 **AutoVision+** solves all four problems within a single, opinionated **7-phase pipeline** that automates the entire journey from raw multi-source data to deployed, explainable predictions.
 
@@ -38,17 +38,21 @@ Training machine learning models on **multimodal data** (images, free-text, and 
 ### What AutoVision+ Handles
 
 - **Multi-format ingestion** across CSV, Parquet, image directories, ZIP archives, and Kaggle datasets
-- **Multimodal preprocessing**: JIT-selected vision backbone (ConvNeXt-Tiny / ResNet-50 / MobileNetV3) for images, JIT-selected text encoder (DeBERTa-v3-base / BERT-base / MiniLM-L6-v2) for text, GRN/MLP tabular encoder, sklearn ColumnTransformer for tabular feature engineering
+- **Multimodal preprocessing**: JIT-selected vision backbone (ViT-B-16 / ConvNeXt-Tiny / ResNet-50 / EfficientNet-B0 / MobileNetV3-Small) for images, JIT-selected text encoder (DeBERTa-v3-base / BERT-base-uncased / DistilBERT / MiniLM-L6-v2 / ALBERT-base-v2) for text, GRN/MLP tabular encoder, sklearn ColumnTransformer for tabular feature engineering
 - **Automatic feature leakage prevention**: heuristic ID/datetime/high-uniqueness column filtering before training
 - **Cost-efficient HPO**: Optuna with HyperbandPruner, shared frozen encoders (single VRAM allocation across all trials), frozen encoder embedding pre-computation (eliminating redundant forward passes), and per-trial trainable tabular encoders with independent random initialization
 - **Dual fusion strategies**: concatenation and learned attention-weighted fusion
 - **Production-grade training**: PyTorch Lightning with FP16 mixed precision, EarlyStopping, stratified splits, and automatic class weighting
-- **Statistical drift detection** (PSI, KS, MMD) with **autonomous retraining triggers**
+- **Statistical drift detection** (PSI, KS, MMD) with **autonomous retraining triggers** and **actionable per-metric recommendations**
+- **Smart training callbacks** with automatic classification of stop reasons (flatline, overfitting, underfitting, convergence) and dynamic epoch extension for underfitting detection using **relative thresholds** (scale-invariant for regression and classification)
 - **Full artifact serialization** (weights, scalers, tokenizers, schemas) to a versioned model registry
-- **Captum XAI** with auto-targeting of the predicted class
+- **Captum XAI** with 6 attribution methods (IG, GradientShap, Saliency, Occlusion, FeatureAblation, SmoothGrad), GradCAM image saliency, and AttentionFusion weight visualization
 - **Schema-guided inference API** and **dynamic Streamlit frontend**
 - **WebSocket streaming inference** (`/ws/predict`) with chunked progress frames for real-time batch prediction feedback
 - **Startup-loadable encoder plugins** via `config/encoder_plugins.py` for custom vision/text/tabular architectures without modifying core code
+- **Opt-in API key authentication** via `APEX_API_KEY` environment variable with `X-API-Key` header enforcement
+- **Canonical encoder naming** across all subsystems (JIT profiler, heuristic selector, hyperparameter config) with `CANONICAL_TO_HF` mapping for weight loading
+- **SQLite-persisted performance tracking** with macro F1/precision/recall for classification and bounded history (10K entries per model)
 
 ### What It Excludes
 
@@ -62,21 +66,29 @@ Training machine learning models on **multimodal data** (images, free-text, and 
 
 ## Competitive Edge
 
-| Capability | Auto-sklearn | AutoGluon | FLAML | **AutoVision+** |
-|---|:---:|:---:|:---:|:---:|
-| Tabular AutoML | Yes | Yes | Yes | Yes |
-| Image + Text + Tabular Fusion | No | Partial | No | **Yes** |
-| JIT Hardware-Constrained Encoder Selection | N/A | No | N/A | **Yes** |
-| Shared Frozen Encoders in HPO | N/A | No | N/A | **Yes** |
-| Frozen Encoder Embedding Pre-computation | N/A | No | N/A | **Yes** |
-| Hot-Loadable Encoder Plugins | N/A | No | N/A | **Yes** (startup) |
-| WebSocket Streaming Inference | No | No | No | **Yes** |
-| Trainable Tabular Encoder (GRN/MLP) in HPO | No | No | No | **Yes** |
-| Automatic ID/Date Column Filtering | No | No | No | **Yes** |
-| Schema-Guided Inference UI | No | No | No | **Yes** |
-| SQLite Multi-Worker Task State | No | No | No | **Yes** |
-| Statistical Drift Detection (PSI/KS/MMD) | No | No | No | **Yes** |
-| XAI Auto-Targeting (Captum IG) | No | No | No | **Yes** |
+| Capability                                 | Auto-sklearn | AutoGluon | FLAML |  **AutoVision+**  |
+| ------------------------------------------ | :----------: | :-------: | :---: | :---------------: |
+| Tabular AutoML                             |     Yes      |    Yes    |  Yes  |        Yes        |
+| Image + Text + Tabular Fusion              |      No      |  Partial  |  No   |      **Yes**      |
+| JIT Hardware-Constrained Encoder Selection |     N/A      |    No     |  N/A  |      **Yes**      |
+| Shared Frozen Encoders in HPO              |     N/A      |    No     |  N/A  |      **Yes**      |
+| Frozen Encoder Embedding Pre-computation   |     N/A      |    No     |  N/A  |      **Yes**      |
+| Hot-Loadable Encoder Plugins               |     N/A      |    No     |  N/A  | **Yes** (startup) |
+| WebSocket Streaming Inference              |      No      |    No     |  No   |      **Yes**      |
+| Trainable Tabular Encoder (GRN/MLP) in HPO |      No      |    No     |  No   |      **Yes**      |
+| Automatic ID/Date Column Filtering         |      No      |    No     |  No   |      **Yes**      |
+| Schema-Guided Inference UI                 |      No      |    No     |  No   |      **Yes**      |
+| SQLite Multi-Worker Task State             |      No      |    No     |  No   |      **Yes**      |
+| Statistical Drift Detection (PSI/KS/MMD)   |      No      |    No     |  No   |      **Yes**      |
+| Actionable Drift Recommendations           |      No      |    No     |  No   |      **Yes**      |
+| Smart Training Callback (Stop Classification) |   No      |    No     |  No   |      **Yes**      |
+| XAI Multi-Method (Captum 6 methods + GradCAM) |      No      |    No     |  No   |      **Yes**      |
+| Opt-in API Key Authentication              |      No      |    No     |  No   |      **Yes**      |
+| Canonical Encoder Naming Contract          |     N/A      |    No     |  N/A  |      **Yes**      |
+| SQLite-Persisted Performance Tracking      |      No      |    No     |  No   |      **Yes**      |
+| Expanded JIT Registry                      |     N/A      |    No     |  N/A  | **Yes** (5 vision + 5 text + 2 tabular encoders, capacity-sorted, constrained optimization) |
+| System Benchmarks Dashboard                |      No      |    No     |  No   | **Yes** (JIT profiler results, FinOps savings, multimodal ablation, inference latency) |
+| Prediction Latency Tracking                |      No      |    No     |  No   | **Yes** (end-to-end P50/P95 inference latency captured per prediction) |
 
 AutoVision+'s core differentiator is treating **the entire lifecycle** -- from raw data ingestion through drift-triggered retraining -- as a single automated pipeline, rather than a collection of disconnected notebooks. The 7-phase orchestrator ensures that preprocessing state, feature contracts, and model provenance are serialized atomically, **eliminating the "training-serving skew"** that plagues ad-hoc ML workflows.
 
@@ -113,25 +125,25 @@ graph LR
     subgraph "Serving"
         H --> I[FastAPI Backend<br/>Async inference + SQLite task state<br/>WebSocket streaming + LRU engine cache]
         I --> J[Streamlit Frontend<br/>7-phase guided workflow]
-        I --> K[Captum XAI<br/>IntegratedGradients]
+        I --> K[Captum XAI<br/>IG · GradientShap · GradCAM · Saliency · Occlusion · SmoothGrad]
     end
 ```
 
 ### Tech Stack
 
-| Layer | Technology |
-|---|---|
-| **Core ML** | PyTorch 2.0, PyTorch Lightning, torchvision (ConvNeXt-Tiny / ResNet-50 / MobileNetV3), HuggingFace Transformers (DeBERTa-v3-base / BERT-base / MiniLM-L6-v2), torchmetrics |
-| **AutoML / HPO** | Optuna (HyperbandPruner), MLflow (experiment tracking), JIT Encoder Selector (VRAM-constrained optimization) |
-| **Preprocessing** | scikit-learn (ColumnTransformer, StandardScaler, OHE), Pandas, NumPy |
-| **Tabular Encoding** | Gated Residual Network (GRN) and MLP encoders with per-trial trainable weights |
-| **Drift Detection** | SciPy (KS test), custom PSI + MMD implementations |
-| **Explainability** | Captum (IntegratedGradients) |
-| **Backend API** | FastAPI, Uvicorn, Pydantic |
-| **Task State** | SQLite (WAL mode) -- multi-worker-safe task persistence via `task_store.py` |
-| **Streaming Inference** | FastAPI WebSocket (`/ws/predict`) with chunked progress frames |
-| **Frontend** | Streamlit, Altair |
-| **Data I/O** | aiohttp (async downloads), Polars/Dask (lazy loading), joblib (serialization) |
+| Layer                   | Technology                                                                                                                                                                 |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Core ML**             | PyTorch 2.0, PyTorch Lightning, torchvision (ViT-B-16 / ConvNeXt-Tiny / ResNet-50 / EfficientNet-B0 / MobileNetV3-Small), HuggingFace Transformers (DeBERTa-v3-base / BERT-base-uncased / DistilBERT / MiniLM-L6-v2 / ALBERT-base-v2), torchmetrics |
+| **AutoML / HPO**        | Optuna (HyperbandPruner), MLflow (experiment tracking), JIT Encoder Selector (VRAM-constrained optimization)                                                               |
+| **Preprocessing**       | scikit-learn (ColumnTransformer, StandardScaler, OHE), Pandas, NumPy                                                                                                       |
+| **Tabular Encoding**    | Gated Residual Network (GRN) and MLP encoders with per-trial trainable weights                                                                                             |
+| **Drift Detection**     | SciPy (KS test), custom PSI + MMD implementations                                                                                                                          |
+| **Explainability**      | Captum (IntegratedGradients, GradientShap, Saliency, Occlusion, FeatureAblation, NoiseTunnel/SmoothGrad, LayerGradCam), AttentionFusion weight extraction |
+| **Backend API**         | FastAPI, Uvicorn, Pydantic                                                                                                                                                 |
+| **Task State**          | SQLite (WAL mode) -- multi-worker-safe task persistence via `task_store.py`                                                                                                |
+| **Streaming Inference** | FastAPI WebSocket (`/ws/predict`) with chunked progress frames                                                                                                             |
+| **Frontend**            | Streamlit, Altair                                                                                                                                                          |
+| **Data I/O**            | aiohttp (async downloads), Polars/Dask (lazy loading), joblib (serialization)                                                                                              |
 
 ---
 
@@ -153,9 +165,9 @@ Theoretical VRAM estimates (parameter count x dtype size) are inaccurate because
 
 The JIT Encoder Selector (`automl/jit_encoder_selector.py`) maintains typed registries of vision, text, and tabular encoder specifications, each recording a factory function, output dimensionality, and a human-readable name. At selection time:
 
-1. **Capacity Registry** -- Three sorted lists rank encoders by parameter count (descending). Vision: ConvNeXt-Tiny (28.6M params, 512-dim) > ResNet-50 (25.6M, 512-dim) > MobileNetV3-Small (2.5M, 512-dim). Text: DeBERTa-v3-base (768-dim) > BERT-base (768-dim) > MiniLM-L6-v2 (384-dim, projected to 768). Tabular: GRN (16-dim) > MLP (16-dim).
+1. **Capacity Registry** -- Three sorted lists rank encoders by parameter count (descending). Vision: ViT-B-16 (86M) > ConvNeXt-Tiny (28.6M, 512-dim) > ResNet-50 (25.6M, 512-dim) > EfficientNet-B0 (5.3M) > MobileNetV3-Small (2.5M, 512-dim). Text: DeBERTa-v3-base (183.8M, 768-dim) > BERT-base-uncased (109.5M, 768-dim) > DistilBERT (66M) > MiniLM-L6-v2 (22.7M, 384-dim, projected to 768) > ALBERT-base-v2 (11.7M). Tabular: GRN (12K, 16-dim) > MLP (5K, 16-dim).
 
-2. **Exhaustive Search** -- The selector enumerates the Cartesian product of all vision x text candidates (3 x 3 = 9 combinations). Combinations are sorted descending by total capacity so the first feasible solution found is guaranteed to be the maximum-capacity fit.
+2. **Exhaustive Search** -- The selector enumerates the Cartesian product of all vision x text candidates (5 x 5 = 25 combinations). Combinations are sorted descending by total capacity so the first feasible solution found is guaranteed to be the maximum-capacity fit.
 
 3. **Dummy-Forward VRAM Profiling** -- Each candidate combination is instantiated on GPU, a synthetic batch is passed through, and `torch.cuda.max_memory_allocated()` records actual peak VRAM. A safety margin (eta = 0.85) reserves 15% of total VRAM for optimizer state and activations during training.
 
@@ -179,7 +191,7 @@ The pipeline has three distinct performance bottlenecks where redundant computat
 
 `data_ingestion/ingestion_manager.py`
 
-- **Mechanism:** Every ingested source (URL, file path, Kaggle slug) is hashed using SHA-256 (16-character truncated digest) after URL normalization (Kaggle slugs are canonicalized). The hash is computed on the *normalized source string*, not the file contents. Ingested DataFrames are persisted in a `data/dataset_cache/` directory with the hash as subdirectory name.
+- **Mechanism:** Every ingested source (URL, file path, Kaggle slug) is hashed using SHA-256 (16-character truncated digest) after URL normalization (Kaggle slugs are canonicalized). The hash is computed on the _normalized source string_, not the file contents. Ingested DataFrames are persisted in a `data/dataset_cache/` directory with the hash as subdirectory name.
 - **Invalidation:** Source-addressed -- the same source URL always produces the same hash, so no TTL or manual invalidation is needed. Re-ingesting an unchanged source is a zero-cost cache hit.
 - **Atomicity:** Metadata writes use `tempfile.mkstemp()` + `os.replace()` for atomic file replacement, preventing corrupted metadata if the process crashes mid-write.
 - **Migration:** Legacy hashes (SHA-256 on raw, non-normalized source strings) are detected and transparently upgraded to normalized hashes on first access.
@@ -209,7 +221,7 @@ Optuna's HyperbandPruner prunes underperforming trials mid-training. When a tria
 
 **Solution -- Unconditional GPU Cleanup with Fail-Safe Teardown:**
 
-Every HPO trial is wrapped in a `try/except/finally` block in `pipeline/training_orchestrator.py`. The `finally` clause executes unconditionally -- on success, error, *and* Optuna pruning:
+Every HPO trial is wrapped in a `try/except/finally` block in `pipeline/training_orchestrator.py`. The `finally` clause executes unconditionally -- on success, error, _and_ Optuna pruning:
 
 1. Non-winning trial models are moved to CPU and dereferenced
 2. `torch.cuda.empty_cache()` releases the CUDA memory pool
@@ -219,7 +231,7 @@ Every HPO trial is wrapped in a `try/except/finally` block in `pipeline/training
 Combined with HyperbandPruner (aggressively killing bottom-performing trials at intermediate epochs) and EarlyStopping (halting stalled training after consecutive epochs of no improvement), 100% of GPU budget is directed toward promising configurations.
 
 **Why This Design:**
-The `finally` block is critical because Optuna raises `optuna.TrialPruned` (a subclass of `Exception`) to signal pruning -- a bare `except` would catch it, but the model cleanup code must run regardless of *how* the trial ends. Explicit `finally` is the only pattern that guarantees cleanup in all three exit paths (success, error, prune).
+The `finally` block is critical because Optuna raises `optuna.TrialPruned` (a subclass of `Exception`) to signal pruning -- a bare `except` would catch it, but the model cleanup code must run regardless of _how_ the trial ends. Explicit `finally` is the only pattern that guarantees cleanup in all three exit paths (success, error, prune).
 
 ---
 
@@ -336,15 +348,15 @@ ML pipeline tools are typically built for local development and lack basic input
 
 **Solutions Implemented:**
 
-| Vulnerability | Location | Mechanism |
-|---|---|---|
-| **Directory Traversal** | `run_api.py` | Regex validation (`^[\w\-.:]+$`) + `..` rejection on all `model_id` parameters |
-| **ZipSlip** | `ingestion_manager.py` | Member path resolution + `startswith()` check before `extractall()` |
-| **XSS** | `app_enhanced.py` | `html.escape()` on all user-derived token text before HTML embedding |
-| **CORS Misconfiguration** | `run_api.py` | Origin whitelist (`localhost:8501`, `127.0.0.1:8501`) instead of wildcard `*` |
-| **Session State Races** | `run_api.py` | `threading.Lock` protecting shared `session_ingested_hashes` on `/detect-schema` and `/preprocess` |
-| **SQLite TOCTOU** | `task_store.py` | `BEGIN IMMEDIATE` transactions for atomic read-modify-write on payload updates |
-| **Unsafe Deserialization** | `model_registry.py` | `torch.load(..., weights_only=True)` to prevent arbitrary code execution via pickle |
+| Vulnerability              | Location               | Mechanism                                                                                          |
+| -------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------- |
+| **Directory Traversal**    | `run_api.py`           | Regex validation (`^[\w\-.:]+$`) + `..` rejection on all `model_id` parameters                     |
+| **ZipSlip**                | `ingestion_manager.py` | Member path resolution + `startswith()` check before `extractall()`                                |
+| **XSS**                    | `app_enhanced.py`      | `html.escape()` on all user-derived token text before HTML embedding                               |
+| **CORS Misconfiguration**  | `run_api.py`           | Origin whitelist (`localhost:8501`, `127.0.0.1:8501`) instead of wildcard `*`                      |
+| **Session State Races**    | `run_api.py`           | `threading.Lock` protecting shared `session_ingested_hashes` on `/detect-schema` and `/preprocess` |
+| **SQLite TOCTOU**          | `task_store.py`        | `BEGIN IMMEDIATE` transactions for atomic read-modify-write on payload updates                     |
+| **Unsafe Deserialization** | `model_registry.py`    | `torch.load(..., weights_only=True)` to prevent arbitrary code execution via pickle                |
 
 ---
 
@@ -365,6 +377,63 @@ Medical and industrial datasets are often heavily skewed (e.g., 95% healthy, 5% 
 
 **Solution:**
 Before training, the pipeline computes inverse-frequency class weights from the training split's target distribution. These weights are injected into the loss function -- `CrossEntropyLoss` for multiclass or `BCEWithLogitsLoss` with calibrated `pos_weight` for binary. No user configuration required; imbalance is detected and compensated automatically.
+
+---
+
+## Additional Features
+
+The following capabilities are fully implemented but were not covered in the design problems section above.
+
+### Data Ingestion
+
+- **ECG Domain Adapter** (`data_ingestion/adapters/ecg_adapter.py`) -- Full PTB-XL ECG waveform adapter with SCP code expansion, image path resolution, and ECG-specific preprocessing configuration (landscape 224x448).
+- **DVC Lineage Integration** -- `dvc add` is called on cached dataset directories for version control lineage. Fails silently if DVC is not installed.
+- **Mendeley URL Rejection** -- Mendeley academic download URLs are explicitly rejected with `ValueError` (unsupported source).
+- **Legacy Cache Hash Migration** -- Pre-normalization SHA-256 hashes are transparently detected and migrated to normalized hashes on first cache access.
+
+### Streaming & Large-Scale Data
+
+- **AutoVisionIterableDataset** (`training_orchestrator.py`) -- Out-of-core streaming `IterableDataset` for datasets exceeding RAM. Fixed-size chunk reading from CSV/Parquet with multi-worker sharding. Available as an alternative to the standard map-style dataset path.
+
+### API Endpoints
+
+- **Image Upload** (`POST /upload/image`) -- Multipart file upload with UUID naming, MIME type validation, and 10 MB size limit.
+- **Production Drift Check** (`POST /predict/drift-check`) -- Lightweight drift detection comparing buffered prediction inputs against saved `drift_reference.npy`.
+- **Prediction Buffer Stats** (`GET /predict/buffer-stats/{model_id}`) -- Returns count of buffered prediction inputs for a given model.
+- **Model Delete** (`DELETE /model-registry/{model_id}`) -- Deletes a registered model and all its artifacts from the registry.
+- **Model Rename** (`PATCH /model-registry/{model_id}/rename`) -- Sets a `display_name` for a registered model (metadata-only, preserves directory structure and cache references).
+- **Model Download** (`GET /model-registry/{model_id}/download`) -- Downloads a registered model as a ZIP archive containing all artifacts.
+
+### Inference
+
+- **Base64 Image Support** -- `_resolve_image()` in the inference engine supports data URIs, raw base64, raw bytes, HTTP/HTTPS URLs, and file paths for image input.
+- **Prediction Input Validation** -- Schema mismatches (missing or extra columns) are detected and surfaced as warnings in the prediction response while still producing results via zero-fill fallback.
+
+### Configuration
+
+- **Hyperparameter Presets** -- Five named presets (`small`, `medium`, `large`, `fast`, `premium`) in `config/hyperparameters.py` for quick configuration. The `large` preset now uses SOTA encoders (ConvNeXt-Tiny + DeBERTa-v3-base). The `premium` preset targets maximum capacity with ViT-B-16 + DeBERTa-v3-base.
+- **Config File Loading** -- `HyperparameterConfig.from_json()` and `HyperparameterConfig.from_yaml()` for loading config from external files, with `save_json()` and `save_yaml()` for persistence.
+- **Canonical Encoder Names** -- All presets, HYPERPARAMETERS options, and Optuna distributions use canonical JIT registry names (`MobileNetV3-Small`, `EfficientNet-B0`, `ResNet-50`, `ConvNeXt-Tiny`, `ViT-B-16`, `ALBERT-base-v2`, `MiniLM-L6-v2`, `DistilBERT`, `BERT-base-uncased`, `DeBERTa-v3-base`). `CANONICAL_TO_HF` mapping bridges to HuggingFace model identifiers for weight loading.
+
+### Security
+
+- **API Key Authentication** -- Opt-in via `APEX_API_KEY` environment variable. When set, all endpoints (except `/`, `/health`, `/docs`) require `X-API-Key` header. Frontend reads the same env var automatically.
+
+### Monitoring
+
+- **PerformanceTracker** (`monitoring/performance_tracker.py`) -- SQLite-persisted per-model prediction tracking with accuracy/macro-F1/precision/recall for classification, MSE/MAE/RMSE for regression, time-windowed trends, and bounded history (10K entries per model).
+- **System Benchmarks Dashboard** -- The frontend includes a System Benchmarks tab displaying JIT profiler results (encoder selection latency and VRAM usage), FinOps savings estimates, multimodal ablation comparisons, and end-to-end inference latency metrics (P50/P95).
+
+### Frontend
+
+- **Confidence Visualization** -- Per-class probability bar charts and batch confidence histograms in the prediction results view.
+- **Prediction History** -- Rolling 20-entry prediction log maintained in session state for the current session.
+- **Model Rename UI** -- In-place model renaming via `display_name` metadata (preserves model_id and all cache references).
+- **Model Details Expanders** -- Per-model expandable panels in the registry tab showing encoders, training metrics, hyperparameters, and stop reason.
+- **"Use for Prediction" Reaccess** -- One-click navigation from model registry to Phase 7 with the selected model pre-loaded.
+- **Drift Recommendations** -- Actionable per-metric drift recommendations with a "Retrain Now" button that navigates to Phase 5.
+- **Smart Stop Reason Display** -- Training stop reasons (flatline, overfitting, underfitting_extended, converged, completed) shown with contextual styling (success/warning/info).
+- **Loss Chart Early-Stop Annotation** -- Dashed red vertical rules on the loss chart at the step where each trial was early-stopped.
 
 ---
 
@@ -394,13 +463,19 @@ pip install -r requirements.txt
 ### Running the Platform
 
 **Terminal 1 -- Backend API:**
+
 ```bash
 python run_api.py
-# FastAPI server starts on http://localhost:8000
-# API docs available at http://localhost:8000/docs
+# FastAPI server starts on http://localhost:8001
+# API docs available at http://localhost:8001/docs
+
+# Optional: enable API key authentication
+# export APEX_API_KEY=your-secret-key   # Linux/macOS
+# set APEX_API_KEY=your-secret-key      # Windows
 ```
 
 **Terminal 2 -- Frontend UI:**
+
 ```bash
 streamlit run frontend/app_enhanced.py
 # Streamlit app opens at http://localhost:8501
@@ -427,8 +502,8 @@ main-project/
 │   └── model_selector.py          # Selection API wrapper (deprecated)
 ├── modelss/
 │   ├── encoders/
-│   │   ├── image.py               # Vision backbones (ConvNeXt-Tiny / ResNet-50 / MobileNetV3)
-│   │   ├── text.py                # Text encoders (DeBERTa-v3 / BERT / MiniLM-L6-v2)
+│   │   ├── image.py               # Vision backbones (ViT-B-16 / ConvNeXt-Tiny / ResNet-50 / EfficientNet-B0 / MobileNetV3-Small)
+│   │   ├── text.py                # Text encoders (DeBERTa-v3-base / BERT-base-uncased / DistilBERT / MiniLM-L6-v2 / ALBERT-base-v2)
 │   │   └── tabular.py             # Tabular encoders (GRN + MLP, trainable)
 │   ├── fusion.py                  # Concatenation + Attention fusion
 │   └── predictor.py               # Multimodal predictor (legacy)
@@ -463,13 +538,13 @@ main-project/
 
 ### Future Roadmap
 
-| Priority | Enhancement | Description |
-|---|---|---|
-| P0 | **Advanced SHAP Integration** | Add KernelSHAP and DeepSHAP alongside IntegratedGradients for richer, method-comparative explanations |
-| P1 | **Distributed Training** | PyTorch Lightning DDPStrategy for multi-GPU scaling |
-| P1 | **Time-Series Modality** | Add temporal encoder (LSTM / Transformer) for sequential data fusion |
-| P2 | **Task State Cleanup** | Automatic TTL-based cleanup of completed/failed tasks from `tasks.db` |
-| P3 | **Deployment Export** | ONNX / TorchScript export with integrated pre/post-processing for edge deployment |
+| Priority | Enhancement                   | Description                                                                                           |
+| -------- | ----------------------------- | ----------------------------------------------------------------------------------------------------- |
+| P2       | **KernelSHAP / DeepSHAP**     | Add KernelSHAP and DeepSHAP for model-agnostic comparison alongside the 6 existing Captum methods    |
+| P1       | **Distributed Training**      | PyTorch Lightning DDPStrategy for multi-GPU scaling                                                   |
+| P1       | **Time-Series Modality**      | Add temporal encoder (LSTM / Transformer) for sequential data fusion                                  |
+| P2       | **Task State Cleanup**        | Automatic TTL-based cleanup of completed/failed tasks from `tasks.db`                                 |
+| P3       | **Deployment Export**         | ONNX / TorchScript export with integrated pre/post-processing for edge deployment                     |
 
 ---
 

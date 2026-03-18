@@ -65,13 +65,15 @@ class IndividualSchema:
         dataset_id:        The SHA-256 hash (or name) identifying the dataset.
         detected_columns:  Mapping from modality label to the list of column
                            names assigned to that modality.
-                           Keys: "image", "text", "tabular", "timeseries".
+                           Keys: "image", "text", "tabular", "timeseries",
+                                  "mask".
         target_column:     Best-guess prediction target column name, or
                            "Unknown" when detection fails.
         problem_type:      One of:  "classification_binary",
                                     "classification_multiclass",
                                     "regression",
                                     "multilabel_classification",
+                                    "segmentation",
                                     "unsupervised".
         modalities:        Sorted list of modality keys that have at least one
                            column assigned to them.
@@ -85,6 +87,7 @@ class IndividualSchema:
             "text": [],
             "tabular": [],
             "timeseries": [],
+            "mask": [],
         }
     )
     target_column: str = "Unknown"

@@ -34,10 +34,10 @@ class HyperparameterConfig:
     bounds that Optuna uses to propose improved values.
     """
 
-    # Encoder names
-    image_encoder_name: str = "resnet50"
+    # Encoder names (canonical JIT registry identifiers)
+    image_encoder_name: str = "ResNet-50"
     image_output_dim: int = 2048
-    text_model_name: str = "bert-base-uncased"
+    text_model_name: str = "BERT-base-uncased"
     text_output_dim: int = 768
     tabular_hidden_dims: Optional[List[int]] = None
     tabular_output_dim: int = 128
@@ -52,6 +52,11 @@ class HyperparameterConfig:
     num_epochs: int = 10
     dropout: float = 0.2
     weight_decay: float = 1e-5
+
+    # Segmentation-specific
+    seg_decoder: str = "unet"
+    seg_num_classes: int = 2
+    seg_input_size: int = 256
 
     def __post_init__(self) -> None:
         if self.tabular_hidden_dims is None:
@@ -155,18 +160,20 @@ def get_optuna_distributions() -> Dict[str, Dict[str, Any]]:
         # ── Architecture ──────────────────────────────────────────────
         "image_encoder_name": {
             "type":    "categorical",
-            "choices": ["MobileNetV3", "ResNet50", "ViT-Base"],
-            "description": "Image backbone",
+            "choices": ["MobileNetV3-Small", "EfficientNet-B0", "ResNet-50",
+                        "ConvNeXt-Tiny", "ViT-B-16"],
+            "description": "Image backbone (matched to JIT encoder registry)",
         },
         "text_model_name": {
             "type":    "categorical",
-            "choices": ["DistilBERT", "BERT-base", "RoBERTa-large"],
-            "description": "Text transformer backbone",
+            "choices": ["ALBERT-base-v2", "MiniLM-L6-v2", "DistilBERT",
+                        "BERT-base-uncased", "DeBERTa-v3-base"],
+            "description": "Text transformer backbone (matched to JIT encoder registry)",
         },
         "tabular_encoder_name": {
             "type":    "categorical",
-            "choices": ["MLP", "TabNet", "FT-Transformer"],
-            "description": "Tabular encoder architecture",
+            "choices": ["MLP", "GRN"],
+            "description": "Tabular encoder architecture (matched to JIT encoder registry)",
         },
         "fusion_strategy": {
             "type":    "categorical",
@@ -197,22 +204,23 @@ def get_optuna_distributions() -> Dict[str, Dict[str, Any]]:
 HYPERPARAMETERS: Dict[str, Dict[str, Any]] = {
     "image_encoder_name": {
         "type":    "string",
-        "default": "resnet50",
-        "options": ["resnet50", "mobilenet_v3_small", "efficientnet_b0", "vit_base_patch16_224"],
+        "default": "ResNet-50",
+        "options": ["MobileNetV3-Small", "EfficientNet-B0", "ResNet-50",
+                    "ConvNeXt-Tiny", "ViT-B-16"],
     },
     "image_output_dim":  {"type": "integer", "default": 2048, "min": 64,  "max": 2048},
     "tabular_output_dim":{"type": "integer", "default": 128,  "min": 32,  "max": 512},
     "text_model_name": {
         "type":    "string",
-        "default": "bert-base-uncased",
-        "options": ["distilbert-base-uncased", "bert-base-uncased",
-                    "roberta-base", "roberta-large"],
+        "default": "BERT-base-uncased",
+        "options": ["ALBERT-base-v2", "MiniLM-L6-v2", "DistilBERT",
+                    "BERT-base-uncased", "DeBERTa-v3-base"],
     },
     "text_output_dim":   {"type": "integer", "default": 768,  "min": 64,  "max": 1024},
     "fusion_strategy": {
         "type":    "string",
         "default": "attention",
-        "options": ["concatenation", "attention", "weighted"],
+        "options": ["concatenation", "attention"],
     },
     "learning_rate": {"type": "float",   "default": 1e-3,  "min": 1e-6, "max": 1e-1},
     "batch_size":    {"type": "integer", "default": 32,
@@ -220,6 +228,30 @@ HYPERPARAMETERS: Dict[str, Dict[str, Any]] = {
     "num_epochs":    {"type": "integer", "default": 10,    "min": 1,    "max": 100},
     "dropout":       {"type": "float",   "default": 0.2,   "min": 0.0,  "max": 0.9},
     "weight_decay":  {"type": "float",   "default": 1e-5,  "min": 1e-7, "max": 1e-1},
+    # Segmentation
+    "seg_decoder":   {"type": "string",  "default": "unet", "options": ["unet"]},
+    "seg_num_classes":{"type": "integer", "default": 2,     "min": 2,   "max": 256},
+    "seg_input_size":{"type": "integer", "default": 256,    "min": 64,  "max": 1024},
+}
+
+# Canonical display name → HuggingFace / torchvision model identifier.
+# Used by code that needs to load pretrained weights from a canonical name.
+CANONICAL_TO_HF: Dict[str, str] = {
+    # Vision
+    "MobileNetV3-Small": "mobilenet_v3_small",
+    "EfficientNet-B0":   "efficientnet_b0",
+    "ResNet-50":         "resnet50",
+    "ConvNeXt-Tiny":     "convnext_tiny",
+    "ViT-B-16":          "vit_b_16",
+    # Text
+    "ALBERT-base-v2":    "albert-base-v2",
+    "MiniLM-L6-v2":      "sentence-transformers/all-MiniLM-L6-v2",
+    "DistilBERT":        "distilbert-base-uncased",
+    "BERT-base-uncased":  "bert-base-uncased",
+    "DeBERTa-v3-base":   "microsoft/deberta-v3-base",
+    # Tabular (no HF counterpart — class-based)
+    "MLP":               "MLP",
+    "GRN":               "GRN",
 }
 
 
@@ -229,10 +261,10 @@ HYPERPARAMETERS: Dict[str, Dict[str, Any]] = {
 
 PRESETS: Dict[str, Dict[str, Any]] = {
     "small": {
-        "image_encoder_name": "mobilenet_v3_small",
+        "image_encoder_name": "MobileNetV3-Small",
         "image_output_dim":   128,
         "tabular_output_dim": 64,
-        "text_model_name":    "distilbert-base-uncased",
+        "text_model_name":    "MiniLM-L6-v2",
         "text_output_dim":    128,
         "fusion_strategy":    "concatenation",
         "learning_rate":      5e-4,
@@ -242,10 +274,10 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "weight_decay":       1e-5,
     },
     "medium": {
-        "image_encoder_name": "resnet50",
+        "image_encoder_name": "ResNet-50",
         "image_output_dim":   2048,
         "tabular_output_dim": 128,
-        "text_model_name":    "bert-base-uncased",
+        "text_model_name":    "BERT-base-uncased",
         "text_output_dim":    768,
         "fusion_strategy":    "attention",
         "learning_rate":      1e-3,
@@ -255,11 +287,11 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "weight_decay":       1e-5,
     },
     "large": {
-        "image_encoder_name": "resnet50",
+        "image_encoder_name": "ConvNeXt-Tiny",
         "image_output_dim":   2048,
         "tabular_output_dim": 256,
-        "text_model_name":    "roberta-large",
-        "text_output_dim":    1024,
+        "text_model_name":    "DeBERTa-v3-base",
+        "text_output_dim":    768,
         "fusion_strategy":    "attention",
         "learning_rate":      1e-3,
         "batch_size":         64,
@@ -268,10 +300,10 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "weight_decay":       1e-4,
     },
     "fast": {
-        "image_encoder_name": "mobilenet_v3_small",
+        "image_encoder_name": "MobileNetV3-Small",
         "image_output_dim":   128,
         "tabular_output_dim": 64,
-        "text_model_name":    "distilbert-base-uncased",
+        "text_model_name":    "MiniLM-L6-v2",
         "text_output_dim":    128,
         "fusion_strategy":    "concatenation",
         "learning_rate":      1e-2,
@@ -279,6 +311,19 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "num_epochs":         3,
         "dropout":            0.1,
         "weight_decay":       1e-5,
+    },
+    "premium": {
+        "image_encoder_name": "ViT-B-16",
+        "image_output_dim":   2048,
+        "tabular_output_dim": 256,
+        "text_model_name":    "DeBERTa-v3-base",
+        "text_output_dim":    768,
+        "fusion_strategy":    "attention",
+        "learning_rate":      5e-4,
+        "batch_size":         16,
+        "num_epochs":         20,
+        "dropout":            0.3,
+        "weight_decay":       1e-4,
     },
 }
 

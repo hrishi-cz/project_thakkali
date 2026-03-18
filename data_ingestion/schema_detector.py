@@ -14,14 +14,16 @@ Two-tier detection architecture:
           results into a single GlobalSchema (global problem type, union of
           modalities, primary target).
 
-Supported modalities:   tabular | text | image | timeseries
+Supported modalities:   tabular | text | image | timeseries | mask
 Supported problem types: classification_binary | classification_multiclass
-                         | regression | multilabel_classification | unsupervised
+                         | regression | multilabel_classification
+                         | segmentation | unsupervised
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,6 +72,7 @@ class MultiDatasetSchemaDetector:
     def detect_global_schema(
         self,
         datasets: Dict[str, Any],
+        dataset_group: Optional[List[int]] = None,
     ) -> GlobalSchema:
         """
         Tier-2 collective inference across all datasets in the current session.
@@ -78,6 +81,10 @@ class MultiDatasetSchemaDetector:
             datasets: Mapping of dataset_id -> lazy reference.
                       Accepted types: polars.LazyFrame, dask.dataframe.DataFrame,
                       pandas.DataFrame (legacy), or torch.utils.data.Dataset.
+            dataset_group: Optional list of dataset indices to use for Tier-2
+                      aggregation.  When provided, only the specified datasets
+                      participate in the global schema; others are still
+                      detected individually but excluded from aggregation.
 
         Returns:
             GlobalSchema with resolved problem type, union of modalities,
@@ -109,7 +116,8 @@ class MultiDatasetSchemaDetector:
                         IndividualSchema(
                             dataset_id=dataset_id,
                             detected_columns={
-                                "image": [], "text": [], "tabular": [], "timeseries": []
+                                "image": [], "text": [], "tabular": [],
+                                "timeseries": [], "mask": [],
                             },
                             target_column="Unknown",
                             problem_type="unsupervised",
@@ -126,7 +134,25 @@ class MultiDatasetSchemaDetector:
 
         # Cross-dataset relatedness checking
         groups, relatedness_report = self._check_relatedness(per_dataset_results)
-        if len(groups) > 1:
+
+        # Determine which datasets to use for aggregation
+        if dataset_group is not None:
+            # User-selected group: override auto-selection
+            valid_indices = [i for i in dataset_group if i < len(per_dataset_results)]
+            if valid_indices:
+                filtered = [per_dataset_results[i] for i in valid_indices]
+                global_modalities = self._aggregate_modalities(filtered)
+                global_problem = self._aggregate_problem_type(filtered)
+                primary_target = self._select_primary_target(filtered)
+                fusion_ready = len(global_modalities) > 1
+                relatedness_report["selected_group"] = valid_indices
+                relatedness_report["selection_method"] = "user"
+                logger.info(
+                    "Schema Tier-2: using user-selected group (indices %s) "
+                    "for global schema",
+                    valid_indices,
+                )
+        elif len(groups) > 1:
             logger.warning(
                 "Schema Tier-2: detected %d unrelated dataset groups: %s",
                 len(groups), groups,
@@ -138,6 +164,8 @@ class MultiDatasetSchemaDetector:
             global_problem = self._aggregate_problem_type(filtered)
             primary_target = self._select_primary_target(filtered)
             fusion_ready = len(global_modalities) > 1
+            relatedness_report["selected_group"] = list(largest_group)
+            relatedness_report["selection_method"] = "auto"
             logger.info(
                 "Schema Tier-2: using largest related group (indices %s) "
                 "for global schema",
@@ -212,6 +240,7 @@ class MultiDatasetSchemaDetector:
                     "text": [],
                     "tabular": [],
                     "timeseries": [],
+                    "mask": [],
                 },
                 target_column="Unknown",
                 problem_type="unsupervised",
@@ -291,12 +320,17 @@ class MultiDatasetSchemaDetector:
             "text": [],
             "tabular": [],
             "timeseries": [],
+            "mask": [],
         }
 
         for col in df.columns:
             series = df[col]
             if self._is_image(series):
-                detected["image"].append(col)
+                # Distinguish mask columns from regular image columns by name
+                if self._is_mask_column(col):
+                    detected["mask"].append(col)
+                else:
+                    detected["image"].append(col)
             elif self._is_timeseries(series):
                 detected["timeseries"].append(col)
             elif self._is_text(series):
@@ -305,7 +339,13 @@ class MultiDatasetSchemaDetector:
                 detected["tabular"].append(col)
 
         target_col, confidence = self._detect_target(df)
-        problem_type = self._infer_problem(df, target_col)
+        problem_type = self._infer_problem(df, target_col, detected_columns=detected)
+
+        # For segmentation, the target is the mask column, not a tabular label
+        if problem_type == "segmentation" and detected.get("mask"):
+            target_col = detected["mask"][0]
+            confidence = max(confidence, 0.8)
+
         modalities: List[str] = sorted(k for k, v in detected.items() if v)
 
         return IndividualSchema(
@@ -337,16 +377,16 @@ class MultiDatasetSchemaDetector:
         """
         Return True when the column looks like free-form text.
 
-        Threshold: mean string length > 50 characters.
-        (Raised from the legacy value of 40 to better distinguish
-        short categoricals from actual prose/text fields.)
+        Threshold: mean string length > 20 characters.
+        (Lowered from 50 to detect short clinical text such as
+        ECG reports, which average ~25 characters per entry.)
         """
         if series.dtype != "object":
             return False
         sample = series.dropna().astype(str).head(50)
         if len(sample) == 0:
             return False
-        return sample.str.len().mean() > 50  # spec: > 50 (was > 40)
+        return sample.str.len().mean() > 20  # lowered: 50 missed short clinical text
 
     def _is_timeseries(self, series: pd.Series) -> bool:
         if series.dtype != "object":
@@ -355,6 +395,17 @@ class MultiDatasetSchemaDetector:
         if len(sample) == 0:
             return False
         return sample.str.contains(r"\[.*\]", na=False).mean() > 0.5
+
+    # -- mask column name detection ----------------------------------------
+
+    _MASK_COLUMN_RE = re.compile(
+        r"(?:^|_)(?:mask|seg_mask|segmentation|annotation|label_map)(?:$|_)",
+        re.IGNORECASE,
+    )
+
+    def _is_mask_column(self, col_name: str) -> bool:
+        """Return True when the column name suggests segmentation masks."""
+        return bool(self._MASK_COLUMN_RE.search(col_name))
 
     # -----------------------------------------------------------------------
     # Target detection – 4-signal universal reasoning
@@ -432,17 +483,23 @@ class MultiDatasetSchemaDetector:
     # Problem-type inference
     # -----------------------------------------------------------------------
 
-    def _infer_problem(self, df: pd.DataFrame, target: str) -> str:
+    def _infer_problem(self, df: pd.DataFrame, target: str,
+                        detected_columns: Optional[Dict[str, List[str]]] = None) -> str:
         """
         Infer the ML problem type from the target column.
 
         Rules (in priority order):
+          0. Segmentation        – mask columns detected
           1. Multilabel – target values look like JSON dicts
           2. Binary classification      – 2 unique values
           3. Multiclass classification  – 3-20 unique integer values
           4. Regression                 – numeric float or >20 unique values
           5. Unsupervised               – no valid target detected
         """
+        # Rule 0 – segmentation (mask column present)
+        if detected_columns and detected_columns.get("mask"):
+            return "segmentation"
+
         if target == "Unknown":
             return "unsupervised"
 
@@ -507,6 +564,10 @@ class MultiDatasetSchemaDetector:
 
         if not types:
             return "unsupervised"
+
+        # Segmentation takes priority when detected
+        if "segmentation" in types:
+            return "segmentation"
 
         # Regression takes priority when mixed
         if "regression" in types:
