@@ -29,6 +29,12 @@ class XAIEngine:
 
         if not self.engine.tabular_prep:
             return {"error": "No tabular preprocessor found for this model."}
+        
+        # Validate required engine attributes
+        if not hasattr(self.engine, 'input_dims'):
+            return {"error": "Model does not have input_dims metadata"}
+        if not hasattr(self.engine, '_head'):
+            return {"error": "Model does not have _head attribute"}
             
         try:
             # 1. Prepare background data
