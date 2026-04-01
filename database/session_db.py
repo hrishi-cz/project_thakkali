@@ -10,7 +10,7 @@ import sqlite3
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 import threading
 
@@ -123,6 +123,29 @@ class SessionDatabase:
                 ON dataset_profiles(source)
             """)
             
+            # Session-to-Dataset mapping table (for explicit active/cached tracking)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS session_datasets (
+                    session_id TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, dataset_id),
+                    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    FOREIGN KEY (dataset_id) REFERENCES dataset_profiles(dataset_id) ON DELETE CASCADE
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_session_datasets_session 
+                ON session_datasets(session_id)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_session_datasets_status 
+                ON session_datasets(status)
+            """)
+            
             conn.commit()
             logger.info("Database schema initialized")
     
@@ -196,7 +219,7 @@ class SessionDatabase:
             True if updated, False if session not found
         """
         # Ensure updated_at is current
-        session_data["updated_at"] = datetime.utcnow().isoformat()
+        session_data["updated_at"] = datetime.now(timezone.utc).isoformat()
         
         with self._get_connection() as conn:
             cursor = conn.cursor()

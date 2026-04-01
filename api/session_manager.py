@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from database.session_db import session_db
@@ -35,8 +35,8 @@ class SessionContext:
         """Initialize a new session context."""
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.user_id = user_id
-        self.created_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
+        self.updated_at = datetime.now(timezone.utc)
         self.status = "active"
         
         # Metadata
@@ -138,17 +138,17 @@ class SessionContext:
         """Log a pipeline phase execution."""
         self.execution_history.append({
             "phase": phase,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "decisions": decisions
         })
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
         self.update_hash()
     
     def add_dataset(self, dataset_id: str):
         """Add a dataset to the active session."""
         if dataset_id not in self.active_dataset_ids:
             self.active_dataset_ids.append(dataset_id)
-            self.updated_at = datetime.utcnow()
+            self.updated_at = datetime.now(timezone.utc)
             self.update_hash()
             logger.info(f"Added dataset {dataset_id} to session {self.session_id}")
     
@@ -159,7 +159,7 @@ class SessionContext:
             # Move to cached list if not already there
             if dataset_id not in self.cached_dataset_ids:
                 self.cached_dataset_ids.append(dataset_id)
-            self.updated_at = datetime.utcnow()
+            self.updated_at = datetime.now(timezone.utc)
             self.update_hash()
             logger.info(f"Removed dataset {dataset_id} from session {self.session_id}")
 
@@ -244,7 +244,7 @@ class SessionManager:
         Returns:
             True if updated, False if not found
         """
-        ctx.updated_at = datetime.utcnow()
+        ctx.updated_at = datetime.now(timezone.utc)
         ctx.update_hash()
         return self.db.update_session(ctx.session_id, ctx.to_dict())
     
