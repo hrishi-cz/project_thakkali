@@ -1992,7 +1992,7 @@ class TrainingOrchestrator:
 
                 def _retrain_background() -> None:
                     try:
-                        from pipeline.retraining_pipeline import RetrainingPipeline
+                        from pipeline.retrain_executor import RetrainingPipeline
                         retrain_pipeline = RetrainingPipeline(model_id="drift_retrain")
                         retrain_result = retrain_pipeline.retrain(
                             production_sources=list(self.config.dataset_sources),

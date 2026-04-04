@@ -1,8 +1,7 @@
 """Pipeline package for orchestrating ML workflows."""
 
-from .orchestrator import Orchestrator
 from .dataset_manager import DatasetManager
-from .retraining_pipeline import RetrainingPipeline
+from .retrain_executor import RetrainingPipeline
 from .training_orchestrator import PipelineOrchestrator
 
-__all__ = ["Orchestrator", "DatasetManager", "RetrainingPipeline", "PipelineOrchestrator"]
+__all__ = ["DatasetManager", "RetrainingPipeline", "PipelineOrchestrator"]
