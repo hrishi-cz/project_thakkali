@@ -218,6 +218,27 @@ class ContextDatabase:
             
             return [dict(row) for row in cursor.fetchall()]
     
+    def get_session_count(
+        self,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None
+    ) -> int:
+        """
+        Get total number of sessions (for pagination).
+        
+        Args:
+            user_id: Optional user filter (not yet implemented)
+            status: Optional status filter (not yet implemented)
+        
+        Returns:
+            Total count of sessions
+        """
+        # TODO: Add user_id and status filtering
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM sessions")
+            row = cursor.fetchone()
+            return row['count'] if row else 0
+    
     def close_session(self, session_id: str) -> bool:
         """Mark a session as closed."""
         with self._get_connection() as conn:
@@ -355,6 +376,14 @@ class ContextDatabase:
             )
             
             return [self._row_to_profile_dict(row) for row in cursor.fetchall()]
+    
+    def get_session_profiles(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Alias for load_session_profiles (backward compatibility).
+        
+        Get all dataset profiles for a session.
+        """
+        return self.load_session_profiles(session_id)
     
     def _row_to_profile_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         """Convert SQLite row to profile dict, parsing JSON fields."""

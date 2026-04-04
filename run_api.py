@@ -71,21 +71,32 @@ _SAFE_MODEL_ID = _re.compile(r"^[\w\-.:]+$")
 # ---------------------------------------------------------------------------
 
 def get_session_datasets(session_id: str) -> Dict[str, Any]:
-    """Load lazy datasets for a session (single source of truth)."""
+    """
+    Load lazy datasets for a session (single source of truth).
+    
+    Uses context_db (thread-safe, no race conditions).
+    """
     from data_ingestion.loader import DataLoader
 
-    with _session_lock:
-        session = _session_store.get(session_id)
-        if not session or "datasets" not in session:
-            return {}
-        session_hashes = session["datasets"]
+    # Get session context from DB (thread-safe)
+    ctx = session_manager.get_session(session_id)
+    if not ctx or not ctx.active_dataset_ids:
+        return {}
 
     cache_dir = Path("./data/dataset_cache")
     loader = DataLoader()
 
     datasets = {}
 
-    for source, hash_id in session_hashes.items():
+    for dataset_id in ctx.active_dataset_ids:
+        # Get profile to find hash/path
+        profile = context_db.load_profile(dataset_id)
+        if not profile:
+            logger.warning("Profile not found for dataset %s", dataset_id)
+            continue
+        
+        # Load from cache using hash or path
+        hash_id = profile.get('dataset_id')  # dataset_id is the hash
         cache_path = cache_dir / hash_id
         lazy_ref = loader.load_cached(cache_path)
 
@@ -124,16 +135,24 @@ def _resolve_xai_target(target_class: int, result: Dict[str, Any]) -> int:
 
 
 def _get_session_hashes(session_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """Return ingested hashes for a session, with backward-compatible fallback.
-
-    If *session_id* is provided and present in ``_session_store``, that
-    per-session dict is returned (correct under concurrency).  Otherwise
-    the legacy global ``session_ingested_hashes`` is returned.
-
-    Must be called under ``_session_lock``.
     """
-    if session_id and session_id in _session_store:
-        return dict(_session_store[session_id])
+    Return ingested hashes for a session, with backward-compatible fallback.
+
+    Uses context_db (thread-safe, no race conditions).
+    If session_id is provided, returns datasets from that session.
+    Otherwise returns legacy global session_ingested_hashes.
+    """
+    if session_id:
+        ctx = session_manager.get_session(session_id)
+        if ctx:
+            # Build dict from dataset profiles
+            result = {}
+            for dataset_id in ctx.active_dataset_ids:
+                profile = context_db.load_profile(dataset_id)
+                if profile:
+                    result[dataset_id] = profile
+            return result
+    
     # Backward-compatible: use legacy global alias
     return dict(session_ingested_hashes)
 
@@ -164,16 +183,12 @@ class IngestionResponse(BaseModel):
 # Session state
 # ---------------------------------------------------------------------------
 
-# Maps session_id -> {dataset_id -> metadata} for concurrent session isolation.
-# Each session_id is independent; concurrent requests don't interfere.
-# session_id -> {
-#   "datasets": {hash: metadata},
-#   "schema": Optional[dict]
-# }
-_session_store: Dict[str, Dict[str, Any]] = {}
-_session_lock = threading.Lock()
+# Session state now handled by ContextDatabase (context_db) - thread-safe, persistent.
+# _session_store and _session_lock REMOVED to eliminate race conditions.
+# Use session_manager.get_session() / session_manager.update_session() instead.
 
 # Backward-compatible alias (used in /train-pipeline and other endpoints)
+# TODO: Migrate these endpoints to use context_db directly
 session_ingested_hashes: Dict[str, Dict[str, Any]] = {}
 
 # Inference engine cache – avoids re-loading model weights on every /predict call.
@@ -1913,7 +1928,10 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
 # V2 Session Management Endpoints (Phase 2)
 # ---------------------------------------------------------------------------
 
-from api.session_manager import session_manager, SessionContext
+from api.session_manager import session_manager
+from core.execution_context import ExecutionContext
+from core.orchestrator import orchestrator
+from database.context_db import context_db
 
 class SessionCreateRequest(BaseModel):
     """Request body for creating a new session."""
@@ -2141,8 +2159,7 @@ async def remove_dataset_from_session_v2(
 # V2 Schema Detection Endpoints (Phase 3)
 # ---------------------------------------------------------------------------
 
-from api.schema_detection_service import schema_detector
-from api.execution_context import ExecutionContext
+# Services removed - using orchestrator directly (no more wrapper services)
 
 @app.get("/v2/sessions/{session_id}/datasets")
 async def list_session_datasets_v2(session_id: str) -> Dict[str, Any]:
@@ -2164,13 +2181,11 @@ async def list_session_datasets_v2(session_id: str) -> Dict[str, Any]:
         }
     """
     try:
-        from database.dataset_profile_db import dataset_profile_db
-        
         ctx = session_manager.get_session(session_id)
         if not ctx:
             raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
         
-        profiles = dataset_profile_db.get_session_profiles(session_id)
+        profiles = context_db.get_session_profiles(session_id)
         
         datasets = []
         for profile in profiles:
@@ -2210,9 +2225,7 @@ async def get_dataset_schema_v2(dataset_id: str) -> Dict[str, Any]:
         }
     """
     try:
-        from database.dataset_profile_db import dataset_profile_db
-        
-        profile = dataset_profile_db.get_profile(dataset_id)
+        profile = context_db.load_profile(dataset_id)
         if not profile:
             raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
         
@@ -2289,7 +2302,7 @@ async def override_dataset_schema_v2(
 # V2 Target Detection Endpoints (Phase 4)
 # ---------------------------------------------------------------------------
 
-from api.target_detection_service import target_detector
+# Target detection service removed - using orchestrator directly
 
 
 @app.get("/v2/datasets/{dataset_id}/target-candidates")
@@ -2306,9 +2319,7 @@ async def get_target_candidates_v2(dataset_id: str) -> Dict[str, Any]:
         }
     """
     try:
-        from database.dataset_profile_db import dataset_profile_db
-        
-        profile = dataset_profile_db.get_profile(dataset_id)
+        profile = context_db.load_profile(dataset_id)
         if not profile:
             raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
         
@@ -2421,7 +2432,7 @@ async def unlock_target_v2(dataset_id: str, session_id: str = Query(...)) -> Dic
 # V2 Global Schema/Target Endpoints (Phase 5)
 # ---------------------------------------------------------------------------
 
-from api.global_aggregation_service import global_aggregation
+# Global aggregation service removed - using orchestrator directly
 
 
 @app.get("/v2/sessions/{session_id}/global-schema")

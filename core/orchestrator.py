@@ -39,8 +39,16 @@ class PipelineOrchestrator:
     def __init__(self):
         """Initialize orchestrator with core components."""
         self.schema_detector = COGMASchemaDetector()
-        self.integrator = Integrator()
+        # Lazy initialization - only create when needed to avoid import errors
+        self._integrator = None
         logger.info("PipelineOrchestrator initialized")
+    
+    @property
+    def integrator(self):
+        """Lazy-load integrator to avoid import issues."""
+        if self._integrator is None:
+            self._integrator = Integrator()
+        return self._integrator
     
     # ===== Context Lifecycle =====
     

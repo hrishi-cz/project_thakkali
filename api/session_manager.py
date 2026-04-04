@@ -100,17 +100,27 @@ class SessionManager:
         context_db.save_context(ctx.to_dict())
         logger.debug("Updated session %s", ctx.session_id)
     
-    def list_sessions(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    def list_sessions(
+        self,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[Dict[str, Any]]:
         """
-        List all sessions.
+        List all sessions (with optional filtering).
         
         Args:
+            user_id: Optional user filter (not yet implemented in DB)
+            status: Optional status filter (not yet implemented in DB)
             limit: Maximum number of sessions to return
             offset: Offset for pagination
         
         Returns:
             List of session summaries
         """
+        # TODO: Add user_id and status filtering to context_db.list_sessions()
+        # For now, just pass through to DB without filters
         return context_db.list_sessions(limit=limit, offset=offset)
     
     def close_session(self, session_id: str) -> bool:
@@ -153,6 +163,50 @@ class SessionManager:
         
         # Mark as closed (for now - can add hard delete later)
         return self.close_session(session_id)
+    
+    def update_session_context(self, session_id: str, ctx: ExecutionContext) -> None:
+        """
+        Update session context (alias for update_session).
+        
+        Args:
+            session_id: Session ID (must match ctx.session_id)
+            ctx: ExecutionContext to update
+        """
+        if ctx.session_id != session_id:
+            logger.warning(
+                "Session ID mismatch: %s != %s. Using context's session_id.",
+                session_id, ctx.session_id
+            )
+        self.update_session(ctx)
+    
+    def remove_dataset_from_session(self, session_id: str, dataset_id: str) -> bool:
+        """
+        Remove a dataset from a session.
+        
+        Args:
+            session_id: Session ID
+            dataset_id: Dataset to remove
+        
+        Returns:
+            True if removed successfully
+        """
+        ctx = self.get_session(session_id)
+        if not ctx:
+            return False
+        
+        # Remove from active datasets
+        if dataset_id in ctx.active_dataset_ids:
+            ctx.active_dataset_ids.remove(dataset_id)
+            self.update_session(ctx)
+            logger.info("Removed dataset %s from session %s", dataset_id, session_id)
+            return True
+        
+        return False
+    
+    @property
+    def db(self):
+        """Access to underlying ContextDatabase (for backward compatibility)."""
+        return context_db
 
 
 # Global singleton instance
