@@ -450,7 +450,7 @@ class MultimodalInferenceEngine:
         if "text" not in self.modalities:
             return None
         try:
-            from modelss.encoders.text import TextEncoder
+            from models.encoders.text import TextEncoder
 
             # Read encoder config for model name and max_length
             enc_config = self._load_json(self.artifacts_dir / "encoder_config.json")
