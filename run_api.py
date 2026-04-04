@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from flask import session
 from pydantic import BaseModel
 import uvicorn
 import pandas as pd
@@ -65,6 +66,35 @@ GPU_DEVICE: str = torch.cuda.get_device_name(0) if GPU_AVAILABLE else "CPU"
 # ---------------------------------------------------------------------------
 _SAFE_MODEL_ID = _re.compile(r"^[\w\-.:]+$")
 
+# ---------------------------------------------------------------------------
+# Session dataset loader (FIX: remove duplication)
+# ---------------------------------------------------------------------------
+
+def get_session_datasets(session_id: str) -> Dict[str, Any]:
+    """Load lazy datasets for a session (single source of truth)."""
+    from data_ingestion.loader import DataLoader
+
+    with _session_lock:
+        session = _session_store.get(session_id)
+        if not session or "datasets" not in session:
+            return {}
+        session_hashes = session["datasets"]
+
+    cache_dir = Path("./data/dataset_cache")
+    loader = DataLoader()
+
+    datasets = {}
+
+    for source, hash_id in session_hashes.items():
+        cache_path = cache_dir / hash_id
+        lazy_ref = loader.load_cached(cache_path)
+
+        if lazy_ref is not None:
+            datasets[hash_id] = lazy_ref
+        else:
+            logger.warning("Cache miss for hash %s", hash_id)
+
+    return datasets
 
 def _sanitize_model_id(model_id: str) -> str:
     """Validate model_id to prevent directory traversal attacks."""
@@ -136,7 +166,11 @@ class IngestionResponse(BaseModel):
 
 # Maps session_id -> {dataset_id -> metadata} for concurrent session isolation.
 # Each session_id is independent; concurrent requests don't interfere.
-_session_store: Dict[str, Dict[str, Dict[str, Any]]] = {}
+# session_id -> {
+#   "datasets": {hash: metadata},
+#   "schema": Optional[dict]
+# }
+_session_store: Dict[str, Dict[str, Any]] = {}
 _session_lock = threading.Lock()
 
 # Backward-compatible alias (used in /train-pipeline and other endpoints)
@@ -295,8 +329,11 @@ async def ingest_datasets_endpoint(
     # session APPENDS new hashes instead of wiping previously ingested datasets.
     with _session_lock:
         if session_id not in _session_store:
-            _session_store[session_id] = {}
-    session_hashes: Dict[str, Dict[str, Any]] = _session_store[session_id]
+            _session_store[session_id] = {
+                "datasets": {},
+                "schema": None
+            }
+        session_hashes = _session_store[session_id]["datasets"]
 
     async def _run_ingestion() -> None:
         try:
@@ -456,103 +493,85 @@ async def ingest_status(task_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Schema detection
 # ---------------------------------------------------------------------------
+@app.post("/api/schema/detect")
+async def detect_schema(request: Request):
 
-@app.post("/detect-schema")
-async def detect_schema(request: Request) -> Dict[str, Any]:
-    """
-    Run Tier-2 schema detection on the datasets from the current session.
-
-    STRICT SESSION ISOLATION
-    ------------------------
-    Only processes the exact dataset hashes tracked in ``session_ingested_hashes``
-    (populated by the most recent /ingest/datasets call).  Returns HTTP 400 if
-    no active session exists – never scans the entire cache directory.
-
-    FRONTEND CONTRACT
-    -----------------
-    Returns::
-
-        {
-          "status": "success",
-          "phase":  "Phase 2: Schema Detection",
-          "data": {
-            "global_modalities":     [...],
-            "global_problem_type":   "...",
-            "primary_target":        "...",
-            "fusion_ready":          true|false,
-            "detection_confidence":  0.0-1.0,
-            "per_dataset":           [{IndividualSchema fields}, ...]
-          }
-        }
-    """
     try:
-        from dataclasses import asdict as dc_asdict
-        from data_ingestion.loader import DataLoader
-        from data_ingestion.schema_detector import MultiDatasetSchemaDetector
+        from dataclasses import asdict
+        from data_ingestion.schema_detector import COGMASchemaDetector
 
-        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-        _sid = body.get("session_id") if isinstance(body, dict) else None
+        body = await request.json()
+        session_id = body.get("session_id")
+        target_override = body.get("target_override")
 
-        # STRICT SESSION ISOLATION: reject if no active session
-        with _session_lock:
-            _session_snapshot = _get_session_hashes(_sid)
-            if not _session_snapshot:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "No active ingestion session. "
-                        "Call POST /ingest/datasets first to register datasets."
-                    ),
-                )
-            _snapshot_hashes = list(_session_snapshot.keys())
+        if not session_id:
+            raise HTTPException(400, "session_id required")
 
-        cache_dir = Path("./data/dataset_cache")
-        loader = DataLoader()
-        lazy_datasets: Dict[str, Any] = {}
-
-        for hash_id in _snapshot_hashes:
-            cache_path = cache_dir / hash_id
-            lazy_ref = loader.load_cached(cache_path)
-            if lazy_ref is not None:
-                lazy_datasets[hash_id] = lazy_ref
-            else:
-                logger.warning(
-                    "/detect-schema: cache miss for session hash %s", hash_id
-                )
+        lazy_datasets = get_session_datasets(session_id)
 
         if not lazy_datasets:
-            raise HTTPException(
-                status_code=400,
-                detail="Active session has no valid data files in cache.",
+            raise HTTPException(400, "No datasets found. Run ingestion first.")
+
+        detector = COGMASchemaDetector()
+
+        per_dataset_results = []
+
+        for dataset_id, lazy_data in lazy_datasets.items():
+
+            result = detector._detect_single(
+                dataset_id,
+                lazy_data,
+                target_override=target_override
             )
 
-        detector = MultiDatasetSchemaDetector()
-        global_schema = await asyncio.to_thread(
-            detector.detect_global_schema, lazy_datasets
-        )
+            per_dataset_results.append(asdict(result))
 
-        result: Dict[str, Any] = dc_asdict(global_schema)
+        # 🔥 IMPORTANT FIX: use correct global builder
+        global_schema = detector._build_global_schema(per_dataset_results)
+
+        schema_dict = asdict(global_schema)
+
+        # 🔥 store schema
+        with _session_lock:
+            _session_store[session_id]["schema"] = schema_dict
 
         return {
             "status": "success",
-            "phase": "Phase 2: Schema Detection",
-            "data": result,
+            "phase": "Schema Detection",
+            "data": schema_dict,
+
+            # 🔥 expose intelligence
+            "candidates": [
+                asdict(c) for c in detector.last_target_candidates
+            ]
         }
 
-    except HTTPException:
-        raise  # re-raise 400s as-is
-    except Exception as exc:
-        logger.error("/detect-schema error: %s", exc, exc_info=True)
-        return JSONResponse(
-            {"error": "Schema detection failed. Check server logs for details."},
-            status_code=500,
-        )
+    except Exception as e:
+        logger.error("Schema detection failed: %s", e, exc_info=True)
+        raise HTTPException(500, "Schema detection failed")
+
 
 
 # ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
+@app.post("/api/schema/override")
+async def override_target(request: Request):
 
+    body = await request.json()
+    session_id = body.get("session_id")
+    new_target = body.get("target")
+
+    if not session_id or not new_target:
+        raise HTTPException(400, "session_id and target required")
+
+    with _session_lock:
+        if session_id not in _session_store:
+            raise HTTPException(400, "Session not found")
+
+        _session_store[session_id]["target_override"] = new_target
+
+    return {"status": "override_applied", "target": new_target}
 @app.post("/preprocess")
 async def preprocess_data(request: Request) -> Dict[str, Any]:
     """
@@ -631,25 +650,24 @@ async def preprocess_data(request: Request) -> Dict[str, Any]:
         # is offloaded to a worker thread to avoid blocking the event loop.
         # ----------------------------------------------------------------
         def _preprocess_sync() -> Dict[str, Any]:
-            detector = MultiDatasetSchemaDetector()
-            global_schema = detector.detect_global_schema(lazy_datasets)
+            with _session_lock:
+                session = _session_store.get(_sid, {})
+                global_schema = session.get("schema")
 
-            modalities: List[str] = global_schema.global_modalities
-            per_ds = global_schema.per_dataset
-            detected = per_ds[0].get("detected_columns", {}) if per_ds else {}
-
-            MAX_SAMPLE = 50_000
-            frames: List[Any] = []
+            if not global_schema:
+                raise HTTPException(400, "Run schema detection first")
+            
+            detected = global_schema.detected_columns
+            modalities = global_schema.modality_presence
+            
+            # Sample frames for preprocessing
+            MAX_SAMPLE = 10_000
+            frames = []
             for lazy_ref in lazy_datasets.values():
                 try:
-                    import polars as pl
-                    if isinstance(lazy_ref, pl.LazyFrame):
-                        frames.append(lazy_ref.head(MAX_SAMPLE).collect().to_pandas())
-                        continue
-                except ImportError:
-                    pass
-                if isinstance(lazy_ref, pd.DataFrame):
                     frames.append(lazy_ref.head(MAX_SAMPLE))
+                except Exception as e:
+                    logger.warning("Failed to load sample from dataset: %s", e)
 
             total_samples = sum(len(f) for f in frames)
             full_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -1889,6 +1907,752 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
             {"error": "Prediction failed. Check server logs for details."},
             status_code=500,
         )
+
+
+# ---------------------------------------------------------------------------
+# V2 Session Management Endpoints (Phase 2)
+# ---------------------------------------------------------------------------
+
+from api.session_manager import session_manager, SessionContext
+
+class SessionCreateRequest(BaseModel):
+    """Request body for creating a new session."""
+    user_id: Optional[str] = None
+    project_name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class SessionDatasetRequest(BaseModel):
+    """Request body for adding datasets to session."""
+    dataset_urls: List[str]
+    force_redownload: bool = False
+
+
+@app.post("/v2/sessions")
+async def create_session_v2(request: SessionCreateRequest) -> Dict[str, Any]:
+    """
+    Create a new session (Phase 2).
+    
+    Returns:
+        {
+            "session_id": str,
+            "created_at": ISO8601,
+            "status": "active"
+        }
+    """
+    try:
+        ctx = session_manager.create_session(
+            user_id=request.user_id,
+            project_name=request.project_name,
+            description=request.description
+        )
+        
+        return {
+            "session_id": ctx.session_id,
+            "created_at": ctx.created_at.isoformat(),
+            "status": ctx.status
+        }
+    
+    except Exception as exc:
+        logger.error("/v2/sessions error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/v2/sessions/{session_id}")
+async def get_session_v2(session_id: str) -> Dict[str, Any]:
+    """
+    Get a session by ID (Phase 2).
+    
+    Returns full SessionContext as dict.
+    """
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        return ctx.to_dict()
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id} error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/v2/sessions")
+async def list_sessions_v2(
+    user_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0
+) -> Dict[str, Any]:
+    """
+    List sessions with optional filtering (Phase 2).
+    
+    Query params:
+        user_id: Filter by user ID
+        status: Filter by status (active, closed, error)
+        limit: Max sessions to return
+        offset: Pagination offset
+    
+    Returns:
+        {
+            "sessions": [session_summary, ...],
+            "total": int
+        }
+    """
+    try:
+        sessions = session_manager.list_sessions(user_id, status, limit, offset)
+        total = session_manager.db.get_session_count(user_id, status)
+        
+        return {
+            "sessions": sessions,
+            "total": total
+        }
+    
+    except Exception as exc:
+        logger.error("/v2/sessions list error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/v2/sessions/{session_id}/close")
+async def close_session_v2(session_id: str) -> Dict[str, Any]:
+    """
+    Close a session (Phase 2).
+    
+    Returns:
+        {
+            "session_id": str,
+            "status": "closed",
+            "closed_at": ISO8601
+        }
+    """
+    try:
+        success = session_manager.close_session(session_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        return {
+            "session_id": session_id,
+            "status": "closed",
+            "closed_at": datetime.utcnow().isoformat()
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/close error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/v2/sessions/{session_id}/datasets")
+async def add_datasets_to_session_v2(
+    session_id: str,
+    request: SessionDatasetRequest
+) -> Dict[str, Any]:
+    """
+    Add datasets to a session (Phase 2).
+    
+    Starts async ingestion and associates datasets with session.
+    
+    Returns:
+        {
+            "task_id": str,
+            "status": "processing",
+            "datasets": [{"dataset_id": str, "source": str, "status": str}, ...]
+        }
+    """
+    try:
+        # Ensure session exists
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        # Use existing ingestion endpoint logic
+        ingestion_req = IngestionRequest(
+            dataset_urls=request.dataset_urls,
+            session_id=session_id
+        )
+        
+        # Call existing ingestion endpoint
+        result = await ingest_datasets_endpoint(ingestion_req)
+        
+        # Extract task_id
+        task_id = result.get("task_id")
+        
+        return {
+            "task_id": task_id,
+            "status": "processing",
+            "datasets": [
+                {
+                    "dataset_id": None,  # Will be assigned after ingestion
+                    "source": url,
+                    "status": "ingesting"
+                }
+                for url in request.dataset_urls
+            ]
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/datasets error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/v2/sessions/{session_id}/datasets/{dataset_id}")
+async def remove_dataset_from_session_v2(
+    session_id: str,
+    dataset_id: str
+) -> Dict[str, Any]:
+    """
+    Remove a dataset from a session's active list (Phase 2).
+    
+    Dataset remains in cache but is not used for training.
+    
+    Returns:
+        {
+            "session_id": str,
+            "dataset_id": str,
+            "status": "removed",
+            "cache_preserved": true
+        }
+    """
+    try:
+        success = session_manager.remove_dataset_from_session(session_id, dataset_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found in session")
+        
+        return {
+            "session_id": session_id,
+            "dataset_id": dataset_id,
+            "status": "removed",
+            "cache_preserved": True
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/datasets/{dataset_id} DELETE error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# V2 Schema Detection Endpoints (Phase 3)
+# ---------------------------------------------------------------------------
+
+from api.schema_detection_service import schema_detector
+from api.execution_context import ExecutionContext
+
+@app.get("/v2/sessions/{session_id}/datasets")
+async def list_session_datasets_v2(session_id: str) -> Dict[str, Any]:
+    """
+    List all datasets in a session with their status (Phase 3).
+    
+    Returns:
+        {
+            "session_id": str,
+            "datasets": [
+                {
+                    "dataset_id": str,
+                    "source_url": str,
+                    "status": "active" | "cached",
+                    "schema_detected": bool,
+                    "target_detected": bool
+                }
+            ]
+        }
+    """
+    try:
+        from database.dataset_profile_db import dataset_profile_db
+        
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        profiles = dataset_profile_db.get_session_profiles(session_id)
+        
+        datasets = []
+        for profile in profiles:
+            datasets.append({
+                "dataset_id": profile['dataset_id'],
+                "source_url": profile.get('source_url'),
+                "status": "active" if profile['dataset_id'] in ctx.active_dataset_ids else "cached",
+                "schema_detected": profile.get('schema_detected', False),
+                "target_detected": profile.get('target_detected', False),
+                "created_at": profile.get('created_at')
+            })
+        
+        return {
+            "session_id": session_id,
+            "datasets": datasets
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/datasets error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/v2/datasets/{dataset_id}/schema")
+async def get_dataset_schema_v2(dataset_id: str) -> Dict[str, Any]:
+    """
+    Get schema detection results for a dataset (Phase 3).
+    
+    Returns:
+        {
+            "dataset_id": str,
+            "schema_detected": bool,
+            "schema_result": {...},
+            "confidence": float,
+            "evidence": str
+        }
+    """
+    try:
+        from database.dataset_profile_db import dataset_profile_db
+        
+        profile = dataset_profile_db.get_profile(dataset_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+        
+        return {
+            "dataset_id": dataset_id,
+            "schema_detected": profile.get('schema_detected', False),
+            "schema_result": profile.get('schema_result'),
+            "confidence": profile.get('schema_confidence', 0.0),
+            "evidence": profile.get('schema_evidence')
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/datasets/{dataset_id}/schema error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class SchemaOverrideRequest(BaseModel):
+    """Request body for schema override."""
+    schema_override: Dict[str, Any]
+    reason: str
+
+
+@app.post("/v2/datasets/{dataset_id}/override-schema")
+async def override_dataset_schema_v2(
+    dataset_id: str,
+    request: SchemaOverrideRequest,
+    session_id: str = Query(...)
+) -> Dict[str, Any]:
+    """
+    Override detected schema for a dataset (Phase 3).
+    
+    Returns:
+        {
+            "dataset_id": str,
+            "schema_overridden": bool,
+            "new_schema": {...}
+        }
+    """
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        # Convert SessionContext to ExecutionContext
+        exec_ctx = ExecutionContext(session_id=ctx.session_id)
+        exec_ctx.active_dataset_ids = ctx.active_dataset_ids
+        
+        success = schema_detector.override_schema(
+            dataset_id,
+            exec_ctx,
+            request.schema_override,
+            request.reason
+        )
+        
+        if not success:
+            raise HTTPException(status_code=400, detail="Failed to override schema")
+        
+        return {
+            "dataset_id": dataset_id,
+            "schema_overridden": True,
+            "new_schema": request.schema_override
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/datasets/{dataset_id}/override-schema error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# V2 Target Detection Endpoints (Phase 4)
+# ---------------------------------------------------------------------------
+
+from api.target_detection_service import target_detector
+
+
+@app.get("/v2/datasets/{dataset_id}/target-candidates")
+async def get_target_candidates_v2(dataset_id: str) -> Dict[str, Any]:
+    """
+    Get target candidates for a dataset (Phase 4).
+    
+    Returns:
+        {
+            "dataset_id": str,
+            "candidates": [{name, score, reason}, ...],
+            "chosen_target": str | null,
+            "target_locked": bool
+        }
+    """
+    try:
+        from database.dataset_profile_db import dataset_profile_db
+        
+        profile = dataset_profile_db.get_profile(dataset_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+        
+        return {
+            "dataset_id": dataset_id,
+            "candidates": profile.get('target_candidates', []),
+            "chosen_target": profile.get('chosen_target'),
+            "target_locked": profile.get('target_locked', False)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/datasets/{dataset_id}/target-candidates error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class TargetOverrideRequest(BaseModel):
+    """Request body for target override."""
+    new_target: str
+    lock: bool = True
+    reason: str = "User override"
+
+
+@app.post("/v2/datasets/{dataset_id}/override-target")
+async def override_target_v2(
+    dataset_id: str,
+    request: TargetOverrideRequest,
+    session_id: str = Query(...)
+) -> Dict[str, Any]:
+    """
+    Override target selection for a dataset (Phase 4).
+    
+    Returns:
+        {
+            "dataset_id": str,
+            "target_overridden": bool,
+            "new_target": str,
+            "locked": bool
+        }
+    """
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        exec_ctx = ExecutionContext(session_id=ctx.session_id)
+        exec_ctx.active_dataset_ids = ctx.active_dataset_ids
+        
+        success = target_detector.override_target(
+            dataset_id,
+            exec_ctx,
+            request.new_target,
+            request.lock,
+            request.reason
+        )
+        
+        if not success:
+            raise HTTPException(status_code=400, detail="Failed to override target")
+        
+        return {
+            "dataset_id": dataset_id,
+            "target_overridden": True,
+            "new_target": request.new_target,
+            "locked": request.lock
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/datasets/{dataset_id}/override-target error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/v2/datasets/{dataset_id}/lock-target")
+async def lock_target_v2(dataset_id: str, session_id: str = Query(...)) -> Dict[str, Any]:
+    """Lock target to prevent automatic changes (Phase 4)."""
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        exec_ctx = ExecutionContext(session_id=ctx.session_id)
+        success = target_detector.lock_target(dataset_id, exec_ctx)
+        
+        return {"dataset_id": dataset_id, "locked": success}
+    except Exception as exc:
+        logger.error("/v2/datasets/{dataset_id}/lock-target error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/v2/datasets/{dataset_id}/unlock-target")
+async def unlock_target_v2(dataset_id: str, session_id: str = Query(...)) -> Dict[str, Any]:
+    """Unlock target to allow re-detection (Phase 4)."""
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        exec_ctx = ExecutionContext(session_id=ctx.session_id)
+        success = target_detector.unlock_target(dataset_id, exec_ctx)
+        
+        return {"dataset_id": dataset_id, "unlocked": success}
+    except Exception as exc:
+        logger.error("/v2/datasets/{dataset_id}/unlock-target error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# V2 Global Schema/Target Endpoints (Phase 5)
+# ---------------------------------------------------------------------------
+
+from api.global_aggregation_service import global_aggregation
+
+
+@app.get("/v2/sessions/{session_id}/global-schema")
+async def get_global_schema_v2(session_id: str) -> Dict[str, Any]:
+    """
+    Get global schema for a session (Phase 5).
+    
+    Returns:
+        {
+            "session_id": str,
+            "global_schema": {...} | null,
+            "confidence": float,
+            "datasets_compatible": bool,
+            "compatibility_matrix": {...}
+        }
+    """
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        return {
+            "session_id": session_id,
+            "global_schema": ctx.global_schema,
+            "confidence": ctx.global_schema_confidence,
+            "datasets_compatible": ctx.datasets_compatible,
+            "compatibility_matrix": ctx.compatibility_matrix
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/global-schema error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/v2/sessions/{session_id}/global-target")
+async def get_global_target_v2(session_id: str) -> Dict[str, Any]:
+    """
+    Get global target for a session (Phase 5).
+    
+    Returns:
+        {
+            "session_id": str,
+            "global_target": str | null,
+            "confidence": float,
+            "candidates": [{name, score, reason}, ...]
+        }
+    """
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        return {
+            "session_id": session_id,
+            "global_target": ctx.global_target,
+            "confidence": ctx.global_target_confidence,
+            "candidates": ctx.global_target_candidates
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/global-target error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class GlobalTargetOverrideRequest(BaseModel):
+    """Request body for global target override."""
+    new_target: str
+    reason: str = "User override"
+
+
+@app.post("/v2/sessions/{session_id}/override-global-target")
+async def override_global_target_v2(
+    session_id: str,
+    request: GlobalTargetOverrideRequest
+) -> Dict[str, Any]:
+    """Override global target (Phase 5)."""
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        exec_ctx = ExecutionContext(session_id=ctx.session_id)
+        success = global_aggregation.override_global_target(
+            exec_ctx,
+            request.new_target,
+            request.reason
+        )
+        
+        # Update session context
+        ctx.global_target = request.new_target
+        session_manager.update_session_context(session_id, ctx)
+        
+        return {
+            "session_id": session_id,
+            "global_target": request.new_target,
+            "overridden": success
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/override-global-target error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class PrimaryDatasetRequest(BaseModel):
+    """Request body for choosing primary dataset."""
+    dataset_id: str
+    reason: str = "User selection for incompatible datasets"
+
+
+@app.post("/v2/sessions/{session_id}/choose-primary-dataset")
+async def choose_primary_dataset_v2(
+    session_id: str,
+    request: PrimaryDatasetRequest
+) -> Dict[str, Any]:
+    """Choose primary dataset when datasets are incompatible (Phase 5)."""
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        exec_ctx = ExecutionContext(session_id=ctx.session_id)
+        exec_ctx.active_dataset_ids = ctx.active_dataset_ids
+        
+        success = global_aggregation.choose_primary_dataset(
+            exec_ctx,
+            request.dataset_id,
+            request.reason
+        )
+        
+        if not success:
+            raise HTTPException(status_code=400, detail="Failed to set primary dataset")
+        
+        # Update session context
+        ctx.primary_dataset_id = request.dataset_id
+        session_manager.update_session_context(session_id, ctx)
+        
+        return {
+            "session_id": session_id,
+            "primary_dataset_id": request.dataset_id,
+            "reason": request.reason
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/choose-primary-dataset error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+    try:
+        success = session_manager.remove_dataset_from_session(session_id, dataset_id)
+        if not success:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session {session_id} not found or dataset {dataset_id} not in session"
+            )
+        
+        return {
+            "session_id": session_id,
+            "dataset_id": dataset_id,
+            "status": "removed",
+            "cache_preserved": True
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/datasets/{dataset_id} error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/v2/sessions/{session_id}/datasets")
+async def list_session_datasets_v2(session_id: str) -> Dict[str, Any]:
+    """
+    List datasets for a session (Phase 2).
+    
+    Returns:
+        {
+            "active_datasets": [{"dataset_id": str, "source": str, "in_session": true}, ...],
+            "cached_datasets": [{"dataset_id": str, "source": str, "in_session": false}, ...]
+        }
+    """
+    try:
+        ctx = session_manager.get_session(session_id)
+        if not ctx:
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        # Get cache metadata
+        from data_ingestion.ingestion_manager import DataIngestionManager
+        mgr = DataIngestionManager()
+        cache_meta = mgr.cache_metadata
+        
+        # Build active datasets
+        active_datasets = []
+        for dataset_id in ctx.active_dataset_ids:
+            meta = cache_meta.get(dataset_id, {})
+            active_datasets.append({
+                "dataset_id": dataset_id,
+                "source": meta.get("source", "unknown"),
+                "in_session": True,
+                "cached_at": meta.get("timestamp", "unknown")
+            })
+        
+        # Build cached datasets (not active)
+        all_cached_ids = set(cache_meta.keys())
+        inactive_ids = all_cached_ids - set(ctx.active_dataset_ids)
+        
+        cached_datasets = []
+        for dataset_id in inactive_ids:
+            meta = cache_meta.get(dataset_id, {})
+            cached_datasets.append({
+                "dataset_id": dataset_id,
+                "source": meta.get("source", "unknown"),
+                "in_session": False,
+                "cached_at": meta.get("timestamp", "unknown")
+            })
+        
+        return {
+            "active_datasets": active_datasets,
+            "cached_datasets": cached_datasets
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/{session_id}/datasets error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
