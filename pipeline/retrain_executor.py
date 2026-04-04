@@ -100,11 +100,8 @@ class RetrainingPipeline:
         RuntimeError
             Propagated from any phase that fails internally.
         """
-        from pipeline.training_orchestrator import (
-            TrainingOrchestrator,
-            TrainingConfig,
-            Phase,
-        )
+        from pipeline.training_orchestrator import TrainingOrchestrator
+        from core.types import TrainingConfig, Phase
 
         logger.info(
             "RetrainingPipeline.retrain: sources=%d  problem=%s  modalities=%s",

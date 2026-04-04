@@ -24,8 +24,7 @@ import torch
 import numpy as np
 import pandas as pd
 
-from dataclasses import dataclass, asdict
-from enum import Enum
+from dataclasses import asdict
 
 from data_ingestion.ingestion_manager import DataIngestionManager
 from data_ingestion.schema import GlobalSchema
@@ -34,61 +33,11 @@ from pipeline.dataset_manager import DatasetManager
 from preprocessing.image_preprocessor import ImagePreprocessor
 from preprocessing.text_preprocessor import TextPreprocessor
 from preprocessing.tabular_preprocessor import TabularPreprocessor
+from core.types import Phase, TrainingConfig, ModelSelectionResult, TrainingMetrics
 
 
 # Configure logging
 logger = logging.getLogger(__name__)
-
-
-class Phase(Enum):
-    """Workflow phases."""
-    DATA_INGESTION = 1
-    SCHEMA_DETECTION = 2
-    PREPROCESSING = 3
-    MODEL_SELECTION = 4
-    TRAINING = 5
-    DRIFT_DETECTION = 6
-    MODEL_REGISTRY = 7
-
-
-@dataclass
-class TrainingConfig:
-    """Configuration for complete training workflow."""
-    dataset_sources: List[str]
-    problem_type: str  # regression, classification_binary, classification_multiclass
-    modalities: List[str]  # image, text, tabular
-    target_column: Optional[str] = None
-    test_split: float = 0.2
-    val_split: float = 0.2
-    seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-@dataclass
-class ModelSelectionResult:
-    """Result from Phase 4 model selection."""
-    image_encoder: Optional[str]
-    text_encoder: Optional[str]
-    tabular_encoder: Optional[str]
-    fusion_strategy: str
-    batch_size: int
-    epochs: int
-    learning_rate: float
-    dropout: float
-    weight_decay: float
-    selection_rationale: str
-
-
-@dataclass
-class TrainingMetrics:
-    """Training metrics from Phase 5."""
-    epoch: int
-    train_loss: float
-    val_loss: float
-    train_accuracy: Optional[float] = None
-    val_accuracy: Optional[float] = None
-    train_f1: Optional[float] = None
-    val_f1: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
