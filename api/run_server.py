@@ -242,7 +242,7 @@ class ServerOrchestrator:
             tag="API",
             cmd=[
                 python, "-m", "uvicorn",
-                "run_api:app",
+                "api.run_api:app",
                 "--host", API_HOST,
                 "--port", str(API_PORT),
                 "--log-level", "info",
