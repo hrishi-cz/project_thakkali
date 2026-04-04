@@ -63,10 +63,10 @@ class _MultimodalHead(nn.Module):
         feature_dims = [input_dims[k] for k in self._keys]
 
         if fusion_strategy == "attention":
-            from modelss.fusion import AttentionFusion
+            from models.fusion import AttentionFusion
             self.fusion = AttentionFusion(feature_dims)
         else:
-            from modelss.fusion import ConcatenationFusion
+            from models.fusion import ConcatenationFusion
             self.fusion = ConcatenationFusion(feature_dims)
 
         fused_dim = self.fusion.get_output_dim()

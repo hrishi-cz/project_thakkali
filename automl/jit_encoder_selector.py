@@ -170,7 +170,7 @@ def _make_mobilenet_v3() -> nn.Module:
 
 def _make_resnet50() -> nn.Module:
     """Standard ResNet-50 — delegates to the existing ImageEncoder."""
-    from modelss.encoders.image import ImageEncoder
+    from models.encoders.image import ImageEncoder
     enc = ImageEncoder(pretrained=True, freeze_backbone=True)
     return _freeze_and_eval(enc)
 
@@ -215,7 +215,7 @@ def _make_convnext_tiny() -> nn.Module:
 
 def _make_minilm() -> nn.Module:
     """all-MiniLM-L6-v2 — lightweight, 384-dim → projected to 768."""
-    from modelss.encoders.text import TextEncoder
+    from models.encoders.text import TextEncoder
     enc = TextEncoder(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         max_length=128,
@@ -232,7 +232,7 @@ def _make_minilm() -> nn.Module:
 
 def _make_bert_base() -> nn.Module:
     """Standard BERT-base-uncased — delegates to existing TextEncoder."""
-    from modelss.encoders.text import TextEncoder
+    from models.encoders.text import TextEncoder
     enc = TextEncoder(
         model_name="bert-base-uncased",
         max_length=128,
@@ -243,7 +243,7 @@ def _make_bert_base() -> nn.Module:
 
 def _make_deberta() -> nn.Module:
     """DeBERTa-v3-base — stronger text understanding, heavier."""
-    from modelss.encoders.text import TextEncoder
+    from models.encoders.text import TextEncoder
     enc = TextEncoder(
         model_name="microsoft/deberta-v3-base",
         max_length=128,
@@ -326,8 +326,8 @@ TEXT_REGISTRY.sort(key=lambda s: s.capacity, reverse=True)
 # no VRAM profiling is needed.  The JIT selector picks the highest-capacity
 # type; the orchestrator instantiates a fresh copy per Optuna trial.
 
-from modelss.encoders.tabular import TabularEncoder as _TabularMLPClass
-from modelss.encoders.tabular import GRNTabularEncoder as _TabularGRNClass
+from models.encoders.tabular import TabularEncoder as _TabularMLPClass
+from models.encoders.tabular import GRNTabularEncoder as _TabularGRNClass
 
 
 TABULAR_REGISTRY: List[TabularEncoderSpec] = [

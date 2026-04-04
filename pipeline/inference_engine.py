@@ -423,10 +423,10 @@ class MultimodalInferenceEngine:
 
         try:
             if encoder_type == "GRNTabularEncoder":
-                from modelss.encoders.tabular import GRNTabularEncoder
+                from models.encoders.tabular import GRNTabularEncoder
                 encoder = GRNTabularEncoder(input_dim=input_dim)
             else:
-                from modelss.encoders.tabular import TabularEncoder
+                from models.encoders.tabular import TabularEncoder
                 encoder = TabularEncoder(input_dim=input_dim)
 
             state_dict = torch.load(state_path, map_location="cpu", weights_only=True)
