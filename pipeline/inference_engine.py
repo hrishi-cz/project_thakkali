@@ -506,7 +506,7 @@ class MultimodalInferenceEngine:
             return None
 
         try:
-            from modelss.encoders.image import ImageEncoder
+            from models.encoders.image import ImageEncoder
 
             encoder = ImageEncoder(pretrained=True, freeze_backbone=True)
             state_dict = torch.load(state_path, map_location="cpu", weights_only=True)

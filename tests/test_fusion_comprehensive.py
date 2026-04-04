@@ -24,7 +24,7 @@ import torch.nn as nn
 from typing import List, Dict
 
 # Import fusion modules
-from modelss.fusion import (
+from models.fusion import (
     ConcatenationFusion,
     AttentionFusion,
     GraphFusion,
