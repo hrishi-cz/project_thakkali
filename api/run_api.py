@@ -14,7 +14,6 @@ from typing import Any, Dict, List, Optional
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from flask import session
 from pydantic import BaseModel
 import uvicorn
 import pandas as pd
