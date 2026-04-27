@@ -39,7 +39,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_DB_PATH: Path = Path(__file__).parent / "tasks.db"
+from config.paths import TASK_DB_PATH
+
+_DB_PATH: Path = TASK_DB_PATH
 
 
 # ---------------------------------------------------------------------------

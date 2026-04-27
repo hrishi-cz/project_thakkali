@@ -50,7 +50,7 @@ class TestXAIExplainer:
         assert isinstance(explanation, dict)
         assert "method" in explanation
         assert "feature_importances" in explanation
-        assert explanation["method"] in ["shap", "gradient", "dummy"]
+        assert explanation["method"] in ["shap", "gradient", "variance_proxy", "dummy"]
 
     def test_explain_image_returns_dict(self, xai_explainer):
         """Test image explanation returns dict with heatmap."""

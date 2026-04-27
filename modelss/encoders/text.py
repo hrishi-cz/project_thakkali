@@ -28,7 +28,7 @@ Supported models (non-exhaustive)
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -82,6 +82,7 @@ class TextEncoder(nn.Module):
         # Causal models (GPT-2) use the last non-padding token as the
         # sequence representation; encoder models use the [CLS] token.
         self._is_causal: bool = "gpt2" in model_name.lower()
+        self.pooling_strategy: str = "last_token" if self._is_causal else "cls"
 
         # ── Optional projection to enforce TEXT_OUTPUT_DIM = 768 ─────────
         hidden_size: int = self.transformer.config.hidden_size
@@ -105,11 +106,33 @@ class TextEncoder(nn.Module):
             freeze_backbone, TEXT_OUTPUT_DIM,
         )
 
+    def configure(self, plan: Optional[Dict[str, Any]]) -> None:
+        """Apply runtime encoder overrides produced by the preprocessing planner."""
+        if not isinstance(plan, dict):
+            return
+
+        pooling = str(plan.get("pooling", "")).strip().lower()
+        if pooling == "auto":
+            pooling = "last_token" if self._is_causal else "cls"
+        if pooling in {"cls", "last_token", "mean"}:
+            self.pooling_strategy = pooling
+
+        max_length = plan.get("max_length")
+        if max_length is not None:
+            try:
+                self.max_length = max(8, int(max_length))
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
 
-    def forward(self, texts: List[str]) -> torch.Tensor:
+    def forward(
+        self,
+        texts: List[str],
+        return_all_tokens: bool = False,
+    ) -> torch.Tensor:
         """
         Tokenise and encode a batch of raw text strings.
 
@@ -117,11 +140,16 @@ class TextEncoder(nn.Module):
         ----------
         texts : List[str]
             Batch of N raw text strings.
+        return_all_tokens : bool
+            False (default): return pooled sentence embedding ``(N, 768)``.
+            True: return full last-hidden-state ``(N, T, hidden_size)`` for
+            use by ``UnifiedLatentFusion`` token-sequence mode.
 
         Returns
         -------
         torch.Tensor
-            Shape ``(N, 768)`` — sentence-level embeddings.
+            ``(N, 768)`` when ``return_all_tokens=False``;
+            ``(N, T, hidden_size)`` when ``return_all_tokens=True``.
         """
         # Resolve device from transformer parameters (handles CPU/GPU/multi-GPU)
         device: torch.device = next(self.transformer.parameters()).device
@@ -141,14 +169,25 @@ class TextEncoder(nn.Module):
         outputs = self.transformer(**encoded)
         last_hidden: torch.Tensor = outputs.last_hidden_state  # (N, seq, hidden)
 
+        # ── Token-sequence mode (for ULA cross-modal fusion) ─────────────
+        if return_all_tokens:
+            # Return full sequence; projection applied per-token if needed
+            if self._projection is not None:
+                last_hidden = self._projection(last_hidden)  # (N, T, 768)
+            return last_hidden
+
         # ── Pooling ──────────────────────────────────────────────────────
-        if self._is_causal:
-            # GPT-2 style: find the last non-padding token per sequence
-            # attention_mask: (N, seq); sum gives the length of each sequence
-            attn_mask: torch.Tensor = encoded["attention_mask"]   # (N, seq)
-            seq_lens: torch.Tensor  = attn_mask.sum(dim=1) - 1    # (N,) — 0-indexed
+        if self.pooling_strategy == "last_token":
+            # Last non-padding token pooling for causal/decoder-style models.
+            attn_mask: torch.Tensor = encoded["attention_mask"]
+            seq_lens: torch.Tensor = (attn_mask.sum(dim=1) - 1).clamp(min=0)
             batch_idx = torch.arange(last_hidden.size(0), device=device)
-            pooled: torch.Tensor = last_hidden[batch_idx, seq_lens]  # (N, hidden)
+            pooled = last_hidden[batch_idx, seq_lens]
+        elif self.pooling_strategy == "mean":
+            # Masked mean pooling can improve robustness on long documents.
+            attn_mask = encoded["attention_mask"].unsqueeze(-1).float()
+            denom = attn_mask.sum(dim=1).clamp_min(1.0)
+            pooled = (last_hidden * attn_mask).sum(dim=1) / denom
         else:
             # BERT / encoder-only: [CLS] token always lives at position 0
             pooled = last_hidden[:, 0, :]   # (N, hidden)

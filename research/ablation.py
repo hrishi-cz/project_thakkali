@@ -85,6 +85,11 @@ def build_ablation(experiments: List[Dict[str, Any]]) -> Dict[str, Any]:
         label_without="Single Modality",
     )
 
+    # Backward-compatible aliases used by older dashboards/tests.
+    ablation["fusion_impact"] = ablation["fusion"]
+    ablation["xai_impact"] = ablation["xai"]
+    ablation["modality_impact"] = ablation["modality"]
+
     return ablation
 
 
@@ -114,6 +119,7 @@ def _compare_groups(
     if "accuracy" in metrics_with and "accuracy" in metrics_without:
         delta_acc = metrics_with["accuracy"] - metrics_without["accuracy"]
         result["delta_accuracy"] = round(delta_acc, 4)
+        result["accuracy_delta"] = round(delta_acc, 4)
 
     if "f1" in metrics_with and "f1" in metrics_without:
         delta_f1 = metrics_with["f1"] - metrics_without["f1"]
@@ -134,6 +140,14 @@ def _average_metrics(experiments: List[Dict]) -> Dict[str, float]:
 
     for exp in experiments:
         metrics = exp.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+
+        # Backfill from flat legacy fields.
+        for key in ("accuracy", "f1", "auc_roc", "ece", "brier", "loss"):
+            if key in exp and key not in metrics:
+                metrics[key] = exp[key]
+
         for key, val in metrics.items():
             if isinstance(val, (int, float)):
                 metric_sums[key] = metric_sums.get(key, 0) + val

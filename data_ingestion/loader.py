@@ -8,8 +8,12 @@ Images:   LazyImageDataset (PyTorch)      -> only paths in RAM; pixels read
 """
 
 import json
+import logging
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Optional heavy-import guard: polars preferred, dask as fallback
@@ -32,6 +36,76 @@ else:
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+
+
+def detect_image_structure(cache_path: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Backward-compatible helper for schema detection of image directories.
+
+    Returns a compact summary with at least a ``type`` key:
+      - ``classification`` when class-folder patterns are detected
+      - ``unsupervised`` otherwise
+    """
+    root = Path(cache_path)
+    if not root.exists():
+        return {
+            "type": "unsupervised",
+            "n_images": 0,
+            "n_classes": 0,
+            "classes": [],
+            "class_distribution": {},
+        }
+
+    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
+    image_paths = [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in image_suffixes
+    ]
+
+    if not image_paths:
+        return {
+            "type": "unsupervised",
+            "n_images": 0,
+            "n_classes": 0,
+            "classes": [],
+            "class_distribution": {},
+        }
+
+    # Infer class labels from first path segment under root.
+    class_counts: Counter[str] = Counter()
+    for img_path in image_paths:
+        try:
+            rel_parts = img_path.relative_to(root).parts
+        except Exception:
+            rel_parts = img_path.parts
+
+        if not rel_parts:
+            continue
+
+        label = rel_parts[0]
+        # Common split roots: train/<class>/... or val/<class>/...
+        if label.lower() in {"train", "training", "val", "valid", "validation", "test"} and len(rel_parts) >= 2:
+            label = rel_parts[1]
+
+        if label and label not in {".", ".."}:
+            class_counts[str(label)] += 1
+
+    if len(class_counts) >= 2:
+        return {
+            "type": "classification",
+            "n_images": len(image_paths),
+            "n_classes": len(class_counts),
+            "classes": sorted(class_counts.keys()),
+            "class_distribution": dict(class_counts),
+        }
+
+    return {
+        "type": "unsupervised",
+        "n_images": len(image_paths),
+        "n_classes": len(class_counts),
+        "classes": sorted(class_counts.keys()),
+        "class_distribution": dict(class_counts),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +265,51 @@ class DataLoader:
         csv_files = sorted(cache_path.glob("*.csv"))
         if csv_files:
             return _lazy_scan(csv_files[0])
+
+        # JSONL — convert to CSV (covers Hateful Memes, HuggingFace exports, etc.)
+        # Prefer train split; fall back to any .jsonl file.
+        jsonl_files = sorted(cache_path.rglob("*.jsonl")) + sorted(cache_path.rglob("*.json"))
+        if jsonl_files:
+            import pandas as _pd
+            # Prefer train split over dev/test
+            _preferred = [f for f in jsonl_files if "train" in f.name.lower()]
+            _src = _preferred[0] if _preferred else jsonl_files[0]
+            try:
+                df = _pd.read_json(_src, lines=True)
+            except Exception:
+                df = _pd.read_json(_src)
+            # Resolve relative image paths to absolute paths so downstream
+            # image validators and preprocessors can find the files.
+            # Hateful Memes uses `img/42953.png` relative to the cache root.
+            for _col in df.columns:
+                if df[_col].dtype == object:
+                    _sample = df[_col].dropna().astype(str).head(3)
+                    _is_img = _sample.apply(lambda v: (
+                        "/" in v or "\\" in v) and any(v.lower().endswith(ext)
+                        for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")
+                    ))
+                    if _is_img.any():
+                        df[_col] = df[_col].apply(
+                            lambda p: str((cache_path / p).resolve())
+                            if isinstance(p, str) and not Path(p).is_absolute() else p
+                        )
+                        break
+            csv_path = cache_path / (_src.stem + ".csv")
+            df.to_csv(csv_path, index=False)
+            logger.info("JSONL converted to CSV: %s -> %s (%d rows)", _src, csv_path, len(df))
+            return _lazy_scan(csv_path)
+
+        # Excel — convert to CSV so the rest of the pipeline sees a uniform format
+        xlsx_files = sorted(cache_path.glob("*.xlsx")) + sorted(cache_path.glob("*.xls"))
+        if xlsx_files:
+            import pandas as _pd
+            try:
+                df = _pd.read_excel(xlsx_files[0], engine="openpyxl")
+            except Exception:
+                df = _pd.read_excel(xlsx_files[0])
+            csv_path = xlsx_files[0].with_suffix(".csv")
+            df.to_csv(csv_path, index=False)
+            return _lazy_scan(csv_path)
 
         # Image directory – use itertools.islice to cap memory usage.
         # Only the first 500_000 paths are collected; for larger datasets

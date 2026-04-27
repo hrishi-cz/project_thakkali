@@ -5,8 +5,17 @@ Multimodal model components for APEX framework.
 from .encoders.image import ImageEncoder
 from .encoders.tabular import TabularEncoder
 from .encoders.text import TextEncoder
-from .fusion import ConcatenationFusion, AttentionFusion
-from .predictor import MultimodalPredictor
+from .fusion import (
+    ConcatenationFusion,
+    AttentionFusion,
+    GraphFusion,
+    UncertaintyFusion,
+    UncertaintyGraphFusion,
+    diversity_loss,
+    graph_sparsity_loss,
+    select_fusion_strategy,
+)
+from .multimodal_alignment import MultimodalAligner
 
 __all__ = [
     "ImageEncoder",
@@ -14,5 +23,11 @@ __all__ = [
     "TextEncoder",
     "ConcatenationFusion",
     "AttentionFusion",
-    "MultimodalPredictor",
+    "GraphFusion",
+    "UncertaintyFusion",
+    "UncertaintyGraphFusion",
+    "diversity_loss",
+    "graph_sparsity_loss",
+    "select_fusion_strategy",
+    "MultimodalAligner",
 ]

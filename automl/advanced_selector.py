@@ -21,9 +21,12 @@ Returns Optuna-compatible search space dicts for every tuneable parameter.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
 import torch
 
 logger = logging.getLogger(__name__)
@@ -72,6 +75,9 @@ class SelectionResult:
     hpo_space: Dict[str, OptunaDist] = field(default_factory=dict)
     rationale: Dict[str, str] = field(default_factory=dict)
     hardware_info: Dict[str, Any] = field(default_factory=dict)
+    meta_context: List[Dict[str, Any]] = field(default_factory=list)
+    eligible_modalities: List[str] = field(default_factory=list)
+    excluded_modalities: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -96,6 +102,32 @@ TEXT_ENCODERS: Dict[str, Dict[str, Any]] = {
 TABULAR_ENCODERS: Dict[str, Dict[str, Any]] = {
     "simple":       {"name": "MLP",  "output_dim": 16},
     "interpretable":{"name": "GRN",  "output_dim": 16},
+    # NOTE: FT-Transformer is not implemented in this codebase yet.
+    # Keep "sota" key mapped to the best available implemented encoder.
+    "sota":         {"name": "GRN",  "output_dim": 16},
+}
+
+
+_ENCODER_LATENCY_MS: Dict[str, float] = {
+    "ConvNeXt-Tiny": 18.0,
+    "ResNet50": 9.0,
+    "MobileNetV3": 4.5,
+    "DeBERTa-v3": 85.0,
+    "BERT-base": 42.0,
+    "MiniLM-L6-v2": 12.0,
+    "GRN": 0.8,
+    "MLP": 0.4,
+}
+
+_ENCODER_VRAM_MB: Dict[str, int] = {
+    "ConvNeXt-Tiny": 880,
+    "ResNet50": 420,
+    "MobileNetV3": 55,
+    "DeBERTa-v3": 1600,
+    "BERT-base": 440,
+    "MiniLM-L6-v2": 90,
+    "GRN": 12,
+    "MLP": 6,
 }
 
 
@@ -121,6 +153,10 @@ class AdvancedModelSelector:
     # Primary selection method
     # ------------------------------------------------------------------
 
+    def __init__(self) -> None:
+        from automl.meta_learning import MetaLearningStore
+        self._meta_store = MetaLearningStore()
+
     def select_models(
         self,
         problem_type: str,
@@ -128,6 +164,10 @@ class AdvancedModelSelector:
         dataset_size: int,
         avg_tokens: int = 128,
         gpu_memory_gb: Optional[float] = None,
+        dataset_meta: Optional[Dict[str, Any]] = None,
+        latency_budget_ms: Optional[float] = None,
+        memory_budget_mb: Optional[float] = None,
+        predictability_scores: Optional[Dict[str, float]] = None,
     ) -> SelectionResult:
         """
         Select encoder tier, fixed batch size, and Optuna HPO search bounds.
@@ -145,6 +185,32 @@ class AdvancedModelSelector:
         -------
         SelectionResult
         """
+        input_modalities = [str(m) for m in (modalities or [])]
+        predictability_map = dict(predictability_scores or {})
+        excluded_modalities: Dict[str, str] = {}
+        eligible_modalities: List[str] = []
+
+        for modality in input_modalities:
+            score = self._resolve_modality_predictability(modality, predictability_map)
+            if score is not None and score < 0.25:
+                excluded_modalities[modality] = f"predictability {score:.3f} < 0.250"
+                continue
+            eligible_modalities.append(modality)
+
+        if not eligible_modalities and input_modalities:
+            ranked = sorted(
+                input_modalities,
+                key=lambda m: self._resolve_modality_predictability(m, predictability_map)
+                if self._resolve_modality_predictability(m, predictability_map) is not None
+                else -1.0,
+                reverse=True,
+            )
+            keep_modality = ranked[0]
+            eligible_modalities = [keep_modality]
+            excluded_modalities.pop(keep_modality, None)
+
+        effective_modalities = eligible_modalities or input_modalities
+
         gpu_mem: float = (
             gpu_memory_gb if gpu_memory_gb is not None
             else self._probe_gpu_memory()
@@ -154,33 +220,100 @@ class AdvancedModelSelector:
         # ── encoder tier selection ──────────────────────────────────────
         image_tier, img_rationale = (
             self._select_image_tier(dataset_size, gpu_mem)
-            if "image" in modalities
+            if "image" in effective_modalities
             else (None, "")
         )
         text_tier, txt_rationale = (
-            self._select_text_tier(problem_type, dataset_size, gpu_mem)
-            if "text" in modalities
+            self._select_text_tier(problem_type, dataset_size, gpu_mem, avg_tokens)
+            if "text" in effective_modalities
             else (None, "")
         )
         tabular_tier, tab_rationale = (
             self._select_tabular_tier(dataset_size, gpu_mem)
-            if "tabular" in modalities
+            if "tabular" in effective_modalities
             else (None, "")
         )
 
+        if latency_budget_ms is not None or memory_budget_mb is not None:
+            image_tier = self._apply_resource_constraints(
+                selected_tier=image_tier,
+                catalogue=IMAGE_ENCODERS,
+                fallback_chain=["sota", "balanced", "lightweight"],
+                modality="image",
+                latency_budget_ms=latency_budget_ms,
+                memory_budget_mb=memory_budget_mb,
+            )
+            text_tier = self._apply_resource_constraints(
+                selected_tier=text_tier,
+                catalogue=TEXT_ENCODERS,
+                fallback_chain=["sota", "balanced", "fast"],
+                modality="text",
+                latency_budget_ms=latency_budget_ms,
+                memory_budget_mb=memory_budget_mb,
+            )
+            tabular_tier = self._apply_resource_constraints(
+                selected_tier=tabular_tier,
+                catalogue=TABULAR_ENCODERS,
+                fallback_chain=["sota", "interpretable", "simple"],
+                modality="tabular",
+                latency_budget_ms=latency_budget_ms,
+                memory_budget_mb=memory_budget_mb,
+            )
+
         # ── batch size (PDF – not tuned) ────────────────────────────────
-        batch_size = self._pdf_batch_size(modalities, gpu_mem, dataset_size, avg_tokens)
+        batch_size = self._pdf_batch_size(
+            effective_modalities,
+            gpu_mem,
+            dataset_size,
+            avg_tokens,
+        )
+
+        # ── meta-learning context (optional bias; never overrides contracts) ─
+        dataset_meta_norm = self._build_dataset_meta(
+            problem_type=problem_type,
+            modalities=effective_modalities,
+            dataset_size=dataset_size,
+            dataset_meta=dataset_meta,
+        )
+        similar_context = self._meta_store.get_similar_context(dataset_meta_norm)
+        meta_bias = self._derive_meta_bias(similar_context)
 
         # ── fusion strategy (static – also offered as HPO when multimodal) ─
-        fusion = "attention" if gpu_mem >= 8 else "concatenation"
+        from models.fusion import select_fusion_strategy
+
+        fusion = self._normalize_fusion_key(
+            select_fusion_strategy({"global_modalities": list(effective_modalities)})
+        )
+        if fusion in {"graph", "uncertainty", "uncertainty_graph"} and gpu_mem < 4:
+            fusion = "concatenation"
+            logger.info(
+                "AdvancedModelSelector: GPU %.1fGB too small for %s, downgraded to concatenation",
+                gpu_mem,
+                self._normalize_fusion_key(
+                    select_fusion_strategy({"global_modalities": list(effective_modalities)})
+                ),
+            )
+
+        preferred_fusion = meta_bias.get("preferred_fusion")
+        preferred_fusion = self._normalize_fusion_key(preferred_fusion)
+        if preferred_fusion in {
+            "attention",
+            "concatenation",
+            "graph",
+            "uncertainty",
+            "uncertainty_graph",
+        }:
+            fusion = preferred_fusion
 
         # ── Optuna HPO search spaces ────────────────────────────────────
         hpo_space = self._build_hpo_space(
-            modalities=modalities,
+            modalities=effective_modalities,
             dataset_size=dataset_size,
             problem_type=problem_type,
             gpu_mem=gpu_mem,
             fusion_static=fusion,
+            lr_bias=meta_bias.get("lr_range"),
+            fusion_priority=meta_bias.get("fusion_priority"),
         )
 
         rationale: Dict[str, str] = {}
@@ -194,6 +327,17 @@ class AdvancedModelSelector:
             f"dataset_size={dataset_size}, gpu_mem={gpu_mem:.1f}GB, "
             f"avg_tokens={avg_tokens}"
         )
+        if excluded_modalities:
+            rationale["modality_gating"] = (
+                "Excluded weak modalities: "
+                + ", ".join(
+                    f"{name} ({reason})" for name, reason in excluded_modalities.items()
+                )
+            )
+        if similar_context:
+            rationale["meta_learning"] = (
+                f"Applied priors from {len(similar_context)} similar experiments"
+            )
 
         logger.info(
             "AdvancedModelSelector: image=%s  text=%s  tabular=%s  "
@@ -209,7 +353,81 @@ class AdvancedModelSelector:
             hpo_space=hpo_space,
             rationale=rationale,
             hardware_info=hardware_info,
+            meta_context=similar_context,
+            eligible_modalities=list(effective_modalities),
+            excluded_modalities=excluded_modalities,
         )
+
+    def record_experiment(
+        self,
+        dataset_meta: Dict[str, Any],
+        best_params: Dict[str, Any],
+        fusion_strategy: str,
+        loss_weights: Optional[Dict[str, float]],
+        performance: float,
+    ) -> None:
+        """Persist a completed training outcome for future search priors."""
+        record = {
+            "dataset_meta": {
+                "num_rows": int(dataset_meta.get("num_rows", 0)),
+                "num_cols": int(dataset_meta.get("num_cols", 0)),
+                "modalities": list(dataset_meta.get("modalities", [])),
+                "target_type": str(dataset_meta.get("target_type", "classification")),
+            },
+            "best_params": dict(best_params or {}),
+            "fusion_strategy": str(fusion_strategy),
+            "loss_weights": dict(loss_weights or {}),
+            "performance": float(performance),
+        }
+        self._meta_store.add_experiment(record)
+
+    @staticmethod
+    def _target_type(problem_type: str) -> str:
+        return "regression" if "regression" in str(problem_type).lower() else "classification"
+
+    def _build_dataset_meta(
+        self,
+        problem_type: str,
+        modalities: List[str],
+        dataset_size: int,
+        dataset_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        meta = dict(dataset_meta or {})
+        meta.setdefault("num_rows", int(dataset_size))
+        meta.setdefault("num_cols", int(meta.get("num_cols", len(modalities) * 8 or 1)))
+        meta.setdefault("modalities", list(modalities))
+        meta.setdefault("target_type", self._target_type(problem_type))
+        return meta
+
+    @staticmethod
+    def _derive_meta_bias(similar_context: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not similar_context:
+            return {}
+
+        fusion_votes = Counter()
+        lr_values: List[float] = []
+        for rec in similar_context:
+            fusion = rec.get("fusion_strategy")
+            if isinstance(fusion, str):
+                fusion_votes[fusion] += 1
+            lr = rec.get("best_params", {}).get("learning_rate")
+            try:
+                if lr is not None:
+                    lr_values.append(float(lr))
+            except Exception:
+                continue
+
+        bias: Dict[str, Any] = {}
+        if fusion_votes:
+            ordered_fusions = [k for k, _ in fusion_votes.most_common()]
+            bias["fusion_priority"] = ordered_fusions
+            bias["preferred_fusion"] = ordered_fusions[0]
+
+        if lr_values:
+            lr_mean = sum(lr_values) / max(1, len(lr_values))
+            bias["lr_range"] = (max(1e-6, lr_mean * 0.5), min(1e-1, lr_mean * 2.0))
+
+        return bias
 
     # ------------------------------------------------------------------
     # API / frontend shim
@@ -221,6 +439,11 @@ class AdvancedModelSelector:
         modalities: List[str],
         dataset_size: int = 10_000,
         avg_tokens: int = 128,
+        tabular_X: Optional[Any] = None,
+        tabular_y: Optional[Any] = None,
+        latency_budget_ms: Optional[float] = None,
+        memory_budget_mb: Optional[float] = None,
+        predictability_scores: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Return a ranked list of model recommendation dicts suitable for the
@@ -235,7 +458,15 @@ class AdvancedModelSelector:
             modalities=modalities,
             dataset_size=dataset_size,
             avg_tokens=avg_tokens,
+            latency_budget_ms=latency_budget_ms,
+            memory_budget_mb=memory_budget_mb,
+            predictability_scores=predictability_scores,
         )
+
+        tab_probe_scores: Dict[str, Dict[str, Any]] = {}
+        probe_scores: Dict[str, Dict[str, Any]] = {}
+        ranked_candidates: Dict[str, List[Dict[str, Any]]] = {}
+        selection_metadata: Dict[str, Any] = {}
 
         def _encoder_name(catalogue: Dict, tier: Optional[str]) -> Optional[str]:
             return catalogue[tier]["name"] if tier and tier in catalogue else None
@@ -254,21 +485,135 @@ class AdvancedModelSelector:
             "hpo_space":       primary.hpo_space,
             "rationale":       primary.rationale,
             "hardware_info":   primary.hardware_info,
+            "meta_context":    primary.meta_context,
+            "eligible_modalities": list(primary.eligible_modalities),
+            "excluded_modalities": dict(primary.excluded_modalities),
+            "warm_start_params": (
+                dict(primary.meta_context[0].get("best_params", {}))
+                if primary.meta_context and isinstance(primary.meta_context[0], dict)
+                else {}
+            ),
+            "selection_contract_version": "model_selection.v2",
+            "probe_scores": {},
+            "selection_metadata": {},
+            "ranked_candidates": {},
             "tier":            "primary",
         }
 
+        # Optional data-driven probe for tabular encoder preference.
+        if (
+            tabular_X is not None
+            and tabular_y is not None
+            and "tabular" in list(primary.eligible_modalities or modalities)
+        ):
+            try:
+                from automl.candidate_selector import (
+                    CandidateSelector,
+                    TABULAR_CANDIDATE_POOL,
+                )
+
+                probe_selector = CandidateSelector()
+                probe_X = tabular_X.toarray() if hasattr(tabular_X, "toarray") else np.asarray(tabular_X)
+                probe_y = np.asarray(tabular_y)
+
+                if probe_y.ndim > 1 and probe_y.shape[1] > 1:
+                    probe_y = np.argmax(probe_y, axis=1)
+                else:
+                    probe_y = probe_y.ravel()
+                    if probe_y.dtype.kind in ("U", "S", "O"):
+                        probe_y = pd.factorize(probe_y)[0]
+                    else:
+                        try:
+                            probe_y = probe_y.astype(int)
+                        except Exception:
+                            probe_y = pd.factorize(probe_y)[0]
+
+                tab_probe_scores = probe_selector.quick_probe_tabular(
+                    list(TABULAR_CANDIDATE_POOL),
+                    probe_X,
+                    probe_y,
+                    problem_type,
+                )
+
+                if tab_probe_scores:
+                    probe_scores["tabular"] = dict(tab_probe_scores)
+
+                score_map = {
+                    name: float(info.get("val_score", 0.0) or 0.0)
+                    for name, info in tab_probe_scores.items()
+                    if isinstance(info, dict)
+                }
+                top_model = max(score_map, key=score_map.get) if score_map else None
+
+                if tab_probe_scores:
+                    ranked_candidates["tabular"] = sorted(
+                        [
+                            {
+                                "name": model_name,
+                                "val_score": float(details.get("val_score", 0.0) or 0.0),
+                                "latency_ms": float(details.get("latency_ms", 0.0) or 0.0),
+                                "uncertainty": float(details.get("uncertainty", 0.0) or 0.0),
+                                "confidence": details.get("confidence"),
+                            }
+                            for model_name, details in tab_probe_scores.items()
+                            if isinstance(details, dict)
+                        ],
+                        key=lambda row: row.get("val_score", 0.0),
+                        reverse=True,
+                    )
+
+                top_score = float(score_map[top_model]) if top_model else None
+                selection_metadata = {
+                    "probe_method": "tabular_3fold_cv",
+                    "top_probe_model": top_model,
+                    "top_probe_score": top_score,
+                    "probe_scores": dict(tab_probe_scores),
+                }
+
+                if top_model in {"mlp", "grn"}:
+                    preferred_tier = "simple" if top_model == "mlp" else "interpretable"
+                    primary_rec["tabular_encoder"] = TABULAR_ENCODERS[preferred_tier]["name"]
+                    primary_rec["name"] = self._build_model_name(
+                        primary.image_encoder,
+                        primary.text_encoder,
+                        preferred_tier,
+                    )
+
+                if top_model is not None:
+                    primary_rec["tabular_probe_top_model"] = str(top_model)
+                    primary_rec["quick_probe_score"] = float(score_map[top_model])
+                    primary_rec["probe_score"] = float(score_map[top_model])
+
+                primary_rec["tabular_probe_scores"] = dict(tab_probe_scores)
+                primary_rec.setdefault("rationale", {})["tabular_probe"] = (
+                    "Tabular quick probe executed on cached sample"
+                )
+            except Exception as probe_exc:
+                logger.warning("AdvancedModelSelector.recommend_models: tabular probe failed: %s", probe_exc)
+
+        primary_rec["probe_scores"] = dict(probe_scores)
+        primary_rec["selection_metadata"] = dict(selection_metadata)
+        primary_rec["ranked_candidates"] = dict(ranked_candidates)
+
         # Lightweight fallback alternative
         alt_hpo = dict(primary.hpo_space)  # same search bounds
+        fallback_modalities = set(primary.eligible_modalities or modalities)
         alt_rec: Dict[str, Any] = {
             "name": "Lightweight Fallback",
-            "image_encoder":   IMAGE_ENCODERS["lightweight"]["name"] if "image" in modalities else None,
-            "text_encoder":    TEXT_ENCODERS["fast"]["name"]         if "text"  in modalities else None,
-            "tabular_encoder": TABULAR_ENCODERS["simple"]["name"]    if "tabular" in modalities else None,
+            "image_encoder":   IMAGE_ENCODERS["lightweight"]["name"] if "image" in fallback_modalities else None,
+            "text_encoder":    TEXT_ENCODERS["fast"]["name"]         if "text"  in fallback_modalities else None,
+            "tabular_encoder": TABULAR_ENCODERS["simple"]["name"]    if "tabular" in fallback_modalities else None,
             "fusion_strategy": "concatenation",
             "batch_size":      min(primary.batch_size, 8),
             "hpo_space":       alt_hpo,
             "rationale":       {"general": "Lightweight fallback for memory-constrained environments"},
             "hardware_info":   primary.hardware_info,
+            "eligible_modalities": list(primary.eligible_modalities),
+            "excluded_modalities": dict(primary.excluded_modalities),
+            "selection_contract_version": "model_selection.v2",
+            "probe_scores": {},
+            "selection_metadata": {},
+            "ranked_candidates": {},
             "tier":            "fallback",
         }
 
@@ -368,7 +713,12 @@ class AdvancedModelSelector:
         problem_type: str,
         dataset_size: int,
         gpu_mem: float,
+        avg_tokens: int = 128,
     ) -> Tuple[str, str]:
+        if avg_tokens > 1024:
+            return "fast", f"Avg tokens {avg_tokens}: lightweight text tier to respect sequence budget"
+        if avg_tokens > 512:
+            return "balanced", f"Avg tokens {avg_tokens}: avoid SOTA text tier with short token limit"
         if "binary" in problem_type or dataset_size < 5_000:
             return "fast", "Binary/small dataset: DistilBERT for speed"
         if "multiclass" in problem_type and gpu_mem >= 8 and dataset_size > 10_000:
@@ -380,9 +730,9 @@ class AdvancedModelSelector:
         if dataset_size < 5_000 and gpu_mem < 8:
             return "simple", "Small dataset + limited GPU: MLP"
         if gpu_mem >= 12:
-            return "sota",    f"GPU {gpu_mem:.1f}GB: FT-Transformer"
+            return "sota",    f"GPU {gpu_mem:.1f}GB: GRN"
         if gpu_mem >= 8:
-            return "interpretable", f"GPU {gpu_mem:.1f}GB: TabNet"
+            return "interpretable", f"GPU {gpu_mem:.1f}GB: GRN"
         return "simple", f"GPU {gpu_mem:.1f}GB: MLP"
 
     # ------------------------------------------------------------------
@@ -396,6 +746,8 @@ class AdvancedModelSelector:
         problem_type: str,
         gpu_mem: float,
         fusion_static: str,
+        lr_bias: Optional[Tuple[float, float]] = None,
+        fusion_priority: Optional[List[str]] = None,
     ) -> Dict[str, OptunaDist]:
         """
         Build a fully-specified Optuna search space based on data context.
@@ -411,6 +763,12 @@ class AdvancedModelSelector:
         # Learning rate: wider range for large datasets; log-uniform always
         lr_low  = 1e-5 if dataset_size > 50_000 else 5e-5
         lr_high = 1e-3 if dataset_size > 50_000 else 1e-2
+        if lr_bias:
+            bias_low, bias_high = lr_bias
+            lr_low = max(lr_low, min(bias_low, bias_high))
+            lr_high = min(lr_high, max(bias_low, bias_high))
+            if lr_low >= lr_high:
+                lr_low, lr_high = (1e-5, 1e-3) if dataset_size > 50_000 else (5e-5, 1e-2)
 
         space: Dict[str, OptunaDist] = {
             "epochs": {
@@ -437,13 +795,33 @@ class AdvancedModelSelector:
             },
         }
 
+        # Alignment regularization is only meaningful when 2+ modalities exist.
+        if len(modalities) >= 2:
+            space["alignment_weight"] = {
+                "type": "float",
+                "low": 0.0,
+                "high": 0.05,
+                "log": False,
+            }
+
         # Fusion strategy is also tunable when multiple modalities exist
         if len(modalities) > 1:
-            choices = (
-                ["attention", "concatenation"]
-                if gpu_mem >= 8
-                else ["concatenation"]
-            )
+            if gpu_mem >= 4:
+                choices = [
+                    "concatenation",
+                    "attention",
+                    "graph",
+                    "uncertainty",
+                    "uncertainty_graph",
+                ]
+            else:
+                choices = ["concatenation", "attention"]
+
+            if fusion_priority:
+                normalized_priority = [self._normalize_fusion_key(f) for f in fusion_priority]
+                ordered = [f for f in normalized_priority if f in choices]
+                if ordered:
+                    choices = ordered + [f for f in choices if f not in ordered]
             space["fusion_strategy"] = {
                 "type":    "categorical",
                 "choices": choices,
@@ -497,3 +875,68 @@ class AdvancedModelSelector:
         if tabular_tier and tabular_tier in TABULAR_ENCODERS:
             parts.append(TABULAR_ENCODERS[tabular_tier]["name"])
         return " + ".join(parts) if parts else "Unsupervised"
+
+    @staticmethod
+    def _normalize_fusion_key(fusion: Optional[str]) -> str:
+        value = str(fusion or "concatenation").strip().lower().replace("-", "_")
+        if value in {"concat", "concatenate"}:
+            return "concatenation"
+        if value in {"uncertaintygraph", "uncertainty+graph"}:
+            return "uncertainty_graph"
+        return value
+
+    @staticmethod
+    def _resolve_modality_predictability(
+        modality: str,
+        predictability_scores: Dict[str, float],
+    ) -> Optional[float]:
+        if not predictability_scores:
+            return None
+
+        modality_key = str(modality).lower()
+        direct = predictability_scores.get(modality)
+        if isinstance(direct, (int, float)):
+            return float(direct)
+
+        for key, value in predictability_scores.items():
+            if not isinstance(value, (int, float)):
+                continue
+            if modality_key in str(key).lower():
+                return float(value)
+        return None
+
+    def _apply_resource_constraints(
+        self,
+        selected_tier: Optional[str],
+        catalogue: Dict[str, Dict[str, Any]],
+        fallback_chain: List[str],
+        modality: str,
+        latency_budget_ms: Optional[float],
+        memory_budget_mb: Optional[float],
+    ) -> Optional[str]:
+        """Downgrade encoder tier when latency or memory budgets are exceeded."""
+        if not selected_tier or selected_tier not in catalogue:
+            return selected_tier
+
+        selected_idx = fallback_chain.index(selected_tier) if selected_tier in fallback_chain else len(fallback_chain) - 1
+        for tier in fallback_chain[selected_idx:]:
+            if tier not in catalogue:
+                continue
+            name = str(catalogue[tier].get("name", ""))
+            lat = float(_ENCODER_LATENCY_MS.get(name, 0.0))
+            mem = float(_ENCODER_VRAM_MB.get(name, 0.0))
+            lat_ok = latency_budget_ms is None or lat <= float(latency_budget_ms)
+            mem_ok = memory_budget_mb is None or mem <= float(memory_budget_mb)
+            if lat_ok and mem_ok:
+                if tier != selected_tier:
+                    logger.info(
+                        "AdvancedModelSelector: %s tier downgraded %s -> %s due to resource budget",
+                        modality,
+                        selected_tier,
+                        tier,
+                    )
+                return tier
+
+        # If nothing satisfies constraints, keep the lightest available tier.
+        lightest = fallback_chain[-1] if fallback_chain else selected_tier
+        return lightest if lightest in catalogue else selected_tier

@@ -1,0 +1,25 @@
+{
+  "steps": {
+    "ablations": "failed",
+    "baselines": "ok",
+    "ula_ablation": "ok",
+    "lora_ablation": "ok",
+    "modality_robustness": "ok",
+    "hateful_memes_benchmark": "ok",
+    "aggregation": "ok",
+    "paper": "ok",
+    "plots": "ok"
+  },
+  "quick": true,
+  "seeds": [
+    42
+  ],
+  "fixture_paths": {
+    "adult": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\adult_income_smoke.csv",
+    "housing": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\california_housing_smoke.csv",
+    "imdb": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\imdb_smoke.csv",
+    "mmimdb": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\mmimdb_smoke.csv",
+    "mosei": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\mosei_smoke.csv",
+    "hateful_memes": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\hateful_memes\\hateful_memes_n200.csv"
+  }
+}

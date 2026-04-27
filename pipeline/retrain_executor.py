@@ -64,6 +64,7 @@ class RetrainingPipeline:
         problem_type: str,
         modalities: List[str],
         schema_info: Optional[Dict[str, Any]] = None,
+        ewc: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Execute Phases 1, (2|inject), 3, 4, 5, 7 on the production dataset.
@@ -114,6 +115,9 @@ class RetrainingPipeline:
             modalities=modalities,
         )
         orchestrator = TrainingOrchestrator(cfg)
+        # Propagate EWC object to orchestrator for use in Phase 5 training
+        if ewc is not None:
+            orchestrator._ewc = ewc
 
         # ── Phase 1: re-register from cache (no network I/O on cache hits) ─
         self._run_async(

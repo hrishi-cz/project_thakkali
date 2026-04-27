@@ -210,6 +210,45 @@ def test_trial_intelligence_memory_persistence():
     print("✅ Test 7 PASSED: Cross-trial memory persists correctly")
 
 
+def test_trial_intelligence_summarize_trials_feedback_signal():
+    """Verify trial summary emits stable adaptive feedback fields."""
+    ti = TrialIntelligence()
+
+    summary = ti.summarize_trials([
+        {
+            "trial": 0,
+            "fit_type": "overfitting",
+            "train_slope": -0.04,
+            "val_slope": 0.03,
+            "generalization_gap": 0.25,
+            "adaptive_penalty": 0.20,
+        },
+        {
+            "trial": 1,
+            "fit_type": "overfitting",
+            "train_slope": -0.03,
+            "val_slope": 0.02,
+            "generalization_gap": 0.22,
+            "adaptive_penalty": 0.24,
+        },
+        {
+            "trial": 2,
+            "fit_type": "good",
+            "train_slope": -0.02,
+            "val_slope": -0.01,
+            "generalization_gap": 0.08,
+            "adaptive_penalty": 0.10,
+        },
+    ])
+
+    assert summary["fit_type"] == "overfitting"
+    assert summary["num_trials"] == 3
+    assert summary["fit_counts"]["overfitting"] == 2
+    assert summary["adaptive_penalty"] > 0.0
+    assert 0.0 <= summary["calibration_proxy"] <= 1.0
+    print("✅ Test 8 PASSED: Trial summary emits adaptive feedback signal")
+
+
 # ===========================================================================
 # Test 5: Complete Wiring Simulation
 # ===========================================================================

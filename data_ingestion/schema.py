@@ -91,6 +91,25 @@ class IndividualSchema:
     problem_type: str = "unsupervised"
     modalities: List[str] = field(default_factory=list)
     confidence: float = 0.0
+    target_profile: Dict[str, Any] = field(default_factory=dict)
+    reasoning: Dict[str, Any] = field(default_factory=dict)
+    candidates: List[Dict[str, Any]] = field(default_factory=list)
+    rejected_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    preprocessing_hints: Dict[str, Any] = field(default_factory=dict)
+    selection_mode: str = "auto"
+    semantic_summary: Dict[str, Any] = field(default_factory=dict)
+    interaction_summary: Dict[str, Any] = field(default_factory=dict)
+    uncertainty_summary: Dict[str, Any] = field(default_factory=dict)
+    semantic_roles: Dict[str, List[str]] = field(default_factory=dict)
+    business_patterns: Dict[str, Any] = field(default_factory=dict)
+    text_task_type: Optional[str] = None
+    num_features: int = 0
+    has_relational_columns: bool = False
+    image_label_separability: float = 0.0
+    image_class_balance: float = 0.0
+    image_dataset_size: int = 0
+    # G7/G8: per-modality feature signals (text vocab/tokens, image resolution/blur, etc.)
+    feature_signals: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -127,3 +146,9 @@ class GlobalSchema:
     detection_confidence: float
     per_dataset: List[Dict[str, Any]] = field(default_factory=list)
     relatedness_report: Dict[str, Any] = field(default_factory=dict)
+    semantic_enrichment: Dict[str, Any] = field(default_factory=dict)
+    # Architecture routing signals
+    total_feature_count: int = 0
+    has_relational_columns: bool = False
+    # G9: cross-modality alignment signals (complementarity_score, alignment_strength)
+    multimodal_signals: Dict[str, float] = field(default_factory=dict)

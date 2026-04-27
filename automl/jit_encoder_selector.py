@@ -168,10 +168,38 @@ def _make_mobilenet_v3() -> nn.Module:
     return _freeze_and_eval(encoder)
 
 
+def _make_efficientnet_b0() -> nn.Module:
+    """EfficientNet-B0 backbone with projection to 512-dim output."""
+    import torchvision.models as tv
+
+    try:
+        weights = tv.EfficientNet_B0_Weights.IMAGENET1K_V1
+        backbone = tv.efficientnet_b0(weights=weights)
+    except (TypeError, AttributeError):
+        backbone = tv.efficientnet_b0(pretrained=True)
+
+    in_features = backbone.classifier[-1].in_features
+    backbone.classifier = nn.Identity()
+
+    projection = nn.Sequential(
+        nn.Linear(in_features, 512),
+        nn.ReLU(),
+    )
+    encoder = _VisionEncoderWrapper(backbone, projection, output_dim=512)
+    return _freeze_and_eval(encoder)
+
+
 def _make_resnet50() -> nn.Module:
     """Standard ResNet-50 — delegates to the existing ImageEncoder."""
     from models.encoders.image import ImageEncoder
     enc = ImageEncoder(pretrained=True, freeze_backbone=True)
+    return _freeze_and_eval(enc)
+
+
+def _make_multiscale_resnet50() -> nn.Module:
+    """Dual-resolution ResNet-50 (112×112 + 224×224) — higher accuracy, ~30% VRAM overhead."""
+    from modelss.encoders.image import MultiScaleImageEncoder
+    enc = MultiScaleImageEncoder(pretrained=True, freeze_backbone=True, share_weights=False)
     return _freeze_and_eval(enc)
 
 
@@ -241,6 +269,17 @@ def _make_bert_base() -> nn.Module:
     return _freeze_and_eval(enc)
 
 
+def _make_distilbert() -> nn.Module:
+    """DistilBERT â€” lighter 768-dim text encoder."""
+    from models.encoders.text import TextEncoder
+    enc = TextEncoder(
+        model_name="distilbert-base-uncased",
+        max_length=128,
+        freeze_backbone=True,
+    )
+    return _freeze_and_eval(enc)
+
+
 def _make_deberta() -> nn.Module:
     """DeBERTa-v3-base — stronger text understanding, heavier."""
     from models.encoders.text import TextEncoder
@@ -277,6 +316,13 @@ VISION_REGISTRY: List[EncoderSpec] = [
         dummy_input_fn=_dummy_image,
     ),
     EncoderSpec(
+        name="EfficientNet-B0",
+        factory=_make_efficientnet_b0,
+        output_dim=512,
+        capacity=5_300_000,       # ~5.3M params
+        dummy_input_fn=_dummy_image,
+    ),
+    EncoderSpec(
         name="ResNet-50",
         factory=_make_resnet50,
         output_dim=512,
@@ -290,7 +336,46 @@ VISION_REGISTRY: List[EncoderSpec] = [
         capacity=28_600_000,      # ~28.6M params
         dummy_input_fn=_dummy_image,
     ),
+    EncoderSpec(
+        name="MultiScale-ResNet50",
+        factory=_make_multiscale_resnet50,
+        output_dim=512,
+        capacity=51_200_000,      # ~2× ResNet-50 params (two branches)
+        dummy_input_fn=_dummy_image,
+    ),
 ]
+
+# ── ViT encoders (optional — require 'transformers' package) ─────────────
+def _make_clip_vit_b16() -> nn.Module:
+    """CLIP ViT-B/16 — 86M params, 768-dim, supports patch tokens for ULA."""
+    from modelss.encoders.image import ViTImageEncoder
+    return ViTImageEncoder("openai/clip-vit-base-patch16", freeze_backbone=True)
+
+def _make_dinov2_vitb14() -> nn.Module:
+    """DINOv2 ViT-B/14 — 86M params, 768-dim, superior dense patch features."""
+    from modelss.encoders.image import ViTImageEncoder
+    return ViTImageEncoder("facebook/dinov2-base", freeze_backbone=True)
+
+try:
+    # Register ViT encoders only if transformers is importable
+    import transformers as _tf_check  # noqa: F401
+    VISION_REGISTRY.append(EncoderSpec(
+        name="CLIP-ViT-B/16",
+        factory=_make_clip_vit_b16,
+        output_dim=768,
+        capacity=86_000_000,
+        dummy_input_fn=_dummy_image,
+    ))
+    VISION_REGISTRY.append(EncoderSpec(
+        name="DINOv2-ViT-B/14",
+        factory=_make_dinov2_vitb14,
+        output_dim=768,
+        capacity=86_000_000,
+        dummy_input_fn=_dummy_image,
+    ))
+    logger.info("JIT registry: CLIP-ViT-B/16 and DINOv2-ViT-B/14 added")
+except ImportError:
+    logger.debug("JIT registry: transformers not installed — ViT encoders unavailable")
 
 TEXT_REGISTRY: List[EncoderSpec] = [
     EncoderSpec(
@@ -298,6 +383,13 @@ TEXT_REGISTRY: List[EncoderSpec] = [
         factory=_make_minilm,
         output_dim=768,
         capacity=22_700_000,      # ~22.7M params
+        dummy_input_fn=_dummy_text,
+    ),
+    EncoderSpec(
+        name="DistilBERT-base-uncased",
+        factory=_make_distilbert,
+        output_dim=768,
+        capacity=66_400_000,      # ~66.4M params
         dummy_input_fn=_dummy_text,
     ),
     EncoderSpec(
@@ -328,9 +420,22 @@ TEXT_REGISTRY.sort(key=lambda s: s.capacity, reverse=True)
 
 from models.encoders.tabular import TabularEncoder as _TabularMLPClass
 from models.encoders.tabular import GRNTabularEncoder as _TabularGRNClass
+from models.encoders.tabular import FTTransformerEncoder as _TabularFTTClass
+
+
+class _FTTWrapper:
+    """Wrapper so FTTransformerEncoder is constructed with only input_dim (like MLP/GRN)."""
+    def __new__(cls, input_dim: int):
+        return _TabularFTTClass(input_dim=input_dim, output_dim=64)
 
 
 TABULAR_REGISTRY: List[TabularEncoderSpec] = [
+    TabularEncoderSpec(
+        name="FTTransformer",
+        encoder_class=_FTTWrapper,
+        output_dim=64,
+        capacity=150_000,     # ~150K params (d_token=96, 3 layers, 8 heads)
+    ),
     TabularEncoderSpec(
         name="GRN",
         encoder_class=_TabularGRNClass,
@@ -597,6 +702,65 @@ class JITEncoderSelector:
         self.ETA = safety_margin
         self._batch_size = batch_size
 
+    def _resolve_tabular_spec(self, preferred_tabular: Optional[str]) -> Optional[TabularEncoderSpec]:
+        if not TABULAR_REGISTRY:
+            return None
+
+        pref = str(preferred_tabular or "").strip().lower()
+        if not pref:
+            return TABULAR_REGISTRY[0]
+
+        if pref in {"simple", "mlp"}:
+            target_name = "mlp"
+        elif pref in {"interpretable", "sota", "grn", "xgboost", "lightgbm"}:
+            target_name = "grn"
+        else:
+            target_name = pref
+
+        for spec in TABULAR_REGISTRY:
+            if spec.name.strip().lower() == target_name:
+                return spec
+
+        return TABULAR_REGISTRY[0]
+
+    @staticmethod
+    def _prioritize_encoder_specs(
+        candidates: List[EncoderSpec],
+        preferred_name: Optional[str],
+    ) -> List[EncoderSpec]:
+        """Move a preferred encoder to the front while retaining fallbacks."""
+        if not candidates:
+            return []
+
+        pref = str(preferred_name or "").strip().lower()
+        if not pref:
+            return list(candidates)
+
+        alias_map = {
+            "mobilenet": "mobilenetv3-small",
+            "mobilenetv3": "mobilenetv3-small",
+            "efficientnet": "efficientnet-b0",
+            "efficientnet_b0": "efficientnet-b0",
+            "resnet": "resnet-50",
+            "resnet50": "resnet-50",
+            "convnext": "convnext-tiny",
+            "distilbert": "distilbert-base-uncased",
+            "bert": "bert-base-uncased",
+            "deberta": "deberta-v3-base",
+        }
+        target = alias_map.get(pref, pref)
+
+        preferred: List[EncoderSpec] = []
+        fallback: List[EncoderSpec] = []
+        for spec in candidates:
+            spec_name = spec.name.strip().lower()
+            if spec_name == target or target in spec_name or spec_name in target:
+                preferred.append(spec)
+            else:
+                fallback.append(spec)
+
+        return preferred + fallback if preferred else list(candidates)
+
     # ------------------------------------------------------------------ #
     #  Public API
     # ------------------------------------------------------------------ #
@@ -605,6 +769,9 @@ class JITEncoderSelector:
         self,
         modalities: List[str],
         device: Optional[torch.device] = None,
+        preferred_tabular: Optional[str] = None,
+        preferred_text: Optional[str] = None,
+        preferred_image: Optional[str] = None,
     ) -> JITSelectionResult:
         """
         Select the highest-capacity encoder combination that fits in VRAM.
@@ -616,6 +783,10 @@ class JITEncoderSelector:
             ``["image", "text", "tabular"]``.
         device : torch.device or None
             Target CUDA device.  Auto-detected when ``None``.
+        preferred_tabular : str or None
+            Optional preferred tabular encoder key/name derived from
+            model-selection or probe results (e.g. ``"GRN"``, ``"MLP"``,
+            ``"interpretable"``).
 
         Returns
         -------
@@ -633,7 +804,7 @@ class JITEncoderSelector:
         # instantiate a fresh copy per Optuna trial.
         _tab_spec: Optional[TabularEncoderSpec] = None
         if need_tabular and TABULAR_REGISTRY:
-            _tab_spec = TABULAR_REGISTRY[0]   # highest capacity (GRN)
+            _tab_spec = self._resolve_tabular_spec(preferred_tabular)
             logger.info(
                 "JITEncoderSelector: tabular encoder type = %s "
                 "(capacity=%d, trainable per-trial)",
@@ -665,6 +836,8 @@ class JITEncoderSelector:
         # ── Build candidate lists per modality ────────────────────────
         vision_candidates = VISION_REGISTRY if need_image else []
         text_candidates = TEXT_REGISTRY if need_text else []
+        vision_candidates = self._prioritize_encoder_specs(vision_candidates, preferred_image)
+        text_candidates = self._prioritize_encoder_specs(text_candidates, preferred_text)
 
         # ── Exhaustive search over Cartesian product ──────────────────
         # Registry lists are pre-sorted descending by capacity, so the

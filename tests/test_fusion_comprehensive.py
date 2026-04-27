@@ -280,6 +280,14 @@ class TestUncertaintyFusion:
         fusion = UncertaintyFusion([768, 2048], latent_dim=256)
         assert fusion.get_output_dim() == 256
 
+    def test_attention_summary_contains_uncertainty_importance(self, embeddings_double):
+        """Uncertainty fusion exposes per-modality uncertainty importance."""
+        fusion = UncertaintyFusion([768, 2048], latent_dim=512)
+        _ = fusion.forward(embeddings_double)
+        summary = fusion.get_attention_summary()
+        importance = summary.get("uncertainty_importance", {})
+        assert set(importance.keys()) == {"modality_0", "modality_1"}
+
 
 # ===========================================================================
 # TEST: UncertaintyGraphFusion
@@ -313,6 +321,28 @@ class TestUncertaintyGraphFusion:
         """get_output_dim() returns latent_dim"""
         fusion = UncertaintyGraphFusion([768, 2048], latent_dim=256, heads=4)
         assert fusion.get_output_dim() == 256
+
+    def test_branch_weight_configuration(self, embeddings_double):
+        """Configured branch weights are preserved and exposed."""
+        fusion = UncertaintyGraphFusion(
+            [768, 2048],
+            latent_dim=512,
+            heads=4,
+            graph_weight=0.8,
+            uncertainty_weight=0.2,
+        )
+        _ = fusion.forward(embeddings_double)
+        weights = fusion.get_branch_weights()
+        assert weights["graph"] == pytest.approx(0.8)
+        assert weights["uncertainty"] == pytest.approx(0.2)
+
+    def test_attention_summary_includes_branch_weights(self, embeddings_double):
+        """Combined fusion attention summary includes branch mixture metadata."""
+        fusion = UncertaintyGraphFusion([768, 2048], latent_dim=512, heads=4)
+        _ = fusion.forward(embeddings_double)
+        summary = fusion.get_attention_summary()
+        assert "branch_weights" in summary
+        assert set(summary["branch_weights"].keys()) == {"graph", "uncertainty"}
 
 
 # ===========================================================================
@@ -405,23 +435,23 @@ class TestFusionStrategySelection:
         strategy = select_fusion_strategy(schema)
         assert strategy == "concat"
 
-    def test_two_modalities_image_text_to_attention(self):
-        """Image + Text → attention"""
+    def test_two_modalities_image_text_to_structural_semantic(self):
+        """Image + Text → structural_semantic (ICML 2025 [1] upgrade)"""
         schema = {"global_modalities": ["image", "text"]}
+        strategy = select_fusion_strategy(schema)
+        assert strategy == "structural_semantic"
+
+    def test_two_modalities_tabular_text_to_attention(self):
+        """Tabular + Text → attention (corrected from graph; attention is superior for text+tabular)."""
+        schema = {"global_modalities": ["tabular", "text"]}
         strategy = select_fusion_strategy(schema)
         assert strategy == "attention"
 
-    def test_two_modalities_tabular_text_to_graph(self):
-        """Tabular + Text → graph"""
-        schema = {"global_modalities": ["tabular", "text"]}
-        strategy = select_fusion_strategy(schema)
-        assert strategy == "graph"
-
-    def test_three_modalities_to_uncertainty_graph(self):
-        """Three+ modalities → uncertainty_graph"""
+    def test_three_modalities_to_complementarity(self):
+        """Three+ modalities → complementarity (CrossFuse ECCV 2024 [4] upgrade)"""
         schema = {"global_modalities": ["text", "image", "tabular"]}
         strategy = select_fusion_strategy(schema)
-        assert strategy == "uncertainty_graph"
+        assert strategy == "complementarity"
 
     def test_empty_schema_defaults(self):
         """Empty/missing modalities → concat"""

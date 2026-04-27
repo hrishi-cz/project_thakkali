@@ -8,6 +8,22 @@ from unittest.mock import Mock, patch, MagicMock
 from pipeline.monitoring import MonitoringEngine
 
 
+@pytest.fixture
+def temp_dirs():
+    """Create temporary registry and reports directories."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry_dir = Path(tmpdir) / "registry"
+        reports_dir = Path(tmpdir) / "reports"
+        registry_dir.mkdir()
+        reports_dir.mkdir()
+
+        yield {
+            "registry": str(registry_dir),
+            "reports": str(reports_dir),
+            "temp": tmpdir,
+        }
+
+
 class TestMonitoringEngine:
     """Test suite for MonitoringEngine class."""
 

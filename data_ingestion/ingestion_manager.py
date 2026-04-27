@@ -89,10 +89,17 @@ class DataIngestionManager:
 
         Non-URL strings (local paths) are returned as-is after stripping.
         """
-        source = source.strip()
+        source = source.strip().strip("\"'")  # remove surrounding quotes users may copy-paste
         if not source.startswith(("http://", "https://")):
-            # Local path — normalise slashes but keep case (Windows paths)
-            return source.replace("\\", "/").rstrip("/")
+            # Local path — normalise slashes but keep case (Windows paths).
+            # Handle double-paste: Windows "Copy as path" produces `"C:\path"`;
+            # if pasted twice the result is `C:\path" "C:\path` after outer strip.
+            # Detect by looking for `" "` or repeated-path patterns and take the first segment.
+            _norm = source.replace("\\", "/").rstrip("/")
+            if '" ' in _norm or "' " in _norm:
+                # Take only the first path segment (before the first space-quote boundary)
+                _norm = _norm.split('"')[0].split("'")[0].rstrip()
+            return _norm
         parsed = urlparse(source)
         host = parsed.hostname or ""
         host = host.lower().removeprefix("www.")
@@ -305,6 +312,106 @@ class DataIngestionManager:
     # Remote URL downloader (aiohttp – truly async)
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _hf_token() -> str:
+        """Return HuggingFace API token from env, or empty string."""
+        return os.getenv("HF_TOKEN", "") or os.getenv("HUGGINGFACE_HUB_TOKEN", "")
+
+    @staticmethod
+    def _resolve_huggingface_url(url: str) -> str:
+        """Convert a HuggingFace dataset page URL to a direct parquet/data file URL.
+
+        Resolution strategy (in order):
+          1. HF datasets-server parquet API  (works for most public datasets)
+          2. HF Hub repo files API           (fallback for datasets not indexed by datasets-server)
+
+        For gated datasets that require terms acceptance, raises ValueError with
+        actionable instructions.
+        """
+        import urllib.request as _req
+        import urllib.error as _uerr
+        import json as _json
+        from urllib.parse import urlparse as _up
+
+        parsed = _up(url)
+        if "huggingface.co" not in (parsed.hostname or ""):
+            return url
+        parts = [p for p in parsed.path.split("/") if p]
+        if not (len(parts) >= 3 and parts[0] == "datasets"):
+            return url
+
+        owner, name = parts[1], parts[2]
+        token = os.getenv("HF_TOKEN", "") or os.getenv("HUGGINGFACE_HUB_TOKEN", "")
+
+        def _authed_request(api_url: str) -> "_req.Request":
+            r = _req.Request(api_url)
+            if token:
+                r.add_header("Authorization", f"Bearer {token}")
+            return r
+
+        # ── Strategy 1: datasets-server parquet index ──────────────────────
+        try:
+            api = f"https://datasets-server.huggingface.co/parquet?dataset={owner}/{name}"
+            with _req.urlopen(_authed_request(api), timeout=15) as r:
+                data = _json.loads(r.read())
+            parquet_files = data.get("parquet_files", [])
+            for split_pref in ("train", "validation", "test"):
+                for f in parquet_files:
+                    if f.get("split") == split_pref:
+                        direct = f.get("url", "")
+                        if direct:
+                            logger.info("HF datasets-server resolved: %s -> %s", url, direct)
+                            return direct
+            if parquet_files:
+                return parquet_files[0].get("url", url)
+        except _uerr.HTTPError as exc:
+            if exc.code == 401:
+                raise ValueError(
+                    f"'{owner}/{name}' requires authentication AND accepted dataset terms. "
+                    "1) Set HF_TOKEN in .env  2) Visit https://huggingface.co/datasets/"
+                    f"{owner}/{name} and click 'Access repository' to accept the terms, "
+                    "then restart the API."
+                ) from exc
+            # 404 = dataset not indexed by datasets-server; try Hub files API next
+            logger.debug("datasets-server 404 for %s/%s, trying Hub files API", owner, name)
+        except Exception as exc:
+            logger.debug("datasets-server failed for %s/%s: %s", owner, name, exc)
+
+        # ── Strategy 2: HF Hub repo files API (finds raw data files) ──────
+        try:
+            api2 = f"https://huggingface.co/api/datasets/{owner}/{name}"
+            with _req.urlopen(_authed_request(api2), timeout=15) as r:
+                meta = _json.loads(r.read())
+            # Prefer parquet siblings, then csv, then jsonl
+            siblings = meta.get("siblings", [])
+            for ext in (".parquet", ".csv", ".jsonl", ".json"):
+                for s in siblings:
+                    rfilename = s.get("rfilename", "")
+                    if rfilename.endswith(ext) and "train" in rfilename.lower():
+                        direct = f"https://huggingface.co/datasets/{owner}/{name}/resolve/main/{rfilename}"
+                        logger.info("HF Hub files API resolved: %s -> %s", url, direct)
+                        return direct
+                # Second pass: any file of that ext
+                for s in siblings:
+                    rfilename = s.get("rfilename", "")
+                    if rfilename.endswith(ext):
+                        direct = f"https://huggingface.co/datasets/{owner}/{name}/resolve/main/{rfilename}"
+                        logger.info("HF Hub files API resolved (non-train): %s -> %s", url, direct)
+                        return direct
+        except _uerr.HTTPError as exc:
+            if exc.code == 401:
+                raise ValueError(
+                    f"'{owner}/{name}' requires authentication AND accepted dataset terms. "
+                    "1) Set HF_TOKEN in .env  2) Visit https://huggingface.co/datasets/"
+                    f"{owner}/{name} and click 'Access repository' to accept the terms, "
+                    "then restart the API."
+                ) from exc
+            logger.warning("HF Hub API failed for %s/%s: %s", owner, name, exc)
+        except Exception as exc:
+            logger.warning("HF Hub API failed for %s/%s: %s", owner, name, exc)
+
+        return url
+
     async def _ingest_remote_url(self, url: str, cache_path: Path) -> Path:
         """
         Download a remote URL with aiohttp.
@@ -315,6 +422,10 @@ class DataIngestionManager:
                 "Mendeley datasets must be downloaded manually. "
                 "Use the local-file upload option instead."
             )
+
+        # Resolve HuggingFace dataset page URLs to direct parquet file URLs
+        if "huggingface.co/datasets/" in url and not url.endswith((".parquet", ".csv", ".json", ".jsonl")):
+            url = self._resolve_huggingface_url(url)
 
         parsed = urlparse(url)
         filename = os.path.basename(parsed.path) or "data.csv"
@@ -327,10 +438,21 @@ class DataIngestionManager:
         # total=7200 (2 h) accommodates 50 GB+ downloads on slower links;
         # sock_read=300 still aborts genuinely stalled connections quickly.
         timeout = aiohttp.ClientTimeout(total=7200, sock_read=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        _hf_token = self._hf_token()
+        _headers = {"Authorization": f"Bearer {_hf_token}"} if _hf_token and "huggingface.co" in url else {}
+        async with aiohttp.ClientSession(timeout=timeout, headers=_headers) as session:
             async with session.get(url) as response:
                 if response.status == 404:
                     raise FileNotFoundError(f"HTTP 404 Not Found: {url}")
+                if response.status == 401:
+                    _ds_hint = ""
+                    if "huggingface.co" in url:
+                        _ds_hint = (
+                            " This dataset is private or gated. Options: "
+                            "(1) Visit the dataset page on huggingface.co and click 'Access repository' to accept terms, "
+                            "(2) Use a local fixture file instead (e.g. data/fixtures/mmimdb_smoke.csv for MMIMDB)."
+                        )
+                    raise ValueError(f"HTTP 401 Unauthorized.{_ds_hint}")
                 if response.status != 200:
                     raise ConnectionError(
                         f"HTTP {response.status} while downloading {url}"
@@ -411,22 +533,34 @@ class DataIngestionManager:
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
+                # Binary mode so we can split on \r (tqdm carriage-return progress)
+                text=False,
                 env=env,
             )
-            
+
             error_output = ""
-            for line in iter(proc.stdout.readline, ''):
-                error_output += line
-                if "%|" in line and progress_callback is not None:
-                    try:
-                        chunk = line.split("%")[0]
-                        pct_str = chunk.split()[-1].strip()
-                        pct = int(pct_str)
-                        if pct > 0:
-                            progress_callback(5 + int(pct * 0.8), f"Downloading {dataset_id}... {pct}%")
-                    except Exception:
-                        pass
+            _buf = b""
+            for raw_chunk in iter(lambda: proc.stdout.read(512), b""):
+                _buf += raw_chunk
+                # Split on both \r and \n — tqdm uses \r to overwrite lines
+                parts = _buf.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
+                _buf = parts[-1]  # incomplete last chunk — keep for next iteration
+                for raw_line in parts[:-1]:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    error_output += line + "\n"
+                    if "%" in line and progress_callback is not None:
+                        try:
+                            # tqdm line: "  23%|██       | 450M/1.87G [01:45<...]"
+                            pct_str = line.strip().split("%")[0].split()[-1].strip()
+                            pct = int(float(pct_str))
+                            if 0 < pct <= 100:
+                                progress_callback(pct, f"Downloading {dataset_id}... {pct}%")
+                        except Exception:
+                            pass
+
+            # Flush remaining buffer
+            if _buf:
+                error_output += _buf.decode("utf-8", errors="replace")
 
             proc.stdout.close()
             returncode = proc.wait(timeout=1800)
@@ -489,6 +623,20 @@ class DataIngestionManager:
         if not src.exists():
             raise FileNotFoundError(f"Local file not found: {path}")
         cache_path.mkdir(parents=True, exist_ok=True)
+
+        # Zip archives: extract contents directly into the cache directory
+        # so load_cached can discover csv/parquet/images inside.
+        if src.suffix.lower() == ".zip":
+            with zipfile.ZipFile(src, "r") as zref:
+                # ZipSlip protection
+                for member in zref.namelist():
+                    member_path = (cache_path / member).resolve()
+                    if not str(member_path).startswith(str(cache_path.resolve())):
+                        raise ValueError(f"ZipSlip detected: '{member}' escapes target directory")
+                zref.extractall(cache_path)
+            logger.info("Local zip extracted %s -> %s", src, cache_path)
+            return cache_path
+
         dest = cache_path / src.name
         shutil.copy2(src, dest)
         logger.info("Local file copied %s -> %s", src, dest)

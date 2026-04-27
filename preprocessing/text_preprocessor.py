@@ -32,6 +32,9 @@ class TextPreprocessor:
 
     def __init__(self) -> None:
         self._tokenizer: Optional[Any] = None  # lazy-loaded on first call
+        self._pretrained_model: str = str(self._PRETRAINED)
+        self.max_length: int = int(self._MAX_LENGTH)
+        self.pooling: str = "cls"
 
     # ------------------------------------------------------------------
     # Lazy tokeniser property
@@ -43,11 +46,11 @@ class TextPreprocessor:
         if self._tokenizer is None:
             try:
                 from transformers import AutoTokenizer
-                self._tokenizer = AutoTokenizer.from_pretrained(self._PRETRAINED)
-                logger.info("TextPreprocessor: loaded tokeniser '%s'", self._PRETRAINED)
+                self._tokenizer = AutoTokenizer.from_pretrained(self._pretrained_model)
+                logger.info("TextPreprocessor: loaded tokeniser '%s'", self._pretrained_model)
             except Exception as exc:
                 raise RuntimeError(
-                    f"TextPreprocessor: could not load '{self._PRETRAINED}'. "
+                    f"TextPreprocessor: could not load '{self._pretrained_model}'. "
                     "Install transformers: pip install transformers"
                 ) from exc
         return self._tokenizer
@@ -69,7 +72,7 @@ class TextPreprocessor:
         The ``.squeeze(0)`` call converts the tokeniser's ``[1, 128]``
         output to ``[128]`` so DataLoader can stack a batch to ``[B, 128]``.
         """
-        # Sanitize NaN/None inputs — tokenizing "nan"/"None" as words produces
+        # Sanitize NaN/None inputs  --  tokenizing "nan"/"None" as words produces
         # misleading embeddings.  Replace with empty string instead.
         if text is None:
             text = ""
@@ -80,7 +83,7 @@ class TextPreprocessor:
 
         encoding = self.tokenizer(
             text,
-            max_length=self._MAX_LENGTH,
+            max_length=self.max_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
@@ -98,12 +101,74 @@ class TextPreprocessor:
     # Config helper (used by /preprocess API endpoint)
     # ------------------------------------------------------------------
 
+    def configure(self, plan: Optional[Dict[str, Any]]) -> None:
+        """Apply optional runtime overrides from the preprocessing planner (G16 enhanced)."""
+        if not isinstance(plan, dict):
+            return
+
+        tokenizer = plan.get("tokenizer")
+        if isinstance(tokenizer, str):
+            model_name = tokenizer.strip()
+            if model_name and model_name != self._pretrained_model:
+                self._pretrained_model = model_name
+                self._tokenizer = None
+
+        max_length = plan.get("max_length")
+        if max_length is not None:
+            try:
+                self.max_length = max(8, int(max_length))
+            except Exception:
+                pass
+
+        pooling = str(plan.get("pooling", self.pooling)).strip().lower()
+        if pooling in {"cls", "mean", "max", "none"}:
+            self.pooling = pooling
+
+        # G16: context-aware adaptation from feature_intelligence signals
+        sig = plan.get("feature_intelligence") or {}
+        text_sig = sig.get("text") or {}
+        avg_tokens = text_sig.get("avg_tokens_per_sample")
+        if avg_tokens and avg_tokens > 0:
+            self.max_length = max(16, min(512, int(avg_tokens * 1.3)))
+
+        linguistic_complexity = text_sig.get("linguistic_complexity", 0.0)
+        if linguistic_complexity > 0.7 and not tokenizer:
+            # Switch to multilingual model for complex / multilingual text
+            self._pretrained_model = "bert-base-multilingual-cased"
+            self._tokenizer = None
+            logger.info("TextPreprocessor: switching to bert-base-multilingual-cased (linguistic_complexity=%.3f)", linguistic_complexity)
+
+        text_task_type = plan.get("text_task_type") or text_sig.get("text_task_type")
+        if text_task_type == "ner_sequence":
+            self.pooling = "none"
+            self._task_type = "ner"
+            logger.info("TextPreprocessor: NER task  --  pooling=none")
+        elif text_task_type == "seq2seq":
+            self._task_type = "seq2seq"
+        else:
+            self._task_type = "classification"
+
+        # long_doc_indicator: documents with avg >200 tokens need max-length
+        # capped at 512 (BERT limit) and mean pooling (not CLS) so the full
+        # document contributes to the representation rather than just the
+        # first 512 tokens.
+        long_doc = bool(text_sig.get("long_doc_indicator", False))
+        if long_doc:
+            self.max_length = 512  # saturate at BERT maximum
+            if self.pooling not in ("none",):  # don't override NER token-level
+                self.pooling = "mean"           # mean over all non-pad tokens
+            logger.info(
+                "TextPreprocessor: long_doc_indicator=True  --  "
+                "max_length=512, pooling=mean for full-document coverage"
+            )
+
     def get_default_config(self) -> Dict[str, Any]:
         return {
-            "model": self._PRETRAINED,
-            "max_length": self._MAX_LENGTH,
+            "model": self._pretrained_model,
+            "max_length": self.max_length,
+            "pooling": self.pooling,
             "padding": "max_length",
             "truncation": True,
             "output_keys": ["input_ids", "attention_mask"],
-            "output_shape": f"[{self._MAX_LENGTH}] per key",
+            "output_shape": f"[{self.max_length}] per key",
         }

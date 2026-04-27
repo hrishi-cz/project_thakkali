@@ -12,7 +12,21 @@ import json
 from typing import Any, Dict, Optional
 from datetime import datetime
 
+from config.paths import MODEL_REGISTRY_DIR, REPORTS_DIR
+
 logger = logging.getLogger(__name__)
+
+# Expose these symbols at module scope for test patching and optional runtime
+# integrations. They are not strict hard dependencies for core monitoring.
+try:
+    from research.paper_service import PaperService  # type: ignore
+except Exception:
+    PaperService = None  # type: ignore
+
+try:
+    from research.experiment_collector import ExperimentCollector  # type: ignore
+except Exception:
+    ExperimentCollector = None  # type: ignore
 
 
 class MonitoringEngine:
@@ -31,7 +45,11 @@ class MonitoringEngine:
         # Returns: {"alerts": [...], "report_generated": True, "report_path": "..."}
     """
 
-    def __init__(self, registry_dir: str = "models", reports_dir: str = "reports"):
+    def __init__(
+        self,
+        registry_dir: str = str(MODEL_REGISTRY_DIR),
+        reports_dir: str = str(REPORTS_DIR),
+    ):
         """
         Parameters
         ----------
@@ -45,9 +63,16 @@ class MonitoringEngine:
         os.makedirs(self.reports_dir, exist_ok=True)
 
         # Alert thresholds
-        self.accuracy_threshold = 0.60
-        self.ece_threshold = 0.15
-        self.f1_threshold = 0.40
+        self.alert_thresholds = {
+            "accuracy_min": 0.60,
+            "ece_max": 0.15,
+            "f1_min": 0.40,
+        }
+
+        # Backward-compatible scalar aliases.
+        self.accuracy_threshold = self.alert_thresholds["accuracy_min"]
+        self.ece_threshold = self.alert_thresholds["ece_max"]
+        self.f1_threshold = self.alert_thresholds["f1_min"]
 
     def evaluate_and_report(
         self,
@@ -73,18 +98,22 @@ class MonitoringEngine:
         """
         alerts = []
 
+        accuracy_threshold = float(self.alert_thresholds.get("accuracy_min", self.accuracy_threshold))
+        ece_threshold = float(self.alert_thresholds.get("ece_max", self.ece_threshold))
+        f1_threshold = float(self.alert_thresholds.get("f1_min", self.f1_threshold))
+
         # -----  Alert Checks  -----
         accuracy = metrics.get("accuracy")
-        if accuracy is not None and accuracy < self.accuracy_threshold:
-            alerts.append(f"⚠️  Low accuracy: {accuracy:.3f} < {self.accuracy_threshold}")
+        if accuracy is not None and accuracy < accuracy_threshold:
+            alerts.append(f"ALERT: Low accuracy: {accuracy:.3f} < {accuracy_threshold}")
 
         ece = metrics.get("ece")
-        if ece is not None and ece > self.ece_threshold:
-            alerts.append(f"⚠️  Poor calibration (ECE): {ece:.3f} > {self.ece_threshold}")
+        if ece is not None and ece > ece_threshold:
+            alerts.append(f"ALERT: Poor calibration (ECE): {ece:.3f} > {ece_threshold}")
 
         f1 = metrics.get("f1")
-        if f1 is not None and f1 < self.f1_threshold:
-            alerts.append(f"⚠️  Low F1 score: {f1:.3f} < {self.f1_threshold}")
+        if f1 is not None and f1 < f1_threshold:
+            alerts.append(f"ALERT: Low F1 score: {f1:.3f} < {f1_threshold}")
 
         # -----  Trigger Report if Alerts -----
         report_path = None
@@ -92,6 +121,8 @@ class MonitoringEngine:
             report_path = self._generate_report(model_id, metrics, alerts)
 
         return {
+            "model_id": model_id,
+            "timestamp": datetime.now().isoformat(),
             "alerts": alerts,
             "report_generated": bool(report_path),
             "report_path": report_path,
@@ -128,25 +159,26 @@ class MonitoringEngine:
 
         # Try to include full paper if possible
         try:
-            from research.paper_service import PaperService
-            
-            logger.info("  Generating full research paper...")
-            service = PaperService(registry_dir=self.registry_dir)
-            paper_text, plot_path = service.generate()
-            
-            report_lines.append(f"\n## Full Research Paper\n")
-            report_lines.append(paper_text)
-            
-            if plot_path:
-                report_lines.append(f"\n**Plot saved**: {plot_path}\n")
-                
+            if PaperService is not None:
+                logger.info("  Generating full research paper...")
+                service = PaperService(registry_dir=self.registry_dir)
+                paper_text, plot_path = service.generate()
+
+                report_lines.append(f"\n## Full Research Paper\n")
+                report_lines.append(paper_text)
+
+                if plot_path:
+                    report_lines.append(f"\n**Plot saved**: {plot_path}\n")
+            else:
+                report_lines.append("\n*(Full paper generation unavailable in current environment.)*\n")
+
         except Exception as e:
             logger.warning(f"  Could not generate full paper: {e}")
             report_lines.append(f"\n*(Full paper generation failed: {e})*\n")
 
         # Save report
         report_content = "".join(report_lines)
-        with open(report_path, "w") as f:
+        with open(report_path, "w", encoding="utf-8") as f:
             f.write(report_content)
 
         logger.info(f"✓ Monitoring report saved: {report_path}")
@@ -163,5 +195,5 @@ class MonitoringEngine:
         report_path = os.path.join(self.reports_dir, report_name)
         if not os.path.exists(report_path):
             return None
-        with open(report_path, "r") as f:
+        with open(report_path, "r", encoding="utf-8") as f:
             return f.read()

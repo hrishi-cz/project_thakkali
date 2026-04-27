@@ -27,6 +27,7 @@ EXPECTED FLOW:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -159,7 +160,23 @@ class Integrator:
         custom_encoders : Optional[Dict[str, Any]]
             Custom encoder overrides (modality → encoder object).
         """
-        self.encoder = ModalityEncoder(custom_encoders=custom_encoders)
+        try:
+            self.encoder = ModalityEncoder(custom_encoders=custom_encoders)
+        except TypeError:
+            # Backward-compat fallback for ModalityEncoder variants that do
+            # not expose the custom_encoders keyword.
+            text_encoder = None
+            image_encoder = None
+            if isinstance(custom_encoders, dict):
+                text_encoder = custom_encoders.get("text")
+                image_encoder = custom_encoders.get("image")
+            self.encoder = ModalityEncoder(
+                text_encoder=text_encoder,
+                image_encoder=image_encoder,
+            )
+            logger.debug(
+                "Integrator: ModalityEncoder initialized via legacy signature fallback"
+            )
         self.validator = UniversalTargetValidator()
         self.min_predictability = min_predictability
         logger.info(
@@ -197,6 +214,7 @@ class Integrator:
         modality: Optional[str] = None,
         y: Optional[np.ndarray] = None,
         task_type: str = "regression",
+        field_name: str = "unknown_field",
     ) -> ModalityMetadata:
         """
         End-to-end: detect + encode + validate a single modality.
@@ -223,8 +241,9 @@ class Integrator:
             If modality detection/encoding fails.
         """
         # 1. Detect modality
+        forced_modality = modality
         if modality is None:
-            modality = self.detect_modality(raw_data)
+            modality = self.detect_modality(raw_data, field_name=field_name)
             if modality is None:
                 raise ValueError(
                     "process_single_modality: could not auto-detect modality"
@@ -233,9 +252,23 @@ class Integrator:
         
         # 2. Encode to embeddings
         try:
-            embeddings, encoder_name, raw_shape = self.encoder.encode(
-                raw_data, modality=modality
-            )
+            try:
+                encode_result = self.encoder.encode(
+                    raw_data,
+                    modality=modality,
+                    return_metadata=True,
+                    field_name=field_name,
+                )
+            except TypeError:
+                # Backward-compat for older ModalityEncoder variants.
+                encode_result = self.encoder.encode(modality, raw_data)
+
+            if isinstance(encode_result, tuple) and len(encode_result) == 3:
+                embeddings, encoder_name, raw_shape = encode_result
+            else:
+                embeddings = np.asarray(encode_result)
+                encoder_name = str(modality)
+                raw_shape = tuple(getattr(np.asarray(raw_data), "shape", tuple()))
         except Exception as e:
             logger.error("process_single_modality: encoding failed: %s", e)
             raise ValueError(f"Encoding failed for {modality}: {e}")
@@ -290,6 +323,12 @@ class Integrator:
                 is_valid = False
         
         # 4. Build metadata
+        detection_method = (
+            "forced"
+            if forced_modality is not None
+            else self._resolve_detection_method(raw_data, field_name=field_name)
+        )
+
         metadata = ModalityMetadata(
             modality_name=modality,
             embeddings=embeddings,
@@ -301,10 +340,58 @@ class Integrator:
             encoder_name=encoder_name,
             raw_shape=raw_shape or tuple(),
             is_valid=is_valid,
-            detection_method="auto" if modality is None else "forced",
+            detection_method=detection_method,
+            metadata={
+                "field_name": field_name,
+                "forced_modality": forced_modality,
+                "resolved_modality": modality,
+            },
         )
         
         return metadata
+
+    @staticmethod
+    def _resolve_detection_method(raw_data: Any, field_name: str) -> str:
+        """Best-effort tag describing how modality auto-detection was inferred."""
+        lowered_field = str(field_name or "").lower()
+        if any(
+            tok in lowered_field
+            for tok in (
+                "image",
+                "img",
+                "photo",
+                "picture",
+                "pixel",
+                "text",
+                "report",
+                "note",
+                "description",
+                "content",
+                "caption",
+                "table",
+                "tabular",
+                "feature",
+            )
+        ):
+            return "field_hint"
+
+        if isinstance(raw_data, np.ndarray):
+            return "shape"
+
+        if isinstance(raw_data, (list, tuple)):
+            sample = next((item for item in raw_data if item is not None), None)
+            if isinstance(sample, str):
+                suffix = Path(sample).suffix.lower()
+                if suffix in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}:
+                    return "filetype"
+                return "dtype"
+            if sample is not None:
+                return "dtype"
+
+        if hasattr(raw_data, "dtypes"):
+            return "dtype"
+
+        return "auto"
     
     def process_multimodal(
         self,
@@ -344,6 +431,7 @@ class Integrator:
                     modality=modality,
                     y=y,
                     task_type=task_type,
+                    field_name=field_name,
                 )
                 results[field_name] = meta
                 logger.info(

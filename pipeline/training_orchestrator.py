@@ -1,6 +1,10 @@
 """
 Comprehensive Training Orchestrator - Coordinates all 7 phases of ML pipeline.
 
+This module is the execution-phase orchestrator (preprocessing, selection,
+training, drift, registry). Metadata-centric context orchestration is handled
+by `core/orchestrator.py`.
+
 Workflow:
 Phase 1: Data Ingestion - Load, validate, and cache datasets from multiple sources
 Phase 2: Schema Detection - Detect columns, infer problem type, identify modalities
@@ -13,6 +17,7 @@ Phase 7: Model Registry - Store models, versioning, and deployment tracking
 
 import asyncio
 import logging
+import os
 import time
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
@@ -32,12 +37,42 @@ from data_ingestion.schema_detector import MultiDatasetSchemaDetector
 from pipeline.dataset_manager import DatasetManager
 from preprocessing.image_preprocessor import ImagePreprocessor
 from preprocessing.text_preprocessor import TextPreprocessor
+from preprocessing.adaptive_engine import AdaptivePreprocessingEngine
 from preprocessing.tabular_preprocessor import TabularPreprocessor
+from preprocessing.preprocessing_planner import PreprocessingPlanner
+from preprocessing.validator import (
+    PreprocessingValidationError,
+    PreprocessingValidator,
+    validate_preprocessor_consistency,
+)
+from automl.optuna_adaptive import AdaptiveOptunaController
+from pipeline.embedding_cache import EmbeddingCache
+from pipeline.representation_layer import RepresentationLayer
+from pipeline.evaluation import EvaluationAdapter
+from pipeline.drift_adapter import DriftAdapter
+from pipeline.research_metrics import ResearchMetrics
+from pipeline.state import PipelineState
+from pipeline.xai_engine import generate_xai_artifacts
+from pipeline.calibration import ProbabilityCalibrator
+from config.paths import MODEL_REGISTRY_DIR
+from core.execution_context import DatasetProfile
+from core.context_enforcer import (
+    ContextValidationError,
+    ContextValidator,
+    ensure_session_context,
+)
 from core.types import Phase, TrainingConfig, ModelSelectionResult, TrainingMetrics
 
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Reproducibility — seed all RNGs at import time (overridable via APEX_SEED)
+# ---------------------------------------------------------------------------
+import pytorch_lightning as _pl
+_APEX_SEED = int(os.getenv("APEX_SEED", "42"))
+_pl.seed_everything(_APEX_SEED, workers=True)
 
 
 # ---------------------------------------------------------------------------
@@ -96,9 +131,17 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
 
         # Pre-compute column groupings from schema
         per_ds = schema_info.get("per_dataset", [{}])
-        detected = per_ds[0].get("detected_columns", {}) if per_ds else {}
-        self._text_cols = [c for c in detected.get("text", []) if c in df.columns]
-        self._image_cols = [c for c in detected.get("image", []) if c in df.columns]
+        all_text_cols: set = set()
+        all_image_cols: set = set()
+        for ds_entry in per_ds:
+            detected = ds_entry.get("detected_columns", {}) if isinstance(ds_entry, dict) else {}
+            all_text_cols.update(detected.get("text", []))
+            all_image_cols.update(detected.get("image", []))
+        self._text_cols = [c for c in all_text_cols if c in df.columns]
+        self._image_cols = [c for c in all_image_cols if c in df.columns]
+        # Track image load failures for aggregate reporting
+        self._image_load_attempts: int = 0
+        self._image_load_failures: int = 0
         self._tabular_cols = [
             c for c in df.columns
             if c not in self._text_cols and c not in self._image_cols
@@ -112,6 +155,45 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
             )
         else:
             self._tabular_array = None
+
+    @staticmethod
+    def _clean_text_value(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text.lower() in {"", "nan", "none", "null", "<na>"} else text
+
+    def _compose_text(self, row: pd.Series, columns: List[str]) -> str:
+        parts = [self._clean_text_value(row[col]) for col in columns if col in row.index]
+        parts = [p for p in parts if p]
+        return " ".join(parts)
+
+    @staticmethod
+    def _resolve_image_path(row: pd.Series, columns: List[str], base_dir: Optional[str] = None) -> Optional[str]:
+        for col in columns:
+            if col not in row.index:
+                continue
+            raw = row[col]
+            if pd.isna(raw):
+                continue
+            path_val = str(raw).strip()
+            if path_val.lower() in {"", "nan", "none", "null", "<na>"}:
+                continue
+            # Fast path: absolute + exists
+            p = Path(path_val)
+            if p.is_absolute() and p.is_file():
+                return path_val
+            # Relative path: resolve against base_dir then CWD
+            if base_dir:
+                resolved = Path(base_dir) / path_val
+                if resolved.is_file():
+                    return str(resolved)
+            cwd_resolved = Path.cwd() / path_val
+            if cwd_resolved.is_file():
+                return str(cwd_resolved)
+            # Fall back: return raw and let the caller handle FileNotFoundError
+            return path_val
+        return None
 
     def __len__(self) -> int:
         return len(self.df)
@@ -128,7 +210,7 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
         if self._precomputed_text is not None and self._text_cols:
             sample["text_pooled"] = self._precomputed_text[idx]
         elif self.text_preprocessor is not None and self._text_cols:
-            text_val = str(row[self._text_cols[0]])
+            text_val = self._compose_text(row, self._text_cols)
             enc = self.text_preprocessor(text_val)
             sample["input_ids"] = enc["input_ids"]
             sample["attention_mask"] = enc["attention_mask"]
@@ -140,15 +222,28 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
         if self._precomputed_image is not None and self._image_cols:
             sample["image_pooled"] = self._precomputed_image[idx]
         elif self.image_preprocessor is not None and self._image_cols:
+            img_path = self._resolve_image_path(row, self._image_cols)
+            self._image_load_attempts += 1
             try:
                 from PIL import Image as PILImage
-                img_path = str(row[self._image_cols[0]])
+                if not img_path:
+                    raise ValueError("no image path found in row")
                 pil_img = PILImage.open(img_path).convert("RGB")
                 if self.apply_augmentation and hasattr(self.image_preprocessor, "augment"):
                     pil_img = self.image_preprocessor.augment(pil_img)
                 sample["image"] = self.image_preprocessor(pil_img)
             except Exception as exc:
-                logger.warning("Image load failed for idx=%d path=%s: %s", idx, img_path, exc)
+                self._image_load_failures += 1
+                # Warn only at first failure and then every 50th to avoid log spam
+                if self._image_load_failures == 1 or self._image_load_failures % 50 == 0:
+                    _rate = self._image_load_failures / max(1, self._image_load_attempts)
+                    logger.warning(
+                        "Image load failed (failure %d/%d attempts = %.0f%%): "
+                        "idx=%d path=%s err=%s. "
+                        "Check that image paths are accessible from the server.",
+                        self._image_load_failures, self._image_load_attempts,
+                        _rate * 100, idx, img_path, exc,
+                    )
                 h, w = self.image_preprocessor.target_size
                 sample["image"] = torch.zeros(3, h, w, dtype=torch.float32)
 
@@ -325,9 +420,50 @@ class AutoVisionIterableDataset(torch.utils.data.IterableDataset):
 
         # Pre-compute column groupings from schema (same logic as map-style)
         per_ds = schema_info.get("per_dataset", [{}])
-        detected = per_ds[0].get("detected_columns", {}) if per_ds else {}
-        self._text_cols: List[str] = detected.get("text", [])
-        self._image_cols: List[str] = detected.get("image", [])
+        all_text_cols: set = set()
+        all_image_cols: set = set()
+        for ds_entry in per_ds:
+            detected = ds_entry.get("detected_columns", {}) if isinstance(ds_entry, dict) else {}
+            all_text_cols.update(detected.get("text", []))
+            all_image_cols.update(detected.get("image", []))
+        self._text_cols = [str(c) for c in all_text_cols]
+        self._image_cols = [str(c) for c in all_image_cols]
+
+    @staticmethod
+    def _clean_text_value(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text.lower() in {"", "nan", "none", "null", "<na>"} else text
+
+    def _compose_text(self, row: pd.Series, columns: List[str]) -> str:
+        parts = [self._clean_text_value(row[col]) for col in columns if col in row.index]
+        parts = [p for p in parts if p]
+        return " ".join(parts)
+
+    @staticmethod
+    def _resolve_image_path(row: pd.Series, columns: List[str], base_dir: Optional[str] = None) -> Optional[str]:
+        for col in columns:
+            if col not in row.index:
+                continue
+            raw = row[col]
+            if pd.isna(raw):
+                continue
+            path_val = str(raw).strip()
+            if path_val.lower() in {"", "nan", "none", "null", "<na>"}:
+                continue
+            p = Path(path_val)
+            if p.is_absolute() and p.is_file():
+                return path_val
+            if base_dir:
+                resolved = Path(base_dir) / path_val
+                if resolved.is_file():
+                    return str(resolved)
+            cwd_resolved = Path.cwd() / path_val
+            if cwd_resolved.is_file():
+                return str(cwd_resolved)
+            return path_val
+        return None
 
     # ------------------------------------------------------------------ #
     #  Target encoding (mirrors Phase 3 logic)
@@ -500,7 +636,7 @@ class AutoVisionIterableDataset(torch.utils.data.IterableDataset):
 
                     # Text (first text column, lazy BERT tokenization)
                     if self._text_preprocessor is not None and text_cols:
-                        text_val = str(feature_chunk.iloc[i][text_cols[0]])
+                        text_val = self._compose_text(feature_chunk.iloc[i], text_cols)
                         enc = self._text_preprocessor(text_val)
                         sample["input_ids"] = enc["input_ids"]
                         sample["attention_mask"] = enc["attention_mask"]
@@ -509,7 +645,9 @@ class AutoVisionIterableDataset(torch.utils.data.IterableDataset):
                     if self._image_preprocessor is not None and image_cols:
                         try:
                             from PIL import Image as PILImage
-                            img_path = str(feature_chunk.iloc[i][image_cols[0]])
+                            img_path = self._resolve_image_path(feature_chunk.iloc[i], image_cols)
+                            if not img_path:
+                                raise ValueError("no image path found in row")
                             pil_img = PILImage.open(img_path).convert("RGB")
                             if (self._apply_augmentation
                                     and hasattr(self._image_preprocessor, "augment")):
@@ -540,11 +678,20 @@ class TrainingOrchestrator:
         result = asyncio.run(orchestrator.run_pipeline())
     """
 
-    def __init__(self, config: TrainingConfig):
+    def __init__(
+        self,
+        config: TrainingConfig,
+        execution_context: Optional[Any] = None,
+    ):
         """Initialize orchestrator."""
         self.config = config
+        self.execution_context = execution_context
+        # FIX-19: enforce context integrity only for session-backed runs.
+        # Standalone runs (execution_context=None at init) remain unaffected.
+        self._require_context: bool = execution_context is not None
         self.current_phase = Phase.DATA_INGESTION
         self.phase_results = {}
+        self.state = PipelineState()
         self.start_time = None
         self.metrics_history = []
         # Lazy dataset registry – populated by Phase 1
@@ -558,6 +705,16 @@ class TrainingOrchestrator:
         self.fitted_transformers = {}
         # Phase 5 output – best trained LightningModule captured by Optuna closure
         self.best_lightning_module: Optional[Any] = None
+        self.probability_calibrator: Optional[ProbabilityCalibrator] = None
+        self.preprocessing_planner = PreprocessingPlanner()
+        self.optuna_adaptive = AdaptiveOptunaController()
+        self.embedding_cache = EmbeddingCache()
+        self.representation_layer = RepresentationLayer()
+        self.evaluation_adapter = EvaluationAdapter()
+        self.drift_adapter = DriftAdapter()
+        self.research_metrics = ResearchMetrics()
+        self._phase6_reference_sample: Optional[Any] = None
+        self.state.set_slot("config", asdict(config))
 
         # Setup device
         self.device = torch.device(config.device)
@@ -565,6 +722,640 @@ class TrainingOrchestrator:
 
         if self.device.type == "cuda":
             logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+        if self.execution_context is not None:
+            logger.info(
+                "TrainingOrchestrator: ExecutionContext attached "
+                "(session=%s)",
+                getattr(self.execution_context, "session_id", "?"),
+            )
+
+    def _get_ctx(self) -> Any:
+        """
+        Return attached ExecutionContext.
+
+        Raises when context was expected (session-backed run) but has become
+        None, which indicates unexpected state mutation.
+        """
+        if self._require_context and self.execution_context is None:
+            raise RuntimeError(
+                "ExecutionContext was provided at construction time but is now None. "
+                "This indicates unexpected state mutation. "
+                "All session-backed phases require a valid ExecutionContext."
+            )
+        return self.execution_context
+
+    def _filter_modalities_by_drift(self) -> None:
+        """
+        Drop modalities whose drift-adjusted predictability has fallen below
+        the candidate-selector threshold (0.25).  Called before Phase 4 on
+        retrain runs so that a modality that has degraded to noise does not
+        drag down the multimodal model.
+        """
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        if not getattr(ctx, "drift_feedback_applied", False):
+            return
+        adjusted = dict(getattr(ctx, "drift_adjusted_predictability", {}) or {})
+        if not adjusted:
+            return
+        _THRESHOLD = 0.25
+        weak = [mod for mod, score in adjusted.items() if float(score or 0) < _THRESHOLD]
+        if weak and self.config.modalities:
+            before = list(self.config.modalities)
+            self.config.modalities = [m for m in before if m not in weak]
+            if not self.config.modalities:
+                self.config.modalities = before  # safety: never drop all modalities
+            else:
+                ctx.log_decision(
+                    "drift_modality_filter",
+                    f"Dropped low-predictability modalities after drift: {weak}",
+                    f"drift_adjusted_predictability={adjusted}",
+                )
+                logger.info(
+                    "Drift feedback: dropped modalities %s (predictability < %.2f)",
+                    weak, _THRESHOLD,
+                )
+
+    def _filter_to_primary_dataset(self) -> None:
+        """G14: restrict dataset_sources to primary_dataset_id when datasets are incompatible."""
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        if getattr(ctx, "datasets_compatible", True):
+            return
+        primary = getattr(ctx, "primary_dataset_id", None)
+        if not primary:
+            return
+        filtered = [
+            s for s in (self.config.dataset_sources or [])
+            if primary in s or str(s).endswith(primary)
+        ]
+        if filtered and len(filtered) < len(self.config.dataset_sources or []):
+            self.config.dataset_sources = filtered
+            ctx.log_decision(
+                "dataset_filter",
+                f"Restricted to primary_dataset_id={primary}",
+                "datasets_compatible=False",
+            )
+            logger.info(
+                "G14: filtered dataset_sources to primary %s (%d source(s))",
+                primary,
+                len(filtered),
+            )
+
+    def _enforce_session_context(self, stage: str) -> None:
+        """
+        Validate session-backed context invariants before critical phases.
+
+        Standalone orchestrator runs (no session context attached) bypass this.
+        """
+        if not self._require_context:
+            return
+
+        ctx = self._get_ctx()
+        dataset_snapshot = {
+            name: {"source": "dataset_registry"}
+            for name in self.dataset_registry.list_datasets()
+        }
+        try:
+            validation = ensure_session_context(
+                ctx,
+                session_id=getattr(ctx, "session_id", None),
+                dataset_snapshot=dataset_snapshot,
+            )
+            for warning in validation.warnings:
+                logger.warning("%s context warning: %s", stage, warning)
+        except ContextValidationError as exc:
+            raise RuntimeError(f"{stage}: {exc}") from exc
+
+    def _record_phase_timing_in_context(self, phase_name: str, duration_s: float) -> None:
+        """Mirror PipelineState phase timing into ExecutionContext when present."""
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        try:
+            ctx.record_phase_timing(phase_name, duration_s)
+        except Exception as exc:
+            logger.debug("Could not record phase timing in ExecutionContext: %s", exc)
+
+    def _sync_preprocessing_contract_to_context(
+        self,
+        preprocessing_plan: Dict[str, Any],
+        validation_report: Dict[str, Any],
+        context_signals: Dict[str, Any],
+        total_samples: int,
+        adaptive_tabular_config: Dict[str, Any],
+        drifted_features: List[str],
+    ) -> None:
+        """Persist preprocessing planning output into the attached ExecutionContext."""
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        try:
+            context_plan = {
+                modality: dict(preprocessing_plan.get(modality, {}) or {})
+                for modality in ("tabular", "text", "image")
+                if isinstance(preprocessing_plan.get(modality), dict)
+            }
+
+            preprocessing_context = {
+                "runtime": dict(preprocessing_plan.get("runtime", {}) or {}),
+                "weak_modalities": list(preprocessing_plan.get("weak_modalities", []) or []),
+                "strong_modalities": list(preprocessing_plan.get("strong_modalities", []) or []),
+                "modality_predictability": dict(preprocessing_plan.get("modality_predictability", {}) or {}),
+                "context_signals": dict(preprocessing_plan.get("context_signals", {}) or context_signals),
+                "validation": dict(validation_report or {}),
+                "dataset_total_samples": int(total_samples),
+                "fusion_recommendation": preprocessing_plan.get("fusion_recommendation"),
+                "adaptive_tabular_config": dict(adaptive_tabular_config or {}),
+                "drifted_features": list(drifted_features or []),
+            }
+
+            ctx.update_preprocessing_contract(context_plan, preprocessing_context)
+            ctx.set_pipeline_stage("preprocessing_planning")
+        except Exception as ctx_pre_exc:
+            logger.warning(
+                "Phase 3: failed to update ExecutionContext preprocessing contract: %s",
+                ctx_pre_exc,
+            )
+
+    def _sync_training_results_to_context(
+        self,
+        results: Dict[str, Any],
+        active_modalities: Optional[List[str]] = None,
+    ) -> None:
+        """Persist phase 5 training summary into the attached ExecutionContext."""
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        try:
+            modalities = list(active_modalities or results.get("active_modalities", []) or self.config.modalities)
+            training_signals = {
+                "best_val_loss": results.get("best_val_loss", 0.0),
+                "best_val_acc": results.get("best_val_acc", 0.0),
+                "best_val_f1": results.get("best_val_f1", 0.0),
+                "best_trial": results.get("best_trial", 0),
+                "n_trials": results.get("n_trials", 0),
+                "training_time": f"{float(results.get('duration_seconds', 0.0) or 0.0):.1f}s",
+                "fit_type": results.get("fit_type", "unknown"),
+                "trial_diagnostics": list(results.get("trial_diagnostics", []) or []),
+                "trial_feedback_summary": dict(results.get("trial_feedback_summary", {}) or {}),
+                "next_run_feedback": dict(results.get("next_run_feedback", {}) or {}),
+                "alignment_summary": dict(results.get("alignment_summary", {}) or {}),
+                "fusion_summary": dict(results.get("fusion_summary", {}) or {}),
+                "fusion_aux_weights": dict(results.get("fusion_aux_weights", {}) or {}),
+                "active_modalities": modalities,
+                # Explicit fusion audit field — used by monitoring and next-run decisions
+                "fusion_strategy_used": (
+                    dict(results.get("fusion_summary", {}) or {}).get("strategy")
+                    or getattr(ctx, "fusion_strategy", None)
+                    or "unknown"
+                ),
+                # Calibration placeholder — populated after Phase 7 calibration
+                "calibration": dict(results.get("calibration", {}) or {}),
+            }
+
+            ctx.update_training(training_signals)
+        except Exception as ctx_train_exc:
+            logger.warning(
+                "Phase 5: failed to update ExecutionContext training summary: %s",
+                ctx_train_exc,
+            )
+
+    def _sync_drift_results_to_context(
+        self,
+        results: Dict[str, Any],
+        modality_drift: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist phase 6 drift summary into the attached ExecutionContext."""
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        try:
+            retrain_info = dict(results.get("retrain_info") or {})
+            retrain_result = dict(retrain_info.get("result") or {}) if isinstance(retrain_info.get("result"), dict) else {}
+            retrain_event = dict(retrain_info.get("event") or {}) if isinstance(retrain_info.get("event"), dict) else {}
+            retrain_model_id = (
+                str(
+                    retrain_result.get("model_id")
+                    or retrain_event.get("model_id")
+                    or ""
+                ).strip()
+            )
+            retrain_deployment_ready = bool(
+                retrain_result.get("deployment_ready")
+                if retrain_result
+                else retrain_event.get("deployment_ready", False)
+            )
+
+            ctx.update_drift(
+                detected=bool(results.get("drift_detected", False)),
+                severity=float(results.get("composite_score", 0.0) or 0.0),
+                details={
+                    "ks": float(results.get("metrics", {}).get("ks_statistic", 0.0) or 0.0),
+                    "psi": float(results.get("metrics", {}).get("psi", 0.0) or 0.0),
+                    "mmd": float(results.get("metrics", {}).get("fdd", 0.0) or 0.0),
+                    "composite": float(results.get("composite_score", 0.0) or 0.0),
+                    "modality_drift": dict(modality_drift or {}),
+                    "retrain_triggered": bool(results.get("retrain_triggered", False)),
+                    "retrain_info": retrain_info,
+                },
+            )
+            ctx.apply_drift_feedback(results, decay=0.5)
+
+            if retrain_model_id:
+                if retrain_model_id not in ctx.registered_model_ids:
+                    ctx.registered_model_ids.append(retrain_model_id)
+                if retrain_deployment_ready:
+                    ctx.active_prediction_model_id = retrain_model_id
+                ctx.log_decision(
+                    "model_registry",
+                    f"Retrained model registered: {retrain_model_id}",
+                    evidence=(
+                        "active_prediction_model_id="
+                        f"{ctx.active_prediction_model_id}"
+                    ),
+                )
+
+            ctx.set_pipeline_stage("drift_detection")
+        except Exception as ctx_drift_exc:
+            logger.warning(
+                "Phase 6: failed to update ExecutionContext drift state: %s",
+                ctx_drift_exc,
+            )
+
+    def _sync_ingestion_results_to_context(
+        self,
+        registered_datasets: List[str],
+        dataset_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        """Persist phase 1 dataset registration into the attached ExecutionContext."""
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        try:
+            metadata_map = dict(dataset_metadata or {})
+            for dataset_id in list(registered_datasets or []):
+                dataset_id = str(dataset_id)
+                profile = ctx.get_dataset_profile(dataset_id)
+                if profile is None:
+                    profile = DatasetProfile(dataset_id=dataset_id)
+
+                metadata = dict(metadata_map.get(dataset_id, {}) or {})
+                source_url = metadata.get("source_url") or metadata.get("source")
+                cache_path = metadata.get("cache_path")
+
+                if source_url and not profile.source_url:
+                    profile.source_url = str(source_url)
+                if cache_path and not profile.file_path:
+                    profile.file_path = str(cache_path)
+
+                ctx.add_dataset_profile(profile)
+
+            ctx.set_pipeline_stage("ingestion_complete")
+        except Exception as ctx_ingest_exc:
+            logger.warning(
+                "Phase 1: failed to update ExecutionContext ingestion state: %s",
+                ctx_ingest_exc,
+            )
+
+    def _sync_model_registry_to_context(
+        self,
+        model_id: str,
+        deployment_ready: bool,
+    ) -> None:
+        """Persist phase 7 registry output into the attached ExecutionContext."""
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        try:
+            model_id = str(model_id)
+            if model_id and model_id not in ctx.registered_model_ids:
+                ctx.registered_model_ids.append(model_id)
+
+            if deployment_ready:
+                ctx.active_prediction_model_id = model_id
+
+            if model_id:
+                ctx.log_decision(
+                    "model_registry",
+                    f"Retrained model registered: {model_id}",
+                    evidence=(
+                        "active_prediction_model_id="
+                        f"{ctx.active_prediction_model_id}"
+                    ),
+                )
+
+            ctx.set_pipeline_stage("model_registry")
+        except Exception as ctx_registry_exc:
+            logger.warning(
+                "Phase 7: failed to update ExecutionContext model registry state: %s",
+                ctx_registry_exc,
+            )
+
+    def _collect_validation_logits(
+        self,
+        lightning_module: Any,
+        val_loader: Any,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect validation logits and targets for post-hoc calibration."""
+        lightning_module.eval()
+        try:
+            device = next(lightning_module.parameters()).device
+        except Exception:
+            device = self.device
+
+        logits_batches: List[torch.Tensor] = []
+        target_batches: List[torch.Tensor] = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                batch_on_device: Dict[str, Any] = {}
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor):
+                        batch_on_device[key] = value.to(device)
+                    else:
+                        batch_on_device[key] = value
+
+                logits = lightning_module(batch_on_device)
+                targets = batch_on_device.get("target")
+                if not isinstance(logits, torch.Tensor) or not isinstance(targets, torch.Tensor):
+                    continue
+
+                logits_batches.append(logits.detach().cpu())
+                target_batches.append(targets.detach().cpu())
+
+        if not logits_batches or not target_batches:
+            raise RuntimeError("Could not collect validation logits/targets for calibration")
+
+        logits_np = torch.cat(logits_batches, dim=0).numpy()
+        targets_np = torch.cat(target_batches, dim=0).numpy()
+        return logits_np, targets_np
+
+    # ------------------------------------------------------------------
+    # External result injection methods (Tree A -> Tree B unification)
+    # ------------------------------------------------------------------
+
+    def inject_external_schema(
+        self,
+        schema_dict: Dict[str, Any],
+        target_override: Optional[str] = None,
+    ) -> None:
+        """
+        Inject a pre-computed GlobalSchema dict from /api/schema/detect.
+        _execute_phase_2_schema_detection() will be a no-op when this is set.
+        """
+        if not isinstance(schema_dict, dict):
+            return
+
+        if target_override:
+            schema_dict = dict(schema_dict)
+            schema_dict["primary_target"] = target_override
+            for ds in schema_dict.get("per_dataset", []):
+                if isinstance(ds, dict):
+                    ds["target_column"] = target_override
+
+        self.phase_results[Phase.SCHEMA_DETECTION] = schema_dict
+        self.state.set_slot("phase2_schema", schema_dict)
+
+        ctx = self._get_ctx()
+        if ctx is not None:
+            try:
+                ctx.update_from_schema(schema_dict)
+
+                if target_override:
+                    current_target = getattr(ctx, "global_target", None)
+                    if current_target != target_override:
+                        if hasattr(ctx, "override_global_target"):
+                            ctx.override_global_target(
+                                target_override,
+                                "TrainingOrchestrator.inject_external_schema",
+                            )
+                        else:
+                            ctx.global_target = target_override
+
+                per_dataset = schema_dict.get("per_dataset", [])
+                if isinstance(per_dataset, list):
+                    for ds_result in per_dataset:
+                        if not isinstance(ds_result, dict):
+                            continue
+                        dataset_id = str(ds_result.get("dataset_id", "") or "").strip()
+                        if not dataset_id:
+                            continue
+
+                        profile = ctx.get_dataset_profile(dataset_id)
+                        if profile is None:
+                            profile = DatasetProfile(dataset_id=dataset_id)
+                            ctx.add_dataset_profile(profile)
+
+                        modalities = list(ds_result.get("modalities", []) or [])
+                        reasoning = ds_result.get("reasoning", {})
+                        xs3_gap = 0.0
+                        if isinstance(reasoning, dict):
+                            xs3_gap = float(
+                                reasoning.get(
+                                    "xs3_confidence_gap",
+                                    reasoning.get(
+                                        "confidence_gap",
+                                        ds_result.get("confidence", 0.0),
+                                    ),
+                                )
+                                or 0.0
+                            )
+
+                        profile.schema_detected = True
+                        profile.schema_result = dict(ds_result)
+                        profile.schema_confidence = float(
+                            ds_result.get("confidence", ds_result.get("schema_confidence", 0.0)) or 0.0
+                        )
+                        profile.schema_evidence = (
+                            f"Detected {len(modalities)} modalities; "
+                            f"X-S3 confidence gap {xs3_gap:.3f}"
+                        )
+                        profile.modality_breakdown = {
+                            modality: (1.0 / len(modalities)) if modalities else 0.0
+                            for modality in modalities
+                        }
+
+                        target_column = (
+                            ds_result.get("target_column")
+                            or schema_dict.get("primary_target")
+                            or ctx.global_target
+                        )
+                        if target_column:
+                            profile.chosen_target = str(target_column)
+
+                        ctx.dataset_profiles[dataset_id] = profile
+
+                ctx.set_pipeline_stage("schema_detection")
+            except Exception as ctx_exc:
+                logger.warning(
+                    "inject_external_schema: failed to mirror schema into ExecutionContext: %s",
+                    ctx_exc,
+                )
+        logger.info(
+            "TrainingOrchestrator: injected external schema "
+            "(primary_target=%s, %d datasets)",
+            schema_dict.get("primary_target", "?"),
+            len(schema_dict.get("per_dataset", [])),
+        )
+
+    def inject_external_preprocessors(
+        self,
+        tabular_scaler_path: Optional[str] = None,
+    ) -> None:
+        """
+        Load pre-fitted TabularPreprocessor from disk.
+        _execute_phase_3_preprocessing() will reuse it instead of re-fitting.
+        """
+        if not tabular_scaler_path:
+            return
+
+        scaler_path = Path(tabular_scaler_path)
+        if not scaler_path.exists():
+            logger.warning(
+                "inject_external_preprocessors: path not found: %s "
+                "- Phase 3 will re-fit.",
+                scaler_path,
+            )
+            return
+
+        try:
+            import joblib
+
+            tab_prep = joblib.load(str(scaler_path))
+            self.fitted_transformers["tabular"] = tab_prep
+            logger.info(
+                "TrainingOrchestrator: loaded TabularPreprocessor from %s "
+                "(output_dim=%d)",
+                scaler_path,
+                tab_prep.get_output_dim() if hasattr(tab_prep, "get_output_dim") else -1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "inject_external_preprocessors: failed to load %s: %s "
+                "- Phase 3 will re-fit.",
+                scaler_path,
+                exc,
+            )
+
+    def inject_external_model_selection(
+        self,
+        model_sel_dict: Dict[str, Any],
+    ) -> None:
+        """
+        Inject pre-computed model selection from /select-model.
+        _execute_phase_4_model_selection() will be a no-op when this is set.
+        """
+        if not isinstance(model_sel_dict, dict):
+            return
+
+        self.phase_results[Phase.MODEL_SELECTION] = model_sel_dict
+        self.state.set_slot("phase4_model_selection", model_sel_dict)
+
+        ctx = self._get_ctx()
+        if ctx is not None:
+            try:
+                recommendations = model_sel_dict.get("recommended_models")
+                if not isinstance(recommendations, list) or not recommendations:
+                    recommendations = [model_sel_dict]
+
+                ctx.update_model_selection(
+                    recommendations,
+                    "TrainingOrchestrator.inject_external_model_selection",
+                )
+
+                selected_model = model_sel_dict.get("selected_model") or model_sel_dict.get("name")
+                if selected_model:
+                    ctx.selected_model = str(selected_model)
+
+                fusion_strategy = model_sel_dict.get("fusion_strategy")
+                if fusion_strategy:
+                    modality_importance = model_sel_dict.get("modality_importance", {})
+                    if not isinstance(modality_importance, dict):
+                        modality_importance = {}
+                    ctx.update_fusion(str(fusion_strategy), dict(modality_importance))
+
+                ctx.set_pipeline_stage("model_selection")
+            except Exception as ctx_exc:
+                logger.warning(
+                    "inject_external_model_selection: failed to mirror selection into ExecutionContext: %s",
+                    ctx_exc,
+                )
+        logger.info(
+            "TrainingOrchestrator: injected external model selection (%s)",
+            model_sel_dict.get("selected_model", model_sel_dict.get("name", "?")),
+        )
+
+    def inject_external_datasets(
+        self,
+        session_datasets: Dict[str, Any],
+    ) -> None:
+        """
+        Register pre-ingested session datasets into DatasetManager.
+
+        This allows Phase 1 ingestion to short-circuit and avoid duplicate
+        download/cache work for session-backed training runs.
+        """
+        if not isinstance(session_datasets, dict) or not session_datasets:
+            return
+
+        registered: List[str] = []
+        registered_metadata: Dict[str, Dict[str, Any]] = {}
+        for source_hash, dataset_obj in session_datasets.items():
+            try:
+                lazy_ref = (
+                    dataset_obj.lazy_data
+                    if hasattr(dataset_obj, "lazy_data")
+                    else dataset_obj
+                )
+                metadata = dict(getattr(dataset_obj, "metadata", {}) or {})
+                registered_metadata[str(source_hash)] = {
+                    "source_url": metadata.get("source_url") or metadata.get("source"),
+                    "cache_path": metadata.get("cache_path"),
+                }
+                self.dataset_registry.register_dataset(
+                    source_hash,
+                    lazy_ref,
+                    metadata={"source": "session_cache", "hash": source_hash},
+                )
+                registered.append(source_hash)
+            except Exception as reg_exc:
+                logger.warning(
+                    "inject_external_datasets: failed to register %s: %s",
+                    source_hash,
+                    reg_exc,
+                )
+
+        if not registered:
+            return
+
+        phase1_result: Dict[str, Any] = {
+            "sources": list(session_datasets.keys()),
+            "registered_datasets": registered,
+            "failed_urls": {},
+            "success_count": len(registered),
+            "failed_count": 0,
+            "ingestion_time": "session_cached",
+            "duration_seconds": 0.0,
+            "injected": True,
+        }
+        self.phase_results[Phase.DATA_INGESTION] = phase1_result
+        self.state.set_slot("phase1_ingestion", phase1_result)
+        self.state.set_phase_timing("DATA_INGESTION", 0.0)
+        self._record_phase_timing_in_context("DATA_INGESTION", 0.0)
+        self._sync_ingestion_results_to_context(registered, registered_metadata)
+        logger.info(
+            "TrainingOrchestrator: injected %d session datasets - Phase 1 will be skipped",
+            len(registered),
+        )
     
     async def run_pipeline(self) -> Dict[str, Any]:
         """Execute complete 7-phase pipeline (async – Phase 1 is truly async)."""
@@ -618,6 +1409,55 @@ class TrainingOrchestrator:
         except Exception as e:
             logger.error(f"❌ Pipeline execution failed: {str(e)}")
             raise
+
+    def run_phase(self, phase: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Legacy phase dispatcher kept for backward compatibility.
+
+        New code should call explicit phase methods (``_execute_phase_*``) or
+        ``run_pipeline()``.
+        """
+        if isinstance(phase, Phase):
+            resolved = phase
+        elif isinstance(phase, int):
+            resolved = Phase(phase)
+        elif isinstance(phase, str):
+            normalized = phase.strip().upper()
+            # Accept either enum names (e.g. "MODEL_SELECTION") or the
+            # legacy "phase_4" style labels.
+            if normalized.startswith("PHASE_"):
+                normalized = normalized.replace("PHASE_", "")
+            if normalized.isdigit():
+                resolved = Phase(int(normalized))
+            else:
+                resolved = Phase[normalized]
+        else:
+            raise ValueError(f"Unsupported phase identifier: {phase!r}")
+
+        if resolved == Phase.DATA_INGESTION:
+            raise RuntimeError(
+                "DATA_INGESTION is async-only in this orchestrator. "
+                "Call _execute_phase_1_data_ingestion() from an async context."
+            )
+        if resolved == Phase.SCHEMA_DETECTION:
+            self._execute_phase_2_schema_detection()
+        elif resolved == Phase.PREPROCESSING:
+            self._execute_phase_3_preprocessing()
+        elif resolved == Phase.MODEL_SELECTION:
+            self._execute_phase_4_model_selection()
+        elif resolved == Phase.TRAINING:
+            self._execute_phase_5_training(
+                hp_overrides=kwargs.get("hp_overrides"),
+                early_stop_patience=kwargs.get("early_stop_patience", 5),
+            )
+        elif resolved == Phase.DRIFT_DETECTION:
+            self._execute_phase_6_drift_detection()
+        elif resolved == Phase.MODEL_REGISTRY:
+            self._execute_phase_7_model_registry()
+
+        phase_result = self.phase_results.get(resolved, {})
+        if isinstance(phase_result, dict):
+            return phase_result
+        return {"result": phase_result}
     
     async def _execute_phase_1_data_ingestion(
         self,
@@ -638,6 +1478,17 @@ class TrainingOrchestrator:
             Phase-1 results dict with keys:
               registered_datasets, failed_urls, success_count, failed_count, …
         """
+        if (
+            Phase.DATA_INGESTION in self.phase_results
+            and self.phase_results[Phase.DATA_INGESTION].get("injected")
+        ):
+            logger.info(
+                "Phase 1: SKIPPED - using %d injected session dataset(s)",
+                len(self.phase_results[Phase.DATA_INGESTION].get("registered_datasets", [])),
+            )
+            self.current_phase = Phase.SCHEMA_DETECTION
+            return self.phase_results[Phase.DATA_INGESTION]
+
         logger.info("\n" + "=" * 80)
         logger.info("PHASE 1: DATA INGESTION")
         logger.info("=" * 80)
@@ -652,7 +1503,12 @@ class TrainingOrchestrator:
             registered: List[str] = []
             failed_urls: Dict[str, str] = ingest_meta.get("failed", {})
 
-            for source_hash, lazy_ref in lazy_datasets.items():
+            for source_hash, dataset_obj in lazy_datasets.items():
+                lazy_ref = (
+                    dataset_obj.lazy_data
+                    if hasattr(dataset_obj, "lazy_data")
+                    else dataset_obj
+                )
                 source_url: str = next(
                     (s for s, h in ingest_meta["cached_hashes"].items()
                      if h == source_hash),
@@ -690,6 +1546,21 @@ class TrainingOrchestrator:
             logger.info("  Duration   : %.2fs", elapsed)
 
             self.phase_results[Phase.DATA_INGESTION] = results
+            self.state.set_slot("phase1_ingestion", results)
+            self.state.set_phase_timing("DATA_INGESTION", elapsed)
+            self._record_phase_timing_in_context("DATA_INGESTION", elapsed)
+            self._sync_ingestion_results_to_context(
+                registered,
+                {
+                    str(source_hash): {
+                        "source_url": next(
+                            (s for s, h in ingest_meta.get("cached_hashes", {}).items() if h == source_hash),
+                            source_hash,
+                        ),
+                    }
+                    for source_hash in registered
+                },
+            )
             self.current_phase = Phase.SCHEMA_DETECTION
             return results
 
@@ -707,6 +1578,15 @@ class TrainingOrchestrator:
 
         All hardcoded mock dictionaries have been removed.
         """
+        # Short-circuit if schema was injected via inject_external_schema()
+        if Phase.SCHEMA_DETECTION in self.phase_results:
+            logger.info(
+                "Phase 2: SKIPPED - using injected schema (primary_target=%s)",
+                self.phase_results[Phase.SCHEMA_DETECTION].get("primary_target", "?"),
+            )
+            self.current_phase = Phase.PREPROCESSING
+            return
+
         logger.info("\n" + "=" * 80)
         logger.info("PHASE 2: SCHEMA DETECTION")
         logger.info("=" * 80)
@@ -742,6 +1622,9 @@ class TrainingOrchestrator:
             logger.info("  Duration            : %.2fs", elapsed)
 
             self.phase_results[Phase.SCHEMA_DETECTION] = results
+            self.state.set_slot("phase2_schema", results)
+            self.state.set_phase_timing("SCHEMA_DETECTION", elapsed)
+            self._record_phase_timing_in_context("SCHEMA_DETECTION", elapsed)
             self.current_phase = Phase.PREPROCESSING
 
         except Exception as e:
@@ -828,10 +1711,62 @@ class TrainingOrchestrator:
                     "Phase 3: no materialisable datasets found in registry."
                 )
 
+            image_only_mode = False
             full_df: pd.DataFrame = (
                 pd.concat(frames, ignore_index=True) if frames
                 else pd.DataFrame()
             )
+
+            if full_df.empty and image_datasets:
+                def _materialize_image_dataset(ds: Any, max_rows: int) -> pd.DataFrame:
+                    paths: List[str] = []
+
+                    raw_paths = getattr(ds, "_paths", None)
+                    if isinstance(raw_paths, list) and raw_paths:
+                        paths = [str(p) for p in raw_paths[:max_rows]]
+                    else:
+                        upper = min(max_rows, len(ds))
+                        for idx in range(upper):
+                            try:
+                                sample = ds[idx]
+                            except Exception:
+                                continue
+                            path_val = None
+                            if isinstance(sample, dict):
+                                path_val = sample.get("path")
+                            elif isinstance(sample, (tuple, list)) and len(sample) >= 2:
+                                path_val = sample[1]
+                            if path_val is not None:
+                                paths.append(str(path_val))
+
+                    if not paths:
+                        return pd.DataFrame()
+
+                    out = pd.DataFrame({"image_path": paths})
+                    parent_labels = [Path(p).parent.name for p in paths]
+                    unique_labels = sorted({lbl for lbl in parent_labels if lbl})
+                    if len(unique_labels) > 1:
+                        out["target"] = parent_labels
+                    return out
+
+                image_frames = []
+                for image_ds in image_datasets:
+                    image_frame = _materialize_image_dataset(image_ds, MAX_ROWS)
+                    if not image_frame.empty:
+                        image_frames.append(image_frame)
+
+                if image_frames:
+                    full_df = pd.concat(image_frames, ignore_index=True, sort=False)
+                    image_only_mode = True
+                    logger.info(
+                        "  Materialised %d rows from %d image dataset(s) for image-only preprocessing",
+                        len(full_df),
+                        len(image_frames),
+                    )
+                else:
+                    raise RuntimeError(
+                        "Phase 3: image datasets found but no image paths could be materialised."
+                    )
 
             # Drop columns with >50% NaN (artifacts of non-overlapping schemas)
             nan_ratio = full_df.isna().mean()
@@ -846,21 +1781,211 @@ class TrainingOrchestrator:
             total_samples: int = len(full_df)
             logger.info("  Materialised %d rows from %d dataset(s)", total_samples, len(frames))
 
+            ctx = self._get_ctx()
+            context_signals: Dict[str, Any] = {}
+            predictability_scores: Dict[str, float] = {}
+            drift_adjusted_predictability: Dict[str, float] = {}
+            modality_presence: Dict[str, bool] = {}
+            planner_drifted_features: List[str] = []
+            global_schema_context: Dict[str, Any] = {}
+            feature_intelligence_context: Dict[str, Any] = {}
+            if ctx is not None:
+                if hasattr(ctx, "get_preprocessing_signals"):
+                    try:
+                        context_signals = dict(ctx.get_preprocessing_signals() or {})
+                    except Exception:
+                        context_signals = {}
+                if not context_signals:
+                    context_signals = {
+                        "global_schema": dict(getattr(ctx, "global_schema", {}) or {}),
+                        "modality_presence": {
+                            str(k): bool(v)
+                            for k, v in dict(getattr(ctx, "modality_presence", {}) or {}).items()
+                        },
+                        "predictability_scores": {
+                            str(k): float(v)
+                            for k, v in dict(getattr(ctx, "predictability_scores", {}) or {}).items()
+                            if isinstance(v, (int, float))
+                        },
+                        "drift_adjusted_predictability": {
+                            str(k): float(v)
+                            for k, v in dict(getattr(ctx, "drift_adjusted_predictability", {}) or {}).items()
+                            if isinstance(v, (int, float))
+                        },
+                        "drifted_features": [
+                            str(col) for col in list(getattr(ctx, "drifted_features", []) or [])
+                        ],
+                        "drift_feedback_applied": bool(getattr(ctx, "drift_feedback_applied", False)),
+                        "training_fit_analysis": dict(getattr(ctx, "training_fit_analysis", {}) or {}),
+                        "feature_intelligence": dict(getattr(ctx, "feature_intelligence", {}) or {}),
+                        "encoder_plan": dict(getattr(ctx, "encoder_plan", {}) or {}),
+                    }
+
+                predictability_scores = {
+                    str(k): float(v)
+                    for k, v in dict(context_signals.get("predictability_scores", {}) or {}).items()
+                    if isinstance(v, (int, float))
+                }
+                drift_adjusted_predictability = {
+                    str(k): float(v)
+                    for k, v in dict(context_signals.get("drift_adjusted_predictability", {}) or {}).items()
+                    if isinstance(v, (int, float))
+                }
+                modality_presence = {
+                    str(k): bool(v)
+                    for k, v in dict(context_signals.get("modality_presence", {}) or {}).items()
+                }
+                planner_drifted_features = [
+                    str(col) for col in list(context_signals.get("drifted_features", []) or [])
+                ]
+                global_schema_context = dict(context_signals.get("global_schema", {}) or {})
+                feature_intelligence_context = dict(context_signals.get("feature_intelligence", {}) or {})
+
+            per_dataset_hints: List[Dict[str, Any]] = []
+            per_dataset_entries = list(schema_info.get("per_dataset", []) or [])
+            for entry in per_dataset_entries:
+                if isinstance(entry, dict):
+                    raw_hints = entry.get("preprocessing_hints")
+                    if isinstance(raw_hints, dict) and raw_hints:
+                        per_dataset_hints.append(dict(raw_hints))
+
+            merged_preprocessing_hints: Dict[str, Any] = {}
+            for raw_hint in per_dataset_hints:
+                for key, value in raw_hint.items():
+                    if isinstance(value, dict):
+                        bucket = dict(merged_preprocessing_hints.get(key, {}) or {})
+                        bucket.update(dict(value))
+                        merged_preprocessing_hints[key] = bucket
+                    else:
+                        merged_preprocessing_hints[key] = value
+
+            merged_feature_intelligence: Dict[str, Any] = {}
+            if isinstance(feature_intelligence_context, dict) and feature_intelligence_context:
+                fi_entries = [
+                    dict(value) for value in feature_intelligence_context.values()
+                    if isinstance(value, dict)
+                ]
+                if fi_entries:
+                    text_lengths = [
+                        float(entry.get("avg_text_len"))
+                        for entry in fi_entries
+                        if isinstance(entry.get("avg_text_len"), (int, float))
+                    ]
+                    image_sizes = [
+                        int(entry.get("image_dataset_size"))
+                        for entry in fi_entries
+                        if isinstance(entry.get("image_dataset_size"), (int, float))
+                    ]
+                    image_seps = [
+                        float(entry.get("image_label_separability"))
+                        for entry in fi_entries
+                        if isinstance(entry.get("image_label_separability"), (int, float))
+                    ]
+                    image_balances = [
+                        float(entry.get("image_class_balance"))
+                        for entry in fi_entries
+                        if isinstance(entry.get("image_class_balance"), (int, float))
+                    ]
+                    all_uncertainty: Dict[str, Any] = {}
+                    all_hints: Dict[str, Any] = {}
+                    text_task_type = None
+                    for entry in fi_entries:
+                        all_uncertainty.update(dict(entry.get("uncertainty_summary", {}) or {}))
+                        all_hints.update(dict(entry.get("preprocessing_hints", {}) or {}))
+                        if not text_task_type and entry.get("text_task_type"):
+                            text_task_type = entry.get("text_task_type")
+                    merged_feature_intelligence = {
+                        "avg_text_len": max(text_lengths) if text_lengths else 0.0,
+                        "image_dataset_size": max(image_sizes) if image_sizes else 0,
+                        "image_label_separability": (
+                            sum(image_seps) / len(image_seps) if image_seps else 0.0
+                        ),
+                        "image_class_balance": (
+                            sum(image_balances) / len(image_balances) if image_balances else 0.0
+                        ),
+                        "uncertainty_summary": all_uncertainty,
+                        "text_task_type": text_task_type,
+                        "preprocessing_hints": all_hints,
+                        "n_features": int(schema_info.get("total_feature_count", 0) or 0),
+                        # Bug 8: propagate rich schema signals to preprocessors
+                        "vocab_sizes": [
+                            int((e.get("feature_signals") or {}).get("vocab_size", 0))
+                            for e in fi_entries
+                        ],
+                        "language_ids": [
+                            (e.get("feature_signals") or {}).get("language_id")
+                            for e in fi_entries
+                            if (e.get("feature_signals") or {}).get("language_id")
+                        ],
+                        "avg_tokens": [
+                            float((e.get("feature_signals") or {}).get("avg_tokens_per_sample", 0))
+                            for e in fi_entries
+                        ],
+                        "image_channels": list({
+                            ch for e in fi_entries
+                            for ch in ((e.get("feature_signals") or {}).get("channels") or [])
+                        }),
+                        "aspect_ratio_variances": [
+                            float((e.get("feature_signals") or {}).get("aspect_ratio_variance", 0))
+                            for e in fi_entries
+                        ],
+                    }
+
+            preprocessing_plan = self.preprocessing_planner.create_plan(
+                schema_info=schema_info,
+                total_samples=total_samples,
+                predictability_scores=predictability_scores,
+                modality_presence=modality_presence,
+                drift_adjusted_predictability=drift_adjusted_predictability,
+                drifted_features=planner_drifted_features,
+                global_schema=global_schema_context,
+                preprocessing_hints=merged_preprocessing_hints,
+                feature_intelligence=merged_feature_intelligence,
+            )
+            self.state.set_slot("preprocessing_plan", preprocessing_plan)
+
             # ----------------------------------------------------------------
             # 3  Target separation and encoding
             # ----------------------------------------------------------------
             from sklearn.preprocessing import LabelEncoder, StandardScaler as SS
 
+            if image_only_mode and target_col == "Unknown" and "target" in full_df.columns:
+                target_col = "target"
+
             if target_col != "Unknown" and target_col in full_df.columns:
                 y_raw = full_df[target_col]
                 feature_df = full_df.drop(columns=[target_col])
             else:
+                if full_df.shape[1] < 2:
+                    raise RuntimeError(
+                        "Phase 3: target column is missing. "
+                        "For image-only datasets provide labels (e.g. class-folder structure) "
+                        "or include an explicit target column."
+                    )
                 logger.warning(
                     "  Target column '%s' not found – using last column as target", target_col
                 )
                 feature_df = full_df.iloc[:, :-1]
                 y_raw = full_df.iloc[:, -1]
                 target_col = full_df.columns[-1]
+
+            if image_only_mode and "image_path" in feature_df.columns:
+                global_modalities = list(schema_info.get("global_modalities", []) or [])
+                if "image" not in global_modalities:
+                    schema_info["global_modalities"] = sorted(global_modalities + ["image"])
+
+                per_dataset = schema_info.get("per_dataset", [])
+                if not isinstance(per_dataset, list) or not per_dataset:
+                    per_dataset = [{}]
+                    schema_info["per_dataset"] = per_dataset
+                first_entry = per_dataset[0]
+                if not isinstance(first_entry, dict):
+                    first_entry = {}
+                    per_dataset[0] = first_entry
+                detected_cols = first_entry.setdefault("detected_columns", {})
+                image_bucket = detected_cols.setdefault("image", [])
+                if "image_path" not in image_bucket:
+                    image_bucket.append("image_path")
 
             # Drop rows with NaN targets (from non-overlapping dataset concat)
             nan_target_mask = y_raw.isna()
@@ -934,6 +2059,70 @@ class TrainingOrchestrator:
                 if c not in text_cols and c not in image_cols
             ]
 
+            adaptive_tabular_config: Dict[str, Any] = {}
+            drifted_features: List[str] = list(planner_drifted_features)
+            if ctx is not None and tabular_cols:
+                try:
+                    adaptive_engine = AdaptivePreprocessingEngine(ctx)
+                    adaptive_tabular_config = adaptive_engine.build_tabular_config(feature_df[tabular_cols])
+                    if not drifted_features:
+                        drifted_features = list(getattr(ctx, "drifted_features", []) or [])
+
+                    weak_modalities = adaptive_engine.get_weak_modalities()
+                    if weak_modalities:
+                        preprocessing_plan["weak_modalities"] = weak_modalities
+                    preprocessing_plan["fusion_recommendation"] = adaptive_engine.get_fusion_recommendation()
+
+                    tab_plan = dict(preprocessing_plan.get("tabular", {}) or {})
+                    tab_plan.update(adaptive_tabular_config)
+                    preprocessing_plan["tabular"] = tab_plan
+                except Exception as adaptive_exc:
+                    logger.warning("Phase 3: adaptive preprocessing engine unavailable: %s", adaptive_exc)
+
+            validation_plan = {
+                "modality": {
+                    "tabular": {
+                        "columns": tabular_cols,
+                        "imputer_strategy": (preprocessing_plan.get("tabular", {}) or {}).get(
+                            "imputer_strategy", "median"
+                        ),
+                    },
+                    "text": {
+                        "columns": text_cols,
+                        "max_length": (preprocessing_plan.get("text", {}) or {}).get(
+                            "max_length", 128
+                        ),
+                    },
+                    "image": {
+                        "columns": image_cols,
+                        "image_size": (preprocessing_plan.get("image", {}) or {}).get(
+                            "target_size", [224, 224]
+                        ),
+                    },
+                },
+                "feature_selection": {
+                    "top_k": max(1, min(512, len(tabular_cols) or 1)),
+                },
+            }
+
+            validation_report: Dict[str, Any] = {
+                "valid": True,
+                "warnings": [],
+                "errors": [],
+                "checks_passed": 0,
+                "checks_total": 0,
+            }
+            try:
+                validation_report = PreprocessingValidator().validate_plan(
+                    validation_plan,
+                    schema_info,
+                    dataset_shape=feature_df.shape,
+                )
+            except PreprocessingValidationError as validation_exc:
+                raise RuntimeError(
+                    f"Phase 3 preprocessing validation failed: {validation_exc}"
+                ) from validation_exc
+
             # ----------------------------------------------------------------
             # 5  Fit modality preprocessors
             # ----------------------------------------------------------------
@@ -943,11 +2132,42 @@ class TrainingOrchestrator:
             output_shapes: Dict[str, Any] = {}
             preprocessing_stages = []
 
-            if tabular_cols and "tabular" in schema_info.get("global_modalities", []):
-                tabular_prep = TabularPreprocessor()
-                tabular_prep.fit(feature_df[tabular_cols])
-                self.fitted_transformers["tabular"] = tabular_prep
+            # Guard condition: use cols presence only — not schema_info.global_modalities.
+            # schema_info can be stale or incorrect after overrides; the column arrays
+            # (tabular_cols/text_cols/image_cols) are built directly from detected_columns
+            # so they are the authoritative source.
+            if tabular_cols:
+                existing_tabular = self.fitted_transformers.get("tabular")
+                tabular_plan = dict(preprocessing_plan.get("tabular", {}) or {})
+                if existing_tabular is not None:
+                    tabular_prep = existing_tabular
+                    tabular_prep.configure(tabular_plan)
+                    if drifted_features:
+                        setattr(tabular_prep, "_drifted_features", list(drifted_features))
+                    _ = tabular_prep.transform(feature_df[tabular_cols])
+                    logger.info(
+                        "  Phase 3: reusing pre-fitted TabularPreprocessor (output_dim=%d)",
+                        tabular_prep.get_output_dim() if hasattr(tabular_prep, "get_output_dim") else -1,
+                    )
+                else:
+                    tabular_prep = TabularPreprocessor(
+                        adaptive_config=tabular_plan,
+                        drifted_features=drifted_features,
+                    )
+                    tabular_prep.configure(tabular_plan)
+                    _ = tabular_prep.fit_transform(feature_df[tabular_cols])
+                    self.fitted_transformers["tabular"] = tabular_prep
                 output_dim = tabular_prep.get_output_dim()
+                # Guard against all-columns-dropped silent failure
+                if output_dim == 0:
+                    raise RuntimeError(
+                        "Phase 3: TabularPreprocessor produced 0 output features. "
+                        "All tabular columns were filtered out (too many unique values, "
+                        "path-like strings, or excessive missing values). "
+                        "Suggestions: (1) Check your dataset for ID or path columns, "
+                        "(2) Reduce _NEAR_UNIQUE_RATIO threshold via /configure, "
+                        "(3) Manually select feature columns before ingestion."
+                    )
                 output_shapes["tabular"] = f"(N, {output_dim})"
                 preprocessing_stages.append({
                     "stage": "tabular_preprocessing",
@@ -956,10 +2176,39 @@ class TrainingOrchestrator:
                 })
                 logger.info("  Tabular preprocessor fitted: output_dim=%d", output_dim)
 
-            if text_cols and "text" in schema_info.get("global_modalities", []):
+                # Part A.4 — when ULA fusion is selected, build a TabularFeatureTokenizer
+                # so tabular features become per-feature token sequences (N,F,token_dim)
+                # instead of a flat pooled vector, enabling cross-modal attention in ULA.
+                _recommended_fusion = (
+                    self.state.get_slot("schema_derived_fusion")
+                    if hasattr(self, "state") and hasattr(self.state, "get_slot")
+                    else None
+                ) or self.config.__dict__.get("fusion_strategy", "concatenation")
+                if str(_recommended_fusion).lower() in ("ula", "unified_latent", "unified_latent_alignment", "omnimodal"):
+                    try:
+                        from preprocessing.tabular_preprocessor import TabularFeatureTokenizer
+                        _ula_token_dim = int(
+                            self.config.__dict__.get("ula_latent_dim", None) or 256
+                        )
+                        _tab_tok = TabularFeatureTokenizer(
+                            n_features=output_dim, token_dim=_ula_token_dim
+                        )
+                        self.fitted_transformers["tabular_tokenizer"] = _tab_tok
+                        logger.info(
+                            "  ULA TabularFeatureTokenizer built: n_features=%d token_dim=%d",
+                            output_dim, _ula_token_dim,
+                        )
+                    except Exception as _tok_exc:
+                        logger.warning("TabularFeatureTokenizer init failed: %s", _tok_exc)
+
+            if text_cols:
                 text_prep = TextPreprocessor()
+                _text_plan = dict(preprocessing_plan.get("text") or {})
+                _text_plan["feature_intelligence"] = merged_feature_intelligence
+                _text_plan["text_task_type"] = merged_feature_intelligence.get("text_task_type")
+                text_prep.configure(_text_plan)
                 self.fitted_transformers["text"] = text_prep
-                output_shapes["text"] = "(N, 128) per key"
+                output_shapes["text"] = f"(N, {text_prep.max_length}) per key"
                 preprocessing_stages.append({
                     "stage": "text_preprocessing",
                     "status": "success",
@@ -967,16 +2216,46 @@ class TrainingOrchestrator:
                 })
                 logger.info("  Text preprocessor initialised (lazy tokeniser)")
 
-            if image_cols and "image" in schema_info.get("global_modalities", []):
+            if image_cols:
                 image_prep = ImagePreprocessor()
+                _img_plan = dict(preprocessing_plan.get("image") or {})
+                _img_plan["feature_intelligence"] = merged_feature_intelligence
+                _img_plan["dataset_size"] = merged_feature_intelligence.get("image_dataset_size", 0)
+                _img_plan["label_separability"] = merged_feature_intelligence.get("image_label_separability", 0.5)
+                _img_plan["class_balance"] = merged_feature_intelligence.get("image_class_balance", 0.5)
+                image_prep.configure(_img_plan)
                 self.fitted_transformers["image"] = image_prep
-                output_shapes["image"] = "(N, 3, 224, 224)"
+                _h, _w = image_prep.target_size
+                output_shapes["image"] = f"(N, 3, {_h}, {_w})"
                 preprocessing_stages.append({
                     "stage": "image_preprocessing",
                     "status": "success",
                     "output_shape": output_shapes["image"],
                 })
                 logger.info("  Image preprocessor initialised")
+
+            consistency_schema = dict(schema_info)
+            consistency_schema["global_modalities"] = [
+                modality
+                for modality, columns in (
+                    ("tabular", tabular_cols),
+                    ("text", text_cols),
+                    ("image", image_cols),
+                )
+                if columns
+            ]
+
+            try:
+                validate_preprocessor_consistency(
+                    tabular_prep,
+                    text_prep,
+                    image_prep,
+                    consistency_schema,
+                )
+            except PreprocessingValidationError as consistency_exc:
+                raise RuntimeError(
+                    f"Phase 3 preprocessor consistency failed: {consistency_exc}"
+                ) from consistency_exc
 
             # ----------------------------------------------------------------
             # 6  Build MultimodalPyTorchDataset
@@ -989,6 +2268,47 @@ class TrainingOrchestrator:
             #    Phase 5 routes train row indices to the augmented dataset and
             #    val row indices to the clean dataset via torch.utils.data.Subset.
             # ----------------------------------------------------------------
+            # ── Pre-flight image path validation ─────────────────────────
+            # Check that image files are actually accessible before building
+            # the dataset.  Silent zero-fill during training is impossible to
+            # diagnose — fail loudly here instead.
+            if image_cols and image_prep is not None:
+                _probe_paths: list = []
+                for _ic in image_cols:
+                    if _ic not in feature_df.columns:
+                        continue
+                    _probe_paths.extend(
+                        feature_df[_ic].dropna().astype(str).head(20).tolist()
+                    )
+                _probe_paths = [p for p in _probe_paths if p.strip() and
+                                p.strip().lower() not in {"nan","none","null",""}]
+                if _probe_paths:
+                    from pathlib import Path as _Path
+                    _n_ok = sum(1 for p in _probe_paths if _Path(p).is_file())
+                    _load_rate = _n_ok / len(_probe_paths)
+                    if _load_rate == 0.0:
+                        raise RuntimeError(
+                            f"Phase 3: Image pre-flight check FAILED — 0/{len(_probe_paths)} "
+                            f"sampled image paths are accessible on this server.\n"
+                            f"  Sample path: {_probe_paths[0]}\n"
+                            "Image columns reference local paths on your machine. "
+                            "Copy the images to the server or provide an accessible path. "
+                            "To train without images, remove the image column from your CSV."
+                        )
+                    elif _load_rate < 0.5:
+                        logger.warning(
+                            "Phase 3: Image pre-flight WARNING — only %d/%d (%.0f%%) sampled "
+                            "image paths are accessible. Training will proceed but image "
+                            "embeddings will be zero for missing files. "
+                            "Check that image paths are accessible from the server.",
+                            _n_ok, len(_probe_paths), _load_rate * 100,
+                        )
+                    else:
+                        logger.info(
+                            "  Image pre-flight: %d/%d paths accessible (%.0f%%)",
+                            _n_ok, len(_probe_paths), _load_rate * 100,
+                        )
+
             _dataset_kwargs = dict(
                 df=feature_df,
                 targets=targets,
@@ -1024,8 +2344,20 @@ class TrainingOrchestrator:
                 "text_columns": text_cols,
                 "image_columns": image_cols,
                 "tabular_columns": tabular_cols,
+                "preprocessing_plan": preprocessing_plan,
+                "validation": validation_report,
                 "duration_seconds": elapsed,
             }
+
+            if ctx is not None:
+                self._sync_preprocessing_contract_to_context(
+                    preprocessing_plan=preprocessing_plan,
+                    validation_report=validation_report,
+                    context_signals=context_signals,
+                    total_samples=total_samples,
+                    adaptive_tabular_config=adaptive_tabular_config,
+                    drifted_features=drifted_features,
+                )
 
             logger.info("\nPhase 3 Summary:")
             logger.info("  Stages     : %d", len(preprocessing_stages))
@@ -1033,6 +2365,9 @@ class TrainingOrchestrator:
             logger.info("  Duration   : %.2fs", elapsed)
 
             self.phase_results[Phase.PREPROCESSING] = results
+            self.state.set_slot("phase3_preprocessing", results)
+            self.state.set_phase_timing("PREPROCESSING", elapsed)
+            self._record_phase_timing_in_context("PREPROCESSING", elapsed)
             self.current_phase = Phase.MODEL_SELECTION
 
         except Exception as exc:
@@ -1062,9 +2397,30 @@ class TrainingOrchestrator:
         ``rationale``       : human-readable selection notes
         ``hardware_info``   : GPU/CPU snapshot
         """
+        # Short-circuit if model selection was injected via inject_external_model_selection()
+        if Phase.MODEL_SELECTION in self.phase_results:
+            injected = self.phase_results[Phase.MODEL_SELECTION]
+            logger.info(
+                "Phase 4: SKIPPED - using injected model selection (%s)",
+                injected.get("selected_model", injected.get("name", "?")),
+            )
+            self.current_phase = Phase.TRAINING
+            return
+
         logger.info("\n" + "=" * 80)
         logger.info("PHASE 4: MODEL SELECTION")
         logger.info("=" * 80)
+
+        self._enforce_session_context("Phase 4")
+
+        _ctx_for_validation = self._get_ctx()
+        if _ctx_for_validation is not None:
+            ContextValidator.require_schema(_ctx_for_validation, phase="model_selection")
+            ContextValidator.require_modality_consistency(
+                _ctx_for_validation,
+                self.config.modalities,
+                phase="model_selection",
+            )
 
         phase_start = time.time()
 
@@ -1086,9 +2442,119 @@ class TrainingOrchestrator:
                 Phase.PREPROCESSING, {}
             )
 
+            from models.fusion import select_fusion_strategy
+
+            schema_derived_fusion = select_fusion_strategy(schema_info)
+
+            # Use multimodal_signals (complementarity_score, alignment_strength)
+            # to upgrade the fusion strategy when signals are informative.
+            _mm_signals = schema_info.get("multimodal_signals", {}) or {}
+            _complementarity = float(_mm_signals.get("complementarity_score", 0.0))
+            _alignment = float(_mm_signals.get("alignment_strength", 0.0))
+            _n_mods = len(schema_info.get("global_modalities", []))
+
+            if _n_mods >= 2 and schema_derived_fusion not in ("ula", "gated", "fusemoe"):
+                if _complementarity > 0.6 and _alignment > 0.45:
+                    # Diverse, well-aligned modalities — ULA cross-modal attention
+                    schema_derived_fusion = "ula"
+                    logger.info(
+                        "Phase 4: upgrading fusion → ULA "
+                        "(complementarity=%.3f alignment=%.3f)",
+                        _complementarity, _alignment,
+                    )
+                elif _complementarity < 0.25:
+                    # Conflicting modalities — use gates to suppress noise
+                    schema_derived_fusion = "gated"
+                    logger.info(
+                        "Phase 4: upgrading fusion → GatedFusion "
+                        "(complementarity=%.3f — modalities likely conflict)",
+                        _complementarity,
+                    )
+
+            # Derive ULA latent_dim from alignment_strength
+            if schema_derived_fusion == "ula":
+                if _alignment > 0.7:
+                    _ula_latent_dim = 128
+                elif _alignment > 0.4:
+                    _ula_latent_dim = 256
+                else:
+                    _ula_latent_dim = 512
+                logger.info("Phase 4: ULA latent_dim=%d (alignment=%.3f)", _ula_latent_dim, _alignment)
+                self.state.set_slot("ula_latent_dim", _ula_latent_dim)
+            else:
+                _ula_latent_dim = 256  # default
+
+            logger.info(
+                "Phase 4: schema-derived fusion strategy = %s",
+                schema_derived_fusion,
+            )
+            self.state.set_slot("schema_derived_fusion", schema_derived_fusion)
+
+            # Respect user fusion overrides: if the user explicitly locked the
+            # fusion strategy via /override-fusion, honour that over any
+            # schema-derived routing. Otherwise apply schema intelligence.
+            ctx = self._get_ctx()
+            if ctx is not None:
+                ctx_fusion = getattr(ctx, "fusion_strategy", None)
+                ctx_locked = bool(getattr(ctx, "fusion_policy_locked", False))
+                ctx_source = getattr(ctx, "fusion_policy_source", "")
+                _is_user_override = ctx_locked and ctx_source == "user_override"
+                if ctx_fusion and _is_user_override:
+                    schema_derived_fusion = str(ctx_fusion)
+                    self.state.set_slot("schema_derived_fusion", schema_derived_fusion)
+                    logger.info(
+                        "Phase 4: user fusion override LOCKED to '%s' -- "
+                        "schema-derived routing suppressed",
+                        schema_derived_fusion,
+                    )
+                elif ctx_fusion and not _is_user_override:
+                    schema_derived_fusion = str(ctx_fusion)
+                    self.state.set_slot("schema_derived_fusion", schema_derived_fusion)
+                    logger.info(
+                        "Phase 4: ExecutionContext fusion applied: %s",
+                        schema_derived_fusion,
+                    )
+
+            # xs3_confidence_gap gate: ambiguous target -> restrict to tabular for safety
+            xs3_gap = 0.0
+            for ds in schema_info.get("per_dataset", []):
+                if not isinstance(ds, dict):
+                    continue
+                reasoning = ds.get("reasoning", {})
+                if isinstance(reasoning, dict):
+                    g = float(reasoning.get("xs3_confidence_gap", 0.0) or 0.0)
+                    xs3_gap = max(xs3_gap, g)
+
+            if xs3_gap < 0.15:
+                logger.warning(
+                    "Phase 4: xs3_confidence_gap=%.3f < 0.15 - "
+                    "target is ambiguous; restricting modalities to tabular.",
+                    xs3_gap,
+                )
+                self.config.modalities = ["tabular"]
+
             modalities: List[str] = schema_info.get(
                 "global_modalities", self.config.modalities
             )
+
+            if ctx is not None:
+                try:
+                    ctx_active = ctx.get_active_modalities()
+                except Exception:
+                    ctx_active = []
+                valid_modalities = [
+                    m for m in (ctx_active or []) if m in {"tabular", "text", "image"}
+                ]
+                if valid_modalities:
+                    modalities = valid_modalities
+                    self.config.modalities = list(valid_modalities)
+                    logger.info(
+                        "Phase 4: using ExecutionContext active modalities: %s",
+                        valid_modalities,
+                    )
+
+            if xs3_gap < 0.15:
+                modalities = ["tabular"]
             problem_type: str = schema_info.get(
                 "global_problem_type", self.config.problem_type
             )
@@ -1096,35 +2562,288 @@ class TrainingOrchestrator:
 
             # Estimate avg_tokens from column count (no materialisation needed)
             text_cols: List[str] = prep_info.get("text_columns", [])
+            image_cols: List[str] = prep_info.get("image_columns", [])
+            tabular_cols: List[str] = prep_info.get("tabular_columns", [])
             avg_tokens: int = 128  # conservative default; Phase 5 can override
+            if ctx is not None:
+                try:
+                    fi = dict(getattr(ctx, "feature_intelligence", {}) or {})
+                    text_lengths = [
+                        float(ds.get("avg_text_len"))
+                        for ds in fi.values()
+                        if isinstance(ds, dict) and isinstance(ds.get("avg_text_len"), (int, float))
+                    ]
+                    if text_lengths:
+                        approx_tokens = int(max(8, min(4096, round(max(text_lengths) / 4.0))))
+                        avg_tokens = approx_tokens
+                except Exception:
+                    pass
+
+            dataset_meta = {
+                "num_rows": int(dataset_size),
+                "num_cols": int(len(text_cols) + len(image_cols) + len(tabular_cols)),
+                "modalities": list(modalities),
+                "target_type": "regression" if "regression" in problem_type else "classification",
+            }
 
             logger.info(
                 "  modalities=%s  problem=%s  dataset_size=%d",
                 modalities, problem_type, dataset_size,
             )
 
+            latency_budget_ms = None
+            memory_budget_mb = None
+            if ctx is not None:
+                latency_budget_ms = getattr(ctx, "latency_budget_ms", None)
+                memory_budget_mb = getattr(ctx, "memory_budget_mb", None)
+                try:
+                    from core.orchestrator import orchestrator as _metadata_orchestrator
+                    _metadata_orchestrator.run_architecture_selection(ctx)
+                except Exception as arch_exc:
+                    logger.debug("Phase 4: architecture routing refresh skipped: %s", arch_exc)
+
             # ----------------------------------------------------------------
             # 2  Run AdvancedModelSelector
             # ----------------------------------------------------------------
             selector = AdvancedModelSelector()
-            result = selector.select_models(
+
+            def _name(catalogue: Dict[str, Dict[str, Any]], tier: Optional[str]) -> Optional[str]:
+                return catalogue[tier]["name"] if tier and tier in catalogue else None
+
+            def _tier_from_name(catalogue: Dict[str, Dict[str, Any]], encoder_name: Optional[str]) -> Optional[str]:
+                if not encoder_name:
+                    return None
+                target = str(encoder_name).strip().lower()
+                for tier_key, spec in catalogue.items():
+                    name = str(spec.get("name", "")).strip().lower()
+                    if name == target:
+                        return str(tier_key)
+                return None
+
+            def _extract_tabular_probe_arrays() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+                dataset_obj = self.train_torch_dataset or self.torch_dataset
+                if dataset_obj is None:
+                    return None, None
+
+                tab_block = getattr(dataset_obj, "_tabular_array", None)
+                targets = getattr(dataset_obj, "targets", None)
+                if tab_block is None or targets is None:
+                    return None, None
+
+                try:
+                    probe_x = (
+                        tab_block.detach().cpu().numpy()
+                        if hasattr(tab_block, "detach")
+                        else np.asarray(tab_block)
+                    )
+                    probe_y = (
+                        targets.detach().cpu().numpy()
+                        if hasattr(targets, "detach")
+                        else np.asarray(targets)
+                    )
+
+                    if probe_x.ndim == 1:
+                        probe_x = probe_x.reshape(-1, 1)
+
+                    n_rows = min(len(probe_x), len(probe_y))
+                    if n_rows <= 1:
+                        return None, None
+
+                    return probe_x[:n_rows], probe_y[:n_rows]
+                except Exception as probe_exc:
+                    logger.warning(
+                        "Phase 4: failed to materialise tabular probe arrays: %s",
+                        probe_exc,
+                    )
+                    return None, None
+
+            probe_x, probe_y = _extract_tabular_probe_arrays()
+            predictability_scores = None
+            if ctx is not None:
+                if hasattr(ctx, "get_effective_predictability_scores"):
+                    try:
+                        predictability_scores = dict(
+                            ctx.get_effective_predictability_scores()
+                        )
+                    except Exception:
+                        predictability_scores = None
+                if not predictability_scores:
+                    predictability_scores = dict(
+                        getattr(ctx, "predictability_scores", {}) or {}
+                    )
+            recommendations = selector.recommend_models(
                 problem_type=problem_type,
                 modalities=modalities,
                 dataset_size=dataset_size,
                 avg_tokens=avg_tokens,
+                tabular_X=probe_x,
+                tabular_y=probe_y,
+                latency_budget_ms=latency_budget_ms,
+                memory_budget_mb=memory_budget_mb,
+                predictability_scores=predictability_scores,
             )
+
+            if recommendations and isinstance(recommendations[0], dict):
+                best_model: Dict[str, Any] = dict(recommendations[0])
+            else:
+                # Defensive fallback: keep legacy selector path if API-style
+                # recommendations are unavailable for any reason.
+                result = selector.select_models(
+                    problem_type=problem_type,
+                    modalities=modalities,
+                    dataset_size=dataset_size,
+                    avg_tokens=avg_tokens,
+                    dataset_meta=dataset_meta,
+                    latency_budget_ms=latency_budget_ms,
+                    memory_budget_mb=memory_budget_mb,
+                    predictability_scores=predictability_scores,
+                )
+                best_model = {
+                    "name": selector._build_model_name(
+                        result.image_encoder,
+                        result.text_encoder,
+                        result.tabular_encoder,
+                    ),
+                    "image_encoder": _name(IMAGE_ENCODERS, result.image_encoder),
+                    "text_encoder": _name(TEXT_ENCODERS, result.text_encoder),
+                    "tabular_encoder": _name(TABULAR_ENCODERS, result.tabular_encoder),
+                    "fusion_strategy": result.fusion_strategy,
+                    "batch_size": result.batch_size,
+                    "hpo_space": dict(result.hpo_space),
+                    "rationale": dict(result.rationale),
+                    "hardware_info": dict(result.hardware_info),
+                    "meta_context": list(result.meta_context),
+                    "eligible_modalities": list(result.eligible_modalities),
+                    "excluded_modalities": dict(result.excluded_modalities),
+                    "tier": "primary",
+                }
+                recommendations = [best_model]
+
+            # Keep schema-derived/context-derived fusion as final authority.
+            resolved_fusion = schema_derived_fusion or best_model.get("fusion_strategy")
+            if resolved_fusion:
+                best_model["fusion_strategy"] = str(resolved_fusion)
+
+            # Normalize probe diagnostics into the same fields used by the API
+            # /select-model contract.
+            tabular_probe_scores = best_model.get("tabular_probe_scores")
+            if not tabular_probe_scores:
+                tabular_probe_scores = (
+                    (best_model.get("probe_scores") or {}).get("tabular")
+                )
+            if isinstance(tabular_probe_scores, dict) and tabular_probe_scores:
+                score_map: Dict[str, float] = {
+                    model_name: float(details.get("val_score", 0.0) or 0.0)
+                    for model_name, details in tabular_probe_scores.items()
+                    if isinstance(details, dict)
+                }
+                top_probe_model = max(score_map, key=score_map.get) if score_map else None
+                top_probe_score = float(score_map[top_probe_model]) if top_probe_model else None
+
+                if top_probe_model is not None:
+                    best_model.setdefault("tabular_probe_top_model", str(top_probe_model))
+                if isinstance(top_probe_score, (int, float)):
+                    best_model.setdefault("quick_probe_score", float(top_probe_score))
+                    best_model.setdefault("probe_score", float(top_probe_score))
+
+                complexity = None
+                confidence = None
+                if probe_x is not None and probe_y is not None:
+                    try:
+                        from automl.candidate_selector import CandidateSelector
+
+                        _probe_selector = CandidateSelector()
+                        probe_y_arr = np.asarray(probe_y)
+                        if probe_y_arr.ndim > 1 and probe_y_arr.shape[1] > 1:
+                            probe_y_norm = np.argmax(probe_y_arr, axis=1)
+                        else:
+                            probe_y_flat = probe_y_arr.ravel()
+                            if probe_y_flat.dtype.kind in ("U", "S", "O"):
+                                probe_y_norm = pd.factorize(probe_y_flat)[0]
+                            else:
+                                try:
+                                    probe_y_norm = probe_y_flat.astype(int)
+                                except Exception:
+                                    probe_y_norm = pd.factorize(probe_y_flat)[0]
+
+                        complexity = _probe_selector.compute_data_complexity(
+                            np.asarray(probe_x),
+                            np.asarray(probe_y_norm),
+                        )
+                        confidence = _probe_selector.compute_selection_confidence(score_map)
+                    except Exception as probe_meta_exc:
+                        logger.debug(
+                            "Phase 4: probe metadata computation skipped: %s",
+                            probe_meta_exc,
+                        )
+
+                selection_metadata = dict(best_model.get("selection_metadata") or {})
+                selection_metadata.update({
+                    "probe_method": "tabular_3fold_cv",
+                    "top_probe_model": top_probe_model,
+                    "top_probe_score": top_probe_score,
+                    "probe_scores": tabular_probe_scores,
+                    "data_complexity": complexity,
+                    "selection_confidence": (
+                        round(float(confidence), 4)
+                        if isinstance(confidence, (int, float))
+                        else None
+                    ),
+                })
+                best_model["selection_metadata"] = selection_metadata
+                best_model["probe_scores"] = {"tabular": tabular_probe_scores}
+                existing_ranked_tabular = (
+                    (best_model.get("ranked_candidates") or {}).get("tabular")
+                )
+                if isinstance(existing_ranked_tabular, list) and existing_ranked_tabular:
+                    best_model["ranked_candidates"] = {
+                        "tabular": list(existing_ranked_tabular)
+                    }
+                else:
+                    best_model["ranked_candidates"] = {
+                        "tabular": sorted(
+                            [
+                                {
+                                    "name": model_name,
+                                    "val_score": float(details.get("val_score", 0.0) or 0.0),
+                                    "latency_ms": float(details.get("latency_ms", 0.0) or 0.0),
+                                    "uncertainty": float(details.get("uncertainty", 0.0) or 0.0),
+                                    "confidence": details.get("confidence"),
+                                }
+                                for model_name, details in tabular_probe_scores.items()
+                                if isinstance(details, dict)
+                            ],
+                            key=lambda row: row.get("val_score", 0.0),
+                            reverse=True,
+                        )
+                    }
+
+            best_model["selection_contract_version"] = "model_selection.v2"
+            recommendations[0] = best_model
+
+            best_hpo_space: Dict[str, Any] = dict(best_model.get("hpo_space") or {})
+            batch_size = int(best_model.get("batch_size") or 16)
+            meta_context = list(best_model.get("meta_context") or [])
+
+            img_name = best_model.get("image_encoder")
+            txt_name = best_model.get("text_encoder")
+            tab_name = best_model.get("tabular_encoder")
+
+            img_tier = _tier_from_name(IMAGE_ENCODERS, img_name)
+            txt_tier = _tier_from_name(TEXT_ENCODERS, txt_name)
+            tab_tier = _tier_from_name(TABULAR_ENCODERS, tab_name)
 
             # ----------------------------------------------------------------
             # 3  Derive phase-5-compatible scalar defaults from HPO space
             #    (midpoint of epoch range; geometric mean of LR range)
             # ----------------------------------------------------------------
-            epoch_space = result.hpo_space.get("epochs", {})
+            epoch_space = best_hpo_space.get("epochs", {})
             epoch_default: int = (
                 (epoch_space.get("low", 10) + epoch_space.get("high", 10)) // 2
                 if epoch_space else 10
             )
 
-            lr_space = result.hpo_space.get("learning_rate", {})
+            lr_space = best_hpo_space.get("learning_rate", {})
             import math
             lr_default: float = (
                 math.sqrt(lr_space.get("low", 1e-4) * lr_space.get("high", 1e-3))
@@ -1134,18 +2853,12 @@ class TrainingOrchestrator:
             # ----------------------------------------------------------------
             # 4  Resolve human-readable encoder names for logging
             # ----------------------------------------------------------------
-            def _name(catalogue: Dict, tier: Optional[str]) -> Optional[str]:
-                return catalogue[tier]["name"] if tier and tier in catalogue else None
-
-            img_name = _name(IMAGE_ENCODERS,  result.image_encoder)
-            txt_name = _name(TEXT_ENCODERS,   result.text_encoder)
-            tab_name = _name(TABULAR_ENCODERS, result.tabular_encoder)
-
-            logger.info("  Image encoder   : %s (%s)", img_name, result.image_encoder)
-            logger.info("  Text encoder    : %s (%s)", txt_name, result.text_encoder)
-            logger.info("  Tabular encoder : %s (%s)", tab_name, result.tabular_encoder)
-            logger.info("  Fusion strategy : %s", result.fusion_strategy)
-            logger.info("  Batch size      : %d  (PDF heuristic, not tuned)", result.batch_size)
+            logger.info("  Image encoder   : %s (%s)", img_name, img_tier or "name-based")
+            logger.info("  Text encoder    : %s (%s)", txt_name, txt_tier or "name-based")
+            logger.info("  Tabular encoder : %s (%s)", tab_name, tab_tier or "name-based")
+            logger.info("  Fusion strategy : %s", best_model.get("fusion_strategy"))
+            logger.info("  Batch size      : %d  (PDF heuristic, not tuned)", batch_size)
+            logger.info("  Meta priors     : %d similar experiments", len(meta_context))
             logger.info(
                 "  Epoch range     : [%d, %d]  → default %d",
                 epoch_space.get("low", "?"), epoch_space.get("high", "?"), epoch_default,
@@ -1156,32 +2869,80 @@ class TrainingOrchestrator:
             # ----------------------------------------------------------------
             elapsed = time.time() - phase_start
             phase_result: Dict[str, Any] = {
-                "image_encoder":   result.image_encoder,
-                "text_encoder":    result.text_encoder,
-                "tabular_encoder": result.tabular_encoder,
+                "selection_contract_version": "model_selection.v2",
+                "selected_model": best_model.get("name"),
+                "recommended_models": recommendations,
+                "best_model": best_model,
+                "image_encoder":   img_tier or img_name,
+                "text_encoder":    txt_tier or txt_name,
+                "tabular_encoder": tab_tier or tab_name,
                 "image_encoder_name":   img_name,
                 "text_encoder_name":    txt_name,
                 "tabular_encoder_name": tab_name,
-                "fusion_strategy": result.fusion_strategy,
-                "batch_size":      result.batch_size,
+                "fusion_strategy": best_model.get("fusion_strategy"),
+                "schema_derived_fusion": schema_derived_fusion,
+                "batch_size":      batch_size,
                 # Scalar defaults used by Phase 5 before HPO narrows them:
                 "epochs":          epoch_default,
                 "learning_rate":   lr_default,
                 # Full Optuna search bounds:
-                "hpo_space":       result.hpo_space,
-                "rationale":       result.rationale,
-                "hardware_info":   result.hardware_info,
+                "hpo_space":       best_hpo_space,
+                "rationale":       best_model.get("rationale", {}),
+                "hardware_info":   best_model.get("hardware_info", {}),
+                "dataset_meta":    dataset_meta,
+                "meta_context":    meta_context,
+                "eligible_modalities": list(best_model.get("eligible_modalities") or modalities),
+                "excluded_modalities": dict(best_model.get("excluded_modalities") or {}),
+                "probe_score": best_model.get("probe_score"),
+                "probe_scores": dict(best_model.get("probe_scores") or {}),
+                "selection_metadata": dict(best_model.get("selection_metadata") or {}),
+                "ranked_candidates": dict(best_model.get("ranked_candidates") or {}),
                 "duration_seconds": elapsed,
             }
 
+            if ctx is not None:
+                _ctx_ranked = getattr(ctx, "ranked_candidates", None)
+                if _ctx_ranked:
+                    phase_result["ranked_candidates_from_ctx"] = _ctx_ranked
+
+                if meta_context:
+                    first_similar = meta_context[0]
+                    warm_params = first_similar.get("best_params") if isinstance(first_similar, dict) else None
+                    if isinstance(warm_params, dict) and warm_params:
+                        ctx.warm_start_params = dict(warm_params)
+                        logger.info(
+                            "Phase 4: warm_start_params populated from meta-learning (%d keys)",
+                            len(ctx.warm_start_params),
+                        )
+
+                try:
+                    if not getattr(ctx, "fusion_strategy", None):
+                        ctx.update_fusion(phase_result["fusion_strategy"], {})
+                    if not getattr(ctx, "model_choices", None):
+                        ctx.update_model_selection(
+                            recommendations,
+                            "Phase 4 orchestrator selection",
+                        )
+                    ctx.selected_model = best_model.get("name")
+                    if phase_result.get("probe_scores"):
+                        ctx.probe_scores_cache = dict(phase_result["probe_scores"])
+                    if phase_result.get("ranked_candidates"):
+                        ctx.ranked_candidates = dict(phase_result["ranked_candidates"])
+                except Exception as ctx_exc:
+                    logger.debug("Phase 4: context update skipped: %s", ctx_exc)
+
             logger.info("\nPhase 4 Summary:")
-            logger.info("  Batch size    : %d", result.batch_size)
+            logger.info("  Selected model: %s", best_model.get("name", "N/A"))
+            logger.info("  Batch size    : %d", batch_size)
             logger.info("  Epoch default : %d (HPO will tune in range)", epoch_default)
             logger.info("  LR default    : %.2e (HPO will tune in range)", lr_default)
-            logger.info("  HPO params    : %d", len(result.hpo_space))
+            logger.info("  HPO params    : %d", len(best_hpo_space))
             logger.info("  Duration      : %.2fs", elapsed)
 
             self.phase_results[Phase.MODEL_SELECTION] = phase_result
+            self.state.set_slot("phase4_model_selection", phase_result)
+            self.state.set_phase_timing("MODEL_SELECTION", elapsed)
+            self._record_phase_timing_in_context("MODEL_SELECTION", elapsed)
             self.current_phase = Phase.TRAINING
 
         except Exception as exc:
@@ -1189,6 +2950,7 @@ class TrainingOrchestrator:
             raise
     
     def _execute_phase_5_training(self, hp_overrides: Optional[Dict[str, Any]] = None,
+                                    early_stop_patience: int = 5,
                                     progress_callback: Optional[Any] = None) -> None:
         """
         Phase 5: GPU Training – Optuna HPO study with MLflow tracking.
@@ -1224,10 +2986,17 @@ class TrainingOrchestrator:
         logger.info("PHASE 5: GPU TRAINING (Optuna + MLflow + Lightning)")
         logger.info("=" * 80)
 
-        N_TRIALS: int = 3       # keep low for interactive use; raise for production
+        self._enforce_session_context("Phase 5")
+        self._filter_to_primary_dataset()   # G14: restrict to primary when datasets incompatible
+        self._filter_modalities_by_drift()  # drop modalities degraded by drift feedback
+
+        # Default: 30 trials — enough for meaningful HPO.
+        # Set APEX_N_TRIALS=3 for fast interactive runs or APEX_N_TRIALS=200 for production.
+        # When hp_overrides are provided, always single trial (no HPO needed).
+        import os as _os_hpo
+        N_TRIALS: int = int(_os_hpo.environ.get("APEX_N_TRIALS", "30"))
         VAL_SPLIT: float = 0.2
 
-        # When hp_overrides are provided, skip HPO and do a single run
         if hp_overrides:
             N_TRIALS = 1
             logger.info("  HP overrides provided – skipping HPO, single run with: %s", hp_overrides)
@@ -1310,9 +3079,22 @@ class TrainingOrchestrator:
             # Preserves class balance in both train and val subsets.
             all_indices = list(range(n_total))
             _use_stratify = problem_type.startswith("classification") or problem_type == "multilabel_classification"
+            _use_stratified_kfold = False
+            ctx = self._get_ctx()  # may be None for standalone runs
+            if _use_stratify and ctx is not None:
+                try:
+                    for _ds_intel in dict(getattr(ctx, "feature_intelligence", {}) or {}).values():
+                        if not isinstance(_ds_intel, dict):
+                            continue
+                        long_tail_cats = [str(v) for v in list(_ds_intel.get("long_tail_cats", []) or [])]
+                        if target_col and str(target_col) in long_tail_cats:
+                            _use_stratified_kfold = True
+                            break
+                except Exception:
+                    _use_stratified_kfold = False
             if _use_stratify:
                 try:
-                    from sklearn.model_selection import train_test_split as _split
+                    from sklearn.model_selection import StratifiedKFold, train_test_split as _split
                     # Extract target labels for stratification
                     _targets_for_strat = []
                     for _idx in range(n_total):
@@ -1324,13 +3106,32 @@ class TrainingOrchestrator:
                             _targets_for_strat.append(int(_t.argmax()))
                         else:
                             _targets_for_strat.append(_t)
-                    train_indices, val_indices = _split(
-                        all_indices,
-                        test_size=VAL_SPLIT,
-                        random_state=self.config.seed,
-                        stratify=_targets_for_strat,
-                    )
-                    logger.info("  Stratified split: train=%d  val=%d", len(train_indices), len(val_indices))
+                    if _use_stratified_kfold:
+                        n_splits = max(3, int(round(1.0 / max(VAL_SPLIT, 1e-6))))
+                        n_splits = min(n_splits, max(2, len(set(_targets_for_strat))))
+                        splitter = StratifiedKFold(
+                            n_splits=n_splits,
+                            shuffle=True,
+                            random_state=self.config.seed,
+                        )
+                        train_indices, val_indices = next(
+                            splitter.split(np.zeros(n_total), _targets_for_strat)
+                        )
+                        train_indices = list(train_indices)
+                        val_indices = list(val_indices)
+                        logger.info(
+                            "  StratifiedKFold split (long-tail target): train=%d  val=%d",
+                            len(train_indices),
+                            len(val_indices),
+                        )
+                    else:
+                        train_indices, val_indices = _split(
+                            all_indices,
+                            test_size=VAL_SPLIT,
+                            random_state=self.config.seed,
+                            stratify=_targets_for_strat,
+                        )
+                        logger.info("  Stratified split: train=%d  val=%d", len(train_indices), len(val_indices))
                 except Exception as strat_exc:
                     logger.warning(
                         "  Stratified split failed (%s), falling back to random split",
@@ -1360,8 +3161,12 @@ class TrainingOrchestrator:
             if progress_callback is not None:
                 progress_callback.set_data_split(n_train, n_val, n_total)
 
+            # Resolve execution context for class-weight / encoder-plan reads
+            ctx = self._get_ctx()
+
             # ── Compute class weights for imbalanced classification ──────
             _class_weights: Optional[torch.Tensor] = None
+            _use_focal_loss: bool = False
             if (problem_type.startswith("classification")
                     and problem_type != "multilabel_classification"):
                 try:
@@ -1371,16 +3176,150 @@ class TrainingOrchestrator:
                     _unique_classes = np.sort(np.unique(_train_labels))
                     _raw_weights = _ccw("balanced", classes=_unique_classes, y=_train_labels)
                     _class_weights = torch.tensor(_raw_weights, dtype=torch.float32)
+                    # Activate Focal Loss when imbalance ratio > 3:1 [Lin et al. ICCV 2017]
+                    _imbalance_ratio = float(_raw_weights.max() / max(_raw_weights.min(), 1e-8))
+                    _use_focal_loss = _imbalance_ratio > 3.0
                     logger.info(
-                        "  Class weights (balanced): %s",
+                        "  Class weights (balanced): %s  imbalance_ratio=%.2f  focal_loss=%s",
                         {int(c): round(float(w), 3) for c, w in zip(_unique_classes, _raw_weights)},
+                        _imbalance_ratio,
+                        _use_focal_loss,
                     )
                 except Exception as cw_exc:
                     logger.warning("  Class weight computation failed: %s", cw_exc)
 
+            # ── Label noise detection ─────────────────────────────────────
+            _noise_sample_weights: Optional[np.ndarray] = None
+            try:
+                from pipeline.label_noise_detector import LabelNoiseDetector
+                _tabular_prep = self.fitted_transformers.get("tabular")
+                if (
+                    _tabular_prep is not None
+                    and problem_type.startswith("classification")
+                    and hasattr(_aug_ds, "targets")
+                ):
+                    _all_targets = _aug_ds.targets.numpy()
+                    _X_tab_full = None
+                    try:
+                        _X_tab_full = _tabular_prep.transform(
+                            getattr(_aug_ds, "df", None)
+                        )
+                    except Exception:
+                        pass
+
+                    if _X_tab_full is not None and len(_X_tab_full) == n_total:
+                        _noise_detector = LabelNoiseDetector(
+                            n_folds=5,
+                            noise_threshold=0.8,
+                            min_samples_to_run=200,
+                            weight_floor=0.2,
+                        )
+                        _noise_result = _noise_detector.detect(
+                            _X_tab_full,
+                            _all_targets,
+                            problem_type=problem_type,
+                        )
+                        if not _noise_result["skipped"] and _noise_result["n_suspicious"] > 0:
+                            _noise_sample_weights = _noise_result["sample_weights"]
+                            if ctx is not None and hasattr(ctx, "__setattr__"):
+                                ctx.suspicious_label_indices = _noise_result["suspicious_indices"]
+                            logger.info(
+                                "  Label noise: %d/%d samples down-weighted (w=%.2f)",
+                                _noise_result["n_suspicious"], n_total, 0.2,
+                            )
+            except Exception as _lnd_exc:
+                logger.debug("Label noise detection failed (non-fatal): %s", _lnd_exc)
+
             model_sel: Dict[str, Any] = self.phase_results.get(Phase.MODEL_SELECTION, {})
             batch_size: int = model_sel.get("batch_size", 32)
             hpo_space: Dict[str, Any] = model_sel.get("hpo_space", {})
+            preprocessing_plan = self.state.get_slot("preprocessing_plan", {})
+            encoder_plan = preprocessing_plan.get("encoder_config", {}) if isinstance(preprocessing_plan, dict) else {}
+            ctx_encoder_plan: Dict[str, Any] = {}
+            if ctx is not None:
+                ctx_encoder_plan = dict(getattr(ctx, "encoder_plan", {}) or {})
+            if ctx_encoder_plan:
+                encoder_plan = {
+                    **dict(encoder_plan or {}),
+                    **{
+                        modality: {
+                            **dict((encoder_plan or {}).get(modality, {}) or {}),
+                            "preferred_model": value,
+                        }
+                        for modality, value in ctx_encoder_plan.items()
+                    },
+                }
+
+            mean_uncertainty: float = 0.0
+            if ctx is not None:
+                try:
+                    uncertainty_vals: List[float] = []
+                    for _ds_intel in dict(getattr(ctx, "feature_intelligence", {}) or {}).values():
+                        if not isinstance(_ds_intel, dict):
+                            continue
+                        uncertainty_vals.extend(
+                            float(v)
+                            for v in dict(_ds_intel.get("uncertainty_summary", {}) or {}).values()
+                            if isinstance(v, (int, float))
+                        )
+                    if uncertainty_vals:
+                        mean_uncertainty = sum(uncertainty_vals) / len(uncertainty_vals)
+                except Exception:
+                    mean_uncertainty = 0.0
+
+            context_dropout_floor = 0.0
+            if ctx is not None:
+                try:
+                    context_dropout_floor = float(
+                        dict(getattr(ctx, "constraints", {}) or {}).get("dropout_floor", 0.0) or 0.0
+                    )
+                except Exception:
+                    context_dropout_floor = 0.0
+
+            hpo_space = self.optuna_adaptive.adapt_search_space(
+                base_space=hpo_space,
+                dataset_size=n_total,
+                modalities=schema_info.get("global_modalities", self.config.modalities),
+                problem_type=problem_type,
+            )
+
+            # Merge modality-specific Optuna bounds from feature_intelligence
+            try:
+                from config.hyperparameters import get_modality_optuna_distributions
+                _active_mods = schema_info.get("global_modalities", self.config.modalities) or []
+                _fi = getattr(self.execution_context, "feature_intelligence", None) or {}
+                _n_tabular = int(schema_info.get("total_feature_count", 0) or 0)
+                _avg_text_len: float = 0.0
+                for _ds_intel in _fi.values():
+                    _tl = _ds_intel.get("avg_text_len")
+                    if _tl:
+                        _avg_text_len = max(_avg_text_len, float(_tl))
+                _modality_dists = get_modality_optuna_distributions(
+                    active_modalities=list(_active_mods),
+                    n_tabular_features=_n_tabular,
+                    avg_text_len=_avg_text_len,
+                    problem_type=problem_type,
+                )
+                # Merge: modality-specific bounds override the static adapt_search_space output
+                for _param, _dist in _modality_dists.items():
+                    if _param in hpo_space:
+                        hpo_space[_param] = {**hpo_space[_param], **_dist}
+                    else:
+                        hpo_space[_param] = _dist
+                logger.info(
+                    "  Modality-specific HPO bounds applied: mods=%s, "
+                    "n_tabular=%d, avg_text_len=%.1f",
+                    list(_active_mods), _n_tabular, _avg_text_len,
+                )
+            except Exception as _hpo_exc:
+                logger.debug("Modality-specific HPO merge failed (non-fatal): %s", _hpo_exc)
+
+            if not hp_overrides:
+                N_TRIALS = self.optuna_adaptive.suggest_trial_count(
+                    dataset_size=n_total,
+                    gpu_available=(self.device.type == "cuda"),
+                )
+                logger.info("  Adaptive HPO policy: trials=%d", N_TRIALS)
 
             # Allow hp_overrides to change batch_size and fusion_strategy
             if hp_overrides:
@@ -1442,17 +3381,84 @@ class TrainingOrchestrator:
                 safety_margin=0.85,
                 batch_size=batch_size,
             )
+            _preferred_tabular = (
+                model_sel.get("tabular_probe_top_model")
+                or model_sel.get("tabular_encoder_name")
+                or model_sel.get("tabular_encoder")
+            )
+            _preferred_text = None
+            _preferred_image = None
+            if isinstance(encoder_plan, dict):
+                _preferred_text = (
+                    dict(encoder_plan.get("text", {}) or {}).get("preferred_model")
+                    or dict(encoder_plan.get("text", {}) or {}).get("model_name")
+                )
+                _preferred_image = (
+                    dict(encoder_plan.get("image", {}) or {}).get("preferred_model")
+                )
+
+            # Apply user encoder overrides from context (set via /encoder-overrides UI)
+            # Stored inside encoder_plan["_encoder_overrides"] for persistence
+            _ctx_for_enc = self._get_ctx()
+            _enc_plan = dict(getattr(_ctx_for_enc, "encoder_plan", {}) or {})
+            _enc_overrides = dict(_enc_plan.get("_encoder_overrides", {}) or {})
+            if _enc_overrides:
+                _preferred_image  = _enc_overrides.get("preferred_image_encoder") or _preferred_image
+                _preferred_text   = _enc_overrides.get("preferred_text_encoder")  or _preferred_text
+                _preferred_tabular= _enc_overrides.get("preferred_tabular_encoder") or _preferred_tabular
+                logger.info("Phase 5: user encoder overrides applied: %s", _enc_overrides)
+            # Read schema-derived output dims from ExecutionContext so the JIT
+            # selector can pick an encoder whose output_dim matches the head.
+            _ctx_enc_dims = {}
+            try:
+                _ctx_enc_dims = dict(getattr(self._get_ctx(), "encoder_output_dims", {}) or {})
+            except Exception:
+                pass
+
             _jit_result = _jit_selector.select(
                 modalities=schema_info.get("global_modalities", self.config.modalities),
                 device=self.device if self.device.type == "cuda" else None,
+                preferred_tabular=_preferred_tabular,
+                preferred_text=_preferred_text,
+                preferred_image=_preferred_image,
             )
+
+            # Apply ctx encoder_output_dims as output-dim overrides when the
+            # selected encoder supports runtime reconfiguration.
+            for _mod, _dim in _ctx_enc_dims.items():
+                try:
+                    enc = getattr(_jit_result, f"{_mod}_encoder", None)
+                    if enc is not None and hasattr(enc, "output_dim"):
+                        enc.output_dim = int(_dim)
+                except Exception:
+                    pass
 
             _image_encoder = _jit_result.image_encoder
             _text_encoder = _jit_result.text_encoder
 
-            # Update input_dims from the selected encoder's actual output
+            if _text_encoder is not None:
+                _text_plan = dict(encoder_plan.get("text", {}))
+                if "text_max_length" in _text_plan and "max_length" not in _text_plan:
+                    _text_plan["max_length"] = _text_plan["text_max_length"]
+                try:
+                    _text_encoder.configure(_text_plan)
+                except Exception as cfg_exc:
+                    logger.debug("  Text encoder configure failed: %s", cfg_exc)
+            if _image_encoder is not None:
+                _image_plan = dict(encoder_plan.get("image", {}))
+                if "freeze_image_backbone" in _image_plan and "freeze_backbone" not in _image_plan:
+                    _image_plan["freeze_backbone"] = _image_plan["freeze_image_backbone"]
+                try:
+                    _image_encoder.configure(_image_plan)
+                except Exception as cfg_exc:
+                    logger.debug("  Image encoder configure failed: %s", cfg_exc)
+
+            # Update input_dims from selected encoders' actual output dims
             if _text_encoder is not None and hasattr(_text_encoder, "get_output_dim"):
                 input_dims["text_pooled"] = _text_encoder.get_output_dim()
+            if _image_encoder is not None and hasattr(_image_encoder, "get_output_dim"):
+                input_dims["image_pooled"] = _image_encoder.get_output_dim()
+                logger.info("  input_dims['image_pooled'] updated to %d from encoder", input_dims["image_pooled"])
 
             # Log selection results
             logger.info(
@@ -1494,27 +3500,91 @@ class TrainingOrchestrator:
             # Text embeddings are deterministic (no augmentation) so we cache
             # for both train and val splits.  Image embeddings are cached for
             # val only because training images go through random augmentation.
+            dataset_fingerprint = {
+                "sources": sorted(self.config.dataset_sources),
+                "problem_type": problem_type,
+                "modalities": sorted(schema_info.get("global_modalities", self.config.modalities)),
+                "rows": n_total,
+                "seed": self.config.seed,
+            }
+
+            _ctx_for_cache = self._get_ctx()
+            if _ctx_for_cache is not None:
+                _scores = dict(getattr(_ctx_for_cache, "predictability_scores", {}) or {})
+                _priority_map: Dict[str, float] = {}
+                for key, score in _scores.items():
+                    try:
+                        score_val = float(score)
+                    except Exception:
+                        continue
+                    key_lower = str(key).lower()
+                    if "image" in key_lower:
+                        _priority_map["image"] = score_val
+                    elif "text" in key_lower:
+                        _priority_map["text"] = score_val
+                    elif "tabular" in key_lower:
+                        _priority_map["tabular"] = score_val
+                if _priority_map:
+                    self.embedding_cache.set_modality_priorities(_priority_map)
+
             if _text_encoder is not None and hasattr(_aug_ds, '_text_cols') and _aug_ds._text_cols:
-                logger.info("  Pre-computing text embeddings (%d samples)...", n_total)
-                _precomputed_text = _precompute_text_embeddings(
-                    _clean_ds, _text_encoder, self.device, batch_size=batch_size,
-                )
+                text_cache_key = self.embedding_cache.build_key({
+                    **dataset_fingerprint,
+                    "modality": "text",
+                    "encoder": _jit_result.text_encoder_name,
+                    "max_length": getattr(_text_encoder, "max_length", 128),
+                })
+                _precomputed_text = self.embedding_cache.get(text_cache_key)
+                if _precomputed_text is None or _precomputed_text.shape[0] != n_total:
+                    logger.info("  Pre-computing text embeddings (%d samples)...", n_total)
+                    _precomputed_text = _precompute_text_embeddings(
+                        _clean_ds, _text_encoder, self.device, batch_size=batch_size,
+                    )
+                    self.embedding_cache.set(
+                        text_cache_key,
+                        _precomputed_text,
+                        meta={"modality": "text", "rows": n_total},
+                    )
+                else:
+                    logger.info("  Loaded text embeddings from cache: shape=%s", list(_precomputed_text.shape))
+
                 _aug_ds._precomputed_text = _precomputed_text
                 _clean_ds._precomputed_text = _precomputed_text
-                logger.info("  Text embeddings cached: shape=%s", list(_precomputed_text.shape))
+                logger.info("  Text embeddings ready: shape=%s", list(_precomputed_text.shape))
             else:
                 _precomputed_text = None
 
             if _image_encoder is not None and hasattr(_clean_ds, '_image_cols') and _clean_ds._image_cols:
-                logger.info("  Pre-computing image embeddings for val (%d samples)...", n_total)
-                _precomputed_image_val = _precompute_image_embeddings(
-                    _clean_ds, _image_encoder, self.device, batch_size=batch_size,
-                )
+                image_cache_key = self.embedding_cache.build_key({
+                    **dataset_fingerprint,
+                    "modality": "image_val",
+                    "encoder": _jit_result.image_encoder_name,
+                    "split": "val_clean",
+                })
+                _precomputed_image_val = self.embedding_cache.get(image_cache_key)
+                if _precomputed_image_val is None or _precomputed_image_val.shape[0] != n_total:
+                    logger.info("  Pre-computing image embeddings for val (%d samples)...", n_total)
+                    _precomputed_image_val = _precompute_image_embeddings(
+                        _clean_ds, _image_encoder, self.device, batch_size=batch_size,
+                    )
+                    self.embedding_cache.set(
+                        image_cache_key,
+                        _precomputed_image_val,
+                        meta={"modality": "image_val", "rows": n_total},
+                    )
+                else:
+                    logger.info(
+                        "  Loaded image-val embeddings from cache: shape=%s",
+                        list(_precomputed_image_val.shape),
+                    )
+
                 # Train images: NOT cached (random augmentation must be preserved)
                 _aug_ds._precomputed_image = None
                 # Val images: cached (deterministic preprocessing only)
                 _clean_ds._precomputed_image = _precomputed_image_val
-                logger.info("  Image embeddings cached (val only): shape=%s", list(_precomputed_image_val.shape))
+                logger.info("  Image embeddings ready (val only): shape=%s", list(_precomputed_image_val.shape))
+            else:
+                _precomputed_image_val = None
 
             def _sample(trial: optuna.Trial, key: str, default: Any) -> Any:
                 """Sample a value from hpo_space or return the default."""
@@ -1533,11 +3603,39 @@ class TrainingOrchestrator:
                     return trial.suggest_categorical(key, spec["choices"])
                 return default
 
+            def _calibration_proxy_from_gap(gap: Any) -> Optional[float]:
+                try:
+                    gap_value = float(gap)
+                except Exception:
+                    return None
+                proxy = 1.0 - (abs(gap_value) / (1.0 + abs(gap_value)))
+                return round(max(0.0, min(1.0, proxy)), 6)
+
+            def _adaptive_penalty_from_diag(diag: Dict[str, Any]) -> float:
+                dynamic = dict(diag.get("dynamic_factors", {}) or {})
+                penalties: List[float] = []
+                for value in dynamic.values():
+                    try:
+                        penalties.append(max(0.0, float(value) - 1.0))
+                    except Exception:
+                        continue
+
+                dynamic_penalty = sum(penalties) / max(1, len(penalties)) if penalties else 0.0
+                try:
+                    gap = abs(float(diag.get("generalization_gap", 0.0) or 0.0))
+                except Exception:
+                    gap = 0.0
+                gap_penalty = gap / (1.0 + gap)
+                return round(min(0.8, dynamic_penalty + 0.30 * gap_penalty), 6)
+
             # Mutable containers capture the best trained LightningModule
             # inside the closure without needing 'nonlocal' on a scalar.
             _best_val: List[float] = [float("inf")]
             _best_module_ref: List[Any] = []
             _best_metrics: Dict[str, float] = {"val_acc": 0.0, "val_f1": 0.0, "train_acc": 0.0}
+            adaptive_feedback_state: Dict[str, Any] = {}
+            adaptive_trial_overrides: Dict[str, Any] = {}
+            trial_feedback_events: List[Dict[str, Any]] = []
 
             def objective(trial: optuna.Trial) -> float:
                 # Report trial number to progress callback
@@ -1549,14 +3647,175 @@ class TrainingOrchestrator:
                     trial_lr      = hp_overrides.get("learning_rate", model_sel.get("learning_rate", 1e-3))
                     trial_wd      = hp_overrides.get("weight_decay", 1e-5)
                     trial_dropout = hp_overrides.get("dropout", 0.1)
+                    trial_label_smoothing = hp_overrides.get("label_smoothing", 0.0)
                     trial_epochs  = hp_overrides.get("epochs", model_sel.get("epochs", 10))
                     trial_fusion  = hp_overrides.get("fusion_strategy", model_sel.get("fusion_strategy", "concatenation"))
+                    trial_alignment = hp_overrides.get("alignment_weight", 0.0)
+                    trial_modality_dropout = hp_overrides.get("modality_dropout_prob", 0.15)
+                    trial_graph_sparsity = hp_overrides.get("graph_sparsity_weight", 0.005)
+                    trial_diversity_weight = hp_overrides.get("diversity_loss_weight", 0.01)
+                    trial_uncertainty_aux = hp_overrides.get("uncertainty_aux_weight", 0.0)
+                    trial_graph_branch_weight = hp_overrides.get("uncertainty_graph_weight", 0.5)
+                    trial_uncertainty_branch_weight = hp_overrides.get(
+                        "uncertainty_branch_weight",
+                        max(0.0, 1.0 - float(trial_graph_branch_weight)),
+                    )
                 else:
                     trial_lr      = _sample(trial, "learning_rate", model_sel.get("learning_rate", 1e-3))
                     trial_wd      = _sample(trial, "weight_decay",  1e-5)
                     trial_dropout = _sample(trial, "dropout",       0.1)
+                    trial_label_smoothing = 0.0
                     trial_epochs  = _sample(trial, "epochs",        model_sel.get("epochs", 10))
                     trial_fusion  = _sample(trial, "fusion_strategy", model_sel.get("fusion_strategy", "concatenation"))
+                    trial_alignment = _sample(trial, "alignment_weight", 0.0)
+                    trial_modality_dropout = _sample(trial, "modality_dropout_prob", 0.15)
+                    trial_graph_sparsity = _sample(trial, "graph_sparsity_weight", 0.005)
+                    trial_diversity_weight = _sample(trial, "diversity_loss_weight", 0.01)
+                    trial_uncertainty_aux = _sample(trial, "uncertainty_aux_weight", 0.0)
+                    trial_graph_branch_weight = _sample(trial, "uncertainty_graph_weight", 0.5)
+                    trial_uncertainty_branch_weight = _sample(
+                        trial,
+                        "uncertainty_branch_weight",
+                        max(0.0, 1.0 - float(trial_graph_branch_weight)),
+                    )
+
+                if not hp_overrides and adaptive_trial_overrides:
+                    if "learning_rate" in adaptive_trial_overrides:
+                        trial_lr = float(adaptive_trial_overrides["learning_rate"])
+                    if "weight_decay" in adaptive_trial_overrides:
+                        trial_wd = float(adaptive_trial_overrides["weight_decay"])
+                    if "dropout" in adaptive_trial_overrides:
+                        trial_dropout = float(adaptive_trial_overrides["dropout"])
+                    if "epochs" in adaptive_trial_overrides:
+                        _ep_override = int(adaptive_trial_overrides["epochs"])
+                        _ep_min = int(hpo_space.get("epochs", {}).get("low", 3))
+                        _ep_max = int(hpo_space.get("epochs", {}).get("high", 40))
+                        trial_epochs = max(_ep_min, min(_ep_max, _ep_override))
+                    logger.info(
+                        "  Trial %d adaptive overrides applied: %s",
+                        trial.number,
+                        adaptive_trial_overrides,
+                    )
+
+                if trial_fusion == "auto":
+                    trial_fusion = self.state.get_slot("schema_derived_fusion") or "attention"
+
+                # ── ULA-specific HPO sampling ─────────────────────────────
+                _ula_fusion_cfg: Dict[str, Any] = {}
+                _trial_lora_config: Optional[Dict[str, Any]] = None
+
+                if trial_fusion in ("ula", "unified_latent", "unified_latent_alignment"):
+                    _base_latent = int(self.state.get_slot("ula_latent_dim") or 256)
+                    if not hp_overrides:
+                        _latent_choices = [max(64, _base_latent // 2), _base_latent, min(512, _base_latent * 2)]
+                        _latent_choices = sorted(set(_latent_choices))
+                        _ula_latent_dim = trial.suggest_categorical("ula_latent_dim", _latent_choices)
+                        _ula_n_layers   = trial.suggest_int("ula_n_layers", 1, 4)
+                        _ula_n_heads    = trial.suggest_categorical("ula_n_heads", [2, 4, 8])
+                        _lora_r         = trial.suggest_categorical("lora_r", [4, 8, 16])
+                        _lora_alpha     = int(_lora_r * 2)
+                    else:
+                        _ula_latent_dim = int(hp_overrides.get("ula_latent_dim", _base_latent))
+                        _ula_n_layers   = int(hp_overrides.get("ula_n_layers", 2))
+                        _ula_n_heads    = int(hp_overrides.get("ula_n_heads", 4))
+                        _lora_r         = int(hp_overrides.get("lora_r", 8))
+                        _lora_alpha     = int(hp_overrides.get("lora_alpha", 16))
+
+                    _ula_fusion_cfg = {
+                        "latent_dim": _ula_latent_dim,
+                        "n_layers":   _ula_n_layers,
+                        "n_heads":    _ula_n_heads,
+                    }
+                    _trial_lora_config = {
+                        "r":       _lora_r,
+                        "alpha":   float(_lora_alpha),
+                        "lr_mult": 0.1,
+                    }
+                    logger.info(
+                        "  Trial %d ULA config: latent=%d layers=%d heads=%d lora_r=%d",
+                        trial.number, _ula_latent_dim, _ula_n_layers, _ula_n_heads, _lora_r,
+                    )
+
+                trial_graph_sparsity = max(0.0, float(trial_graph_sparsity))
+                trial_diversity_weight = max(0.0, float(trial_diversity_weight))
+                trial_uncertainty_aux = max(0.0, float(trial_uncertainty_aux))
+                trial_graph_branch_weight = min(1.0, max(0.0, float(trial_graph_branch_weight)))
+                trial_uncertainty_branch_weight = max(0.0, float(trial_uncertainty_branch_weight))
+                trial_dropout = float(max(context_dropout_floor, float(trial_dropout)))
+                if mean_uncertainty > 0.0:
+                    uncertainty_dropout = min(
+                        0.5,
+                        max(0.1, 0.1 + 0.2 * float(mean_uncertainty)),
+                    )
+                    trial_dropout = max(trial_dropout, uncertainty_dropout)
+                    trial_label_smoothing = max(
+                        float(trial_label_smoothing),
+                        float(min(0.25, max(0.0, 0.05 * float(mean_uncertainty)))),
+                    )
+
+                head_architecture_type = "mlp"
+                head_hidden_dim = int(model_sel.get("hidden_dim", 256) or 256)
+                head_num_layers = 3
+                _ctx_current = self._get_ctx()
+                if _ctx_current is not None:
+                    head_architecture_type = str(
+                        getattr(_ctx_current, "head_architecture_type", head_architecture_type)
+                        or head_architecture_type
+                    )
+                    head_hidden_dim = int(
+                        getattr(_ctx_current, "head_hidden_dim", head_hidden_dim)
+                        or head_hidden_dim
+                    )
+                    head_num_layers = int(
+                        getattr(_ctx_current, "head_num_layers", head_num_layers)
+                        or head_num_layers
+                    )
+
+                fusion_config = {
+                    "uncertainty_graph_weight": trial_graph_branch_weight,
+                    "uncertainty_branch_weight": trial_uncertainty_branch_weight,
+                }
+                # Merge ULA-specific config when ULA fusion is selected
+                if _ula_fusion_cfg:
+                    fusion_config.update(_ula_fusion_cfg)
+                fusion_aux_weights = {
+                    "graph_sparsity_weight": trial_graph_sparsity,
+                    "diversity_loss_weight": trial_diversity_weight,
+                    "uncertainty_aux_weight": trial_uncertainty_aux,
+                }
+
+                ctx = self._get_ctx()
+                if ctx is not None:
+                    ctx_fusion = getattr(ctx, "fusion_strategy", None)
+                    _locked = bool(getattr(ctx, "fusion_policy_locked", False))
+                    _src    = getattr(ctx, "fusion_policy_source", "")
+                    if ctx_fusion and (_locked and _src == "user_override"):
+                        # Hard lock: Optuna must not sample a different fusion
+                        trial_fusion = str(ctx_fusion)
+                        logger.debug("Phase 5: user fusion lock enforced → %s", trial_fusion)
+                    elif ctx_fusion and not hp_overrides:
+                        # Soft suggestion: use context fusion when not explicitly overridden
+                        trial_fusion = str(ctx_fusion)
+
+                # Bug 9: ULA cross-modal attention requires ≥2 active modalities
+                _active_mods_ula = [k for k in input_dims if (input_dims.get(k) or 0) > 0]
+                if (
+                    str(trial_fusion).lower() in ("ula", "unified_latent", "unified_latent_alignment", "omnimodal")
+                    and len(_active_mods_ula) < 2
+                ):
+                    logger.warning(
+                        "Trial %d: ULA requires ≥2 modalities but only %s active — "
+                        "falling back to concatenation",
+                        trial.number, _active_mods_ula,
+                    )
+                    trial_fusion = "concatenation"
+
+                ContextValidator.require_fusion_consistency(
+                    fusion_strategy=str(trial_fusion),
+                    modalities=self.config.modalities,
+                    phase="training",
+                )
+                ContextValidator.require_model_selection(ctx, phase="training")
 
                 # Create a FRESH tabular encoder for this trial (trainable,
                 # random init).  Image/text encoders are shared (frozen).
@@ -1565,6 +3824,33 @@ class TrainingOrchestrator:
                     _trial_tabular_encoder = _tabular_encoder_class(
                         input_dim=_tabular_input_dim,
                     )
+                    try:
+                        _trial_tabular_encoder.configure(encoder_plan.get("tabular", {}))
+                    except Exception as cfg_exc:
+                        logger.debug("  Trial tabular encoder configure failed: %s", cfg_exc)
+
+                # Contrastive weight: activate when ≥2 modalities AND id_columns
+                # detected by feature_intelligence (entity-linking signal)
+                _contrastive_weight: float = 0.0
+                _ctx_for_cw = self._get_ctx()
+                if (
+                    len(input_dims) >= 2
+                    and _ctx_for_cw is not None
+                ):
+                    _fi_for_cw = getattr(_ctx_for_cw, "feature_intelligence", {}) or {}
+                    _any_id_cols = any(
+                        len(ds.get("id_columns") or []) > 0
+                        for ds in _fi_for_cw.values()
+                    )
+                    if _any_id_cols:
+                        _contrastive_weight = 0.05
+
+                # ULA: use smaller, simpler head (ULA CLS token already cross-modal)
+                if trial_fusion in ("ula", "unified_latent", "unified_latent_alignment"):
+                    _ula_ld = int(fusion_config.get("latent_dim", 256))
+                    head_hidden_dim  = _ula_ld * 2
+                    head_num_layers  = 2
+                    head_architecture_type = "mlp"
 
                 lightning_module = build_trainer(
                     problem_type=problem_type,
@@ -1574,12 +3860,42 @@ class TrainingOrchestrator:
                     weight_decay=trial_wd,
                     dropout=trial_dropout,
                     max_epochs=trial_epochs,
+                    hidden_dim=head_hidden_dim,
                     image_encoder=_image_encoder,
                     text_encoder=_text_encoder,
                     tabular_encoder=_trial_tabular_encoder,
                     class_weights=_class_weights,
                     fusion_strategy=trial_fusion,
+                    fusion_config=fusion_config,
+                    head_architecture_type=head_architecture_type,
+                    head_num_layers=head_num_layers,
+                    label_smoothing=float(trial_label_smoothing),
+                    alignment_weight=float(trial_alignment),
+                    modality_dropout_prob=float(trial_modality_dropout),
+                    fusion_aux_weights=fusion_aux_weights,
+                    execution_context=_ctx_for_cw,
+                    contrastive_weight=_contrastive_weight,
+                    ewc=getattr(self, "_ewc", None),
+                    use_focal_loss=_use_focal_loss,
+                    lora_config=_trial_lora_config,
+                    tabular_tokenizer=self.fitted_transformers.get("tabular_tokenizer"),
                 )
+
+                # Part A.3 — LoRA warm-start: load previous best LoRA A/B weights
+                # into encoders before training begins, giving each trial a head start.
+                try:
+                    _ctx_warm = self._get_ctx()
+                    _lora_warm = dict(getattr(_ctx_warm, "lora_warm_start_state", {}) or {})
+                    if _lora_warm and _trial_lora_config:
+                        from modelss.adapters.lora import load_lora_state_dict as _llsd
+                        if "_text_encoder" in _lora_warm and lightning_module._text_encoder is not None:
+                            _llsd(lightning_module._text_encoder, _lora_warm["_text_encoder"])
+                            logger.info("Trial %d: LoRA warm-start loaded for text encoder", trial.number)
+                        if "_image_encoder" in _lora_warm and lightning_module._image_encoder is not None:
+                            _llsd(lightning_module._image_encoder, _lora_warm["_image_encoder"])
+                            logger.info("Trial %d: LoRA warm-start loaded for image encoder", trial.number)
+                except Exception as _warm_exc:
+                    logger.debug("LoRA warm-start load skipped: %s", _warm_exc)
 
                 # Build a Lightning callback to push epoch metrics in real-time
                 _pl_callbacks = []
@@ -1609,9 +3925,17 @@ class TrainingOrchestrator:
                 _pl_callbacks.append(_EarlyStopping(
                     monitor="val_loss",
                     mode="min",
-                    patience=5,
+                    patience=max(1, int(early_stop_patience)),
                     verbose=False,
                 ))
+
+                # PCGrad — Gradient Surgery (Yu et al., NeurIPS 2020)
+                # Prevents destructive gradient interference between modality encoders.
+                # Only activate when 2+ encoder types are present.
+                _active_modalities = set(input_dims.keys())
+                if len(_active_modalities) >= 2:
+                    from automl.trainer import PCGradCallback as _PCGradCallback
+                    _pl_callbacks.append(_PCGradCallback())
 
                 # Optuna pruning: kill unpromising trials early (skip for manual HP runs)
                 if not hp_overrides:
@@ -1619,6 +3943,27 @@ class TrainingOrchestrator:
                     _pl_callbacks.append(PyTorchLightningPruningCallback(
                         trial, monitor="val_loss",
                     ))
+
+                # SWA — Stochastic Weight Averaging (Izmailov et al., UAI 2018)
+                # Averages weights along SGD trajectory for flatter minima and
+                # better generalization, especially on small/medium datasets.
+                # Activates in the last 10% of epochs (min 1 epoch).
+                try:
+                    from pytorch_lightning.callbacks import StochasticWeightAveraging as _SWA
+                    _swa_start = max(0, int(trial_epochs * 0.9) - 1)  # last 10% of epochs
+                    if trial_epochs >= 5:
+                        _pl_callbacks.append(_SWA(
+                            swa_lrs=float(trial_lr) * 0.5,
+                            swa_epoch_start=_swa_start,
+                            annealing_epochs=max(1, trial_epochs - _swa_start),
+                            device=None,
+                        ))
+                        logger.info(
+                            "  SWA [UAI 2018] enabled: start_epoch=%d  swa_lr=%.6f",
+                            _swa_start, float(trial_lr) * 0.5,
+                        )
+                except Exception as _swa_exc:
+                    logger.debug("SWA not available: %s", _swa_exc)
 
                 pl_trainer = pl.Trainer(
                     max_epochs=trial_epochs,
@@ -1645,7 +3990,16 @@ class TrainingOrchestrator:
                             "learning_rate": trial_lr,
                             "weight_decay":  trial_wd,
                             "dropout":       trial_dropout,
+                            "label_smoothing": float(trial_label_smoothing),
                             "epochs":        trial_epochs,
+                            "fusion_strategy": str(trial_fusion),
+                            "alignment_weight": float(trial_alignment),
+                            "modality_dropout_prob": float(trial_modality_dropout),
+                            "graph_sparsity_weight": trial_graph_sparsity,
+                            "diversity_loss_weight": trial_diversity_weight,
+                            "uncertainty_aux_weight": trial_uncertainty_aux,
+                            "uncertainty_graph_weight": trial_graph_branch_weight,
+                            "uncertainty_branch_weight": trial_uncertainty_branch_weight,
                             "problem_type":  problem_type,
                             "num_classes":   num_classes,
                         })
@@ -1665,11 +4019,104 @@ class TrainingOrchestrator:
                                     5, "detail",
                                     f"Trial {trial.number + 1} pruned (underperforming)",
                                 )
+                            # Capture pruning metadata for warm-start guidance
+                            _pruned_step = len(trial.intermediate_values)
+                            _best_inter  = (
+                                min(trial.intermediate_values.values())
+                                if trial.intermediate_values else float("inf")
+                            )
+                            try:
+                                trial.set_user_attr("pruned_at_step", _pruned_step)
+                                trial.set_user_attr("best_intermediate_loss", _best_inter)
+                                trial.set_user_attr("lr_at_prune", trial_lr)
+                                trial.set_user_attr("fusion_at_prune", trial_fusion)
+                            except Exception:
+                                pass
                             raise  # re-raise so Optuna marks the trial as pruned
                         except Exception as trial_exc:
                             logger.warning("  Trial %d error: %s", trial.number, trial_exc)
 
                         mlflow.log_metric("val_loss", best_val_loss)
+
+                    # Persist TrialIntelligence diagnostics on the Optuna trial.
+                    try:
+                        trial_diag: Dict[str, Any] = {}
+                        if hasattr(lightning_module, "loss_weight_scheduler"):
+                            trial_diag = dict(
+                                getattr(
+                                    lightning_module.loss_weight_scheduler,
+                                    "last_analysis",
+                                    {},
+                                )
+                                or {}
+                            )
+                            dynamic_factors = dict(
+                                getattr(
+                                    lightning_module.loss_weight_scheduler,
+                                    "dynamic_factors",
+                                    {},
+                                )
+                                or {}
+                            )
+                            if dynamic_factors:
+                                trial_diag["dynamic_factors"] = dynamic_factors
+                        if trial_diag:
+                            calibration_proxy = _calibration_proxy_from_gap(
+                                trial_diag.get("generalization_gap")
+                            )
+                            if calibration_proxy is not None:
+                                trial_diag["calibration_proxy"] = calibration_proxy
+
+                            trial_diag["adaptive_penalty"] = _adaptive_penalty_from_diag(trial_diag)
+
+                            trial.set_user_attr(
+                                "fit_type",
+                                str(trial_diag.get("fit_type", "unknown")),
+                            )
+                            if trial_diag.get("calibration_proxy") is not None:
+                                trial.set_user_attr(
+                                    "calibration_proxy",
+                                    float(trial_diag.get("calibration_proxy", 0.0)),
+                                )
+                            trial.set_user_attr(
+                                "adaptive_penalty",
+                                float(trial_diag.get("adaptive_penalty", 0.0)),
+                            )
+                            trial.set_user_attr("trial_diagnostics", trial_diag)
+
+                            if not hp_overrides:
+                                updated_state = self.optuna_adaptive.update_from_trial_diagnostics(
+                                    adaptive_feedback_state,
+                                    trial_diag,
+                                )
+                                adaptive_feedback_state.clear()
+                                adaptive_feedback_state.update(updated_state)
+
+                                # G20: pass recent finished trials so prune-step cap can apply
+                                _recent_trials_g20 = [
+                                    t for t in study.trials if t.state.is_finished()
+                                ][-6:]
+                                next_overrides = self.optuna_adaptive.next_trial_overrides(
+                                    adaptive_feedback_state,
+                                    hpo_space,
+                                    recent_trials=_recent_trials_g20,
+                                )
+                                adaptive_trial_overrides.clear()
+                                adaptive_trial_overrides.update(next_overrides)
+
+                                if next_overrides:
+                                    event = {
+                                        "after_trial": int(trial.number),
+                                        "fit_type": str(trial_diag.get("fit_type", "unknown")),
+                                        "adaptive_penalty": float(
+                                            trial_diag.get("adaptive_penalty", 0.0)
+                                        ),
+                                        "calibration_proxy": trial_diag.get("calibration_proxy"),
+                                        "overrides": dict(next_overrides),
+                                    }
+                                    trial_feedback_events.append(event)
+                    except Exception as diag_exc:
+                        logger.debug("  Trial diagnostics capture failed: %s", diag_exc)
 
                     # Capture best module – mutable list avoids 'nonlocal'
                     if best_val_loss < _best_val[0]:
@@ -1682,9 +4129,9 @@ class TrainingOrchestrator:
 
                     logger.info(
                         "  Trial %d: lr=%.2e  wd=%.2e  dropout=%.2f  "
-                        "epochs=%d  val_loss=%.4f",
+                        "label_smoothing=%.3f  epochs=%d  val_loss=%.4f  fusion=%s",
                         trial.number, trial_lr, trial_wd, trial_dropout,
-                        trial_epochs, best_val_loss,
+                        trial_label_smoothing, trial_epochs, best_val_loss, trial_fusion,
                     )
 
                     return best_val_loss
@@ -1706,14 +4153,95 @@ class TrainingOrchestrator:
                 # HyperbandPruner: aggressively prunes underperforming trials
                 # at intermediate epochs, saving GPU compute.
                 _pruner = optuna.pruners.HyperbandPruner(
-                    min_resource=1, max_resource=model_sel.get("epochs", 10),
+                    min_resource=1,
+                    max_resource=hpo_space.get("epochs", {}).get("high", model_sel.get("epochs", 10)),
                     reduction_factor=3,
                 ) if N_TRIALS > 1 else optuna.pruners.NopPruner()
                 study = optuna.create_study(
                     direction="minimize",
                     pruner=_pruner,
+                    sampler=optuna.samplers.TPESampler(seed=_APEX_SEED),
                 )
+
+                _ctx_for_warm = self._get_ctx()
+                _warm_params = (
+                    getattr(_ctx_for_warm, "warm_start_params", None)
+                    if _ctx_for_warm is not None
+                    else None
+                )
+                if isinstance(_warm_params, dict) and _warm_params:
+                    self.optuna_adaptive.seed_from_warm_start(
+                        study=study,
+                        warm_params=_warm_params,
+                        hpo_space=hpo_space,
+                    )
+
                 study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=False)
+
+            # Derive next-trial overrides from pruning patterns and store on context
+            try:
+                import statistics as _stats
+                _pruned_trials = [
+                    t for t in study.trials
+                    if getattr(t, "state", None) and "PRUNED" in str(t.state)
+                ]
+                _completed_trials = [
+                    t for t in study.trials
+                    if getattr(t, "state", None) and "COMPLETE" in str(t.state)
+                ]
+                _next_overrides: Dict[str, Any] = {}
+
+                if _pruned_trials:
+                    _prune_steps = [
+                        t.user_attrs.get("pruned_at_step", 5) for t in _pruned_trials
+                    ]
+                    _med_step = _stats.median(_prune_steps)
+                    if _med_step <= 2:
+                        # Very early pruning → reduce complexity next run
+                        _next_overrides["ula_n_layers_max"] = 2
+                        _next_overrides["ula_latent_dim_choices"] = [128, 256]
+                        _next_overrides["learning_rate_max"] = 5e-4
+                    elif _med_step >= max(8, N_TRIALS * 0.8):
+                        # Late pruning → need more capacity
+                        _next_overrides["ula_latent_dim_choices"] = [256, 512]
+                        _next_overrides["ula_n_layers_max"] = 4
+
+                if _completed_trials:
+                    _best_done = min(_completed_trials, key=lambda t: t.value or float("inf"))
+                    _next_overrides["lr_center"] = _best_done.params.get("learning_rate", 1e-3)
+                    _next_overrides["lora_r_hint"] = _best_done.params.get("lora_r", 8)
+
+                _ctx_for_next = self._get_ctx()
+                if _ctx_for_next is not None and _next_overrides:
+                    try:
+                        object.__setattr__(
+                            _ctx_for_next, "next_trial_overrides",
+                            {**dict(getattr(_ctx_for_next, "next_trial_overrides", {}) or {}),
+                             **_next_overrides},
+                        )
+                        logger.info("Phase 5: next_trial_overrides derived: %s", _next_overrides)
+                    except Exception:
+                        pass
+
+                # LoRA warm-start: save best trial's adapter weights for next training run
+                if (_best_module_ref and self.best_lightning_module is not None
+                        and _ctx_for_next is not None):
+                    try:
+                        from modelss.adapters.lora import lora_state_dict as _lsd
+                        _lora_warm = {}
+                        for _enc_name in ("_text_encoder", "_image_encoder"):
+                            _enc = getattr(self.best_lightning_module, _enc_name, None)
+                            if _enc is not None:
+                                _enc_state = _lsd(_enc)
+                                if _enc_state:
+                                    _lora_warm[_enc_name] = _enc_state
+                        if _lora_warm:
+                            object.__setattr__(_ctx_for_next, "lora_warm_start_state", _lora_warm)
+                            logger.info("Phase 5: LoRA warm-start state saved (%d encoder(s))", len(_lora_warm))
+                    except Exception as _ws_exc:
+                        logger.debug("LoRA warm-start save failed: %s", _ws_exc)
+            except Exception as _post_exc:
+                logger.debug("Post-study analysis failed: %s", _post_exc)
 
             # Persist best model reference so Phase 7 can serialise weights
             if _best_module_ref:
@@ -1722,13 +4250,226 @@ class TrainingOrchestrator:
             best = study.best_trial
             best_val_loss: float = best.value if best.value is not None else float("inf")
 
+            best_fit_type = str(best.user_attrs.get("fit_type", "unknown"))
+            if best_fit_type == "unknown" and self.best_lightning_module is not None:
+                try:
+                    _best_diag = dict(
+                        getattr(
+                            self.best_lightning_module.loss_weight_scheduler,
+                            "last_analysis",
+                            {},
+                        )
+                        or {}
+                    )
+                    best_fit_type = str(_best_diag.get("fit_type", "unknown"))
+                except Exception:
+                    best_fit_type = "unknown"
+
+            trial_diagnostics: List[Dict[str, Any]] = []
+            for t in study.trials:
+                if t.state != optuna.trial.TrialState.COMPLETE:
+                    continue
+                _diag = t.user_attrs.get("trial_diagnostics", {})
+                trial_diagnostics.append(
+                    {
+                        "trial": int(t.number),
+                        "fit_type": t.user_attrs.get("fit_type", "unknown"),
+                        "val_loss": float(t.value) if t.value is not None else None,
+                        "train_slope": _diag.get("train_slope") if isinstance(_diag, dict) else None,
+                        "val_slope": _diag.get("val_slope") if isinstance(_diag, dict) else None,
+                        "generalization_gap": (
+                            _diag.get("generalization_gap") if isinstance(_diag, dict) else None
+                        ),
+                        "dynamic_factors": (
+                            _diag.get("dynamic_factors") if isinstance(_diag, dict) else None
+                        ),
+                        "calibration_proxy": (
+                            _diag.get("calibration_proxy") if isinstance(_diag, dict) else t.user_attrs.get("calibration_proxy")
+                        ),
+                        "adaptive_penalty": (
+                            _diag.get("adaptive_penalty") if isinstance(_diag, dict) else t.user_attrs.get("adaptive_penalty")
+                        ),
+                    }
+                )
+
+            lw_schedule_history = [
+                {
+                    "trial": row.get("trial"),
+                    "fit_type": row.get("fit_type"),
+                    "dynamic_factors": row.get("dynamic_factors") or {},
+                }
+                for row in trial_diagnostics
+            ]
+
+            trial_feedback_summary: Dict[str, Any] = {}
+            try:
+                from automl.trial_intelligence import TrialIntelligence
+
+                _trial_intelligence = TrialIntelligence()
+                trial_feedback_summary = _trial_intelligence.summarize_trials(trial_diagnostics)
+            except Exception as summary_exc:
+                logger.debug("  Trial feedback summary unavailable: %s", summary_exc)
+
+            ctx_for_feedback = self._get_ctx()
+            feedback_modalities = schema_info.get("global_modalities", self.config.modalities)
+            feedback_importance: Dict[str, float] = {}
+            if ctx_for_feedback is not None:
+                feedback_importance = dict(
+                    getattr(ctx_for_feedback, "modality_importance", {}) or {}
+                )
+
+            next_run_feedback = self.optuna_adaptive.build_next_run_feedback(
+                trial_summary=trial_feedback_summary,
+                feedback_state=adaptive_feedback_state,
+                hpo_space=hpo_space,
+                modalities=feedback_modalities,
+                modality_importance=feedback_importance,
+            )
+
+            meta_saved = False
+            try:
+                from automl.advanced_selector import AdvancedModelSelector
+
+                selector_for_memory = AdvancedModelSelector()
+                best_fusion = best.params.get(
+                    "fusion_strategy",
+                    model_sel.get("fusion_strategy", "concatenation"),
+                )
+
+                loss_weights: Dict[str, float] = {}
+                if self.best_lightning_module is not None and hasattr(
+                    self.best_lightning_module, "get_loss_weight_state"
+                ):
+                    loss_weights = self.best_lightning_module.get_loss_weight_state()
+
+                performance = (
+                    float(_best_metrics["val_acc"])
+                    if problem_type.startswith("classification")
+                    or problem_type == "multilabel_classification"
+                    else float(-best_val_loss)
+                )
+
+                selector_for_memory.record_experiment(
+                    dataset_meta=model_sel.get(
+                        "dataset_meta",
+                        {
+                            "num_rows": n_total,
+                            "num_cols": len(input_dims),
+                            "modalities": schema_info.get("global_modalities", self.config.modalities),
+                            "target_type": "regression" if "regression" in problem_type else "classification",
+                        },
+                    ),
+                    best_params=dict(best.params),
+                    fusion_strategy=str(best_fusion),
+                    loss_weights=loss_weights,
+                    performance=performance,
+                )
+                meta_saved = True
+            except Exception as meta_exc:
+                logger.warning("  Meta-learning persistence skipped: %s", meta_exc)
+
+            representation_summary: Dict[str, Any] = {}
+            alignment_summary: Dict[str, float] = {}
+            fusion_summary: Dict[str, Any] = {}
+            fusion_aux_weights: Dict[str, float] = {}
+            if self.best_lightning_module is not None:
+                try:
+                    representation_summary = self.representation_layer.summarize(
+                        getattr(self.best_lightning_module, "_last_encoded_batch", {}),
+                    )
+                except Exception as rep_exc:
+                    logger.debug("  Representation summary unavailable: %s", rep_exc)
+                if hasattr(self.best_lightning_module, "get_alignment_summary"):
+                    try:
+                        alignment_summary = self.best_lightning_module.get_alignment_summary()
+                    except Exception as align_exc:
+                        logger.debug("  Alignment summary unavailable: %s", align_exc)
+                if hasattr(self.best_lightning_module, "get_fusion_summary"):
+                    try:
+                        fusion_summary = dict(self.best_lightning_module.get_fusion_summary() or {})
+                        fusion_aux_weights = dict(
+                            fusion_summary.get("auxiliary_loss_weights", {}) or {}
+                        )
+                    except Exception as fusion_exc:
+                        logger.debug("  Fusion summary unavailable: %s", fusion_exc)
+
+            # ----------------------------------------------------------------
+            # XAI Artifacts — generated from one val batch after best trial
+            # Fault-isolated: failure here does not abort Phase 5.
+            # ----------------------------------------------------------------
+            xai_artifacts: Dict[str, Any] = {}
+            if self.best_lightning_module is not None:
+                try:
+                    _xai_batch = next(iter(val_loader))
+                    _active_modalities = schema_info.get(
+                        "global_modalities", self.config.modalities
+                    )
+                    xai_artifacts = generate_xai_artifacts(
+                        model=self.best_lightning_module,
+                        batch=_xai_batch,
+                        modalities=list(_active_modalities),
+                        execution_context=self._get_ctx(),
+                    )
+                    logger.info("  XAI artifacts generated for modalities: %s", _active_modalities)
+                except Exception as xai_exc:
+                    logger.warning("  XAI artifact generation skipped: %s", xai_exc)
+                    xai_artifacts = {"error": str(xai_exc)}
+
             # Count pruned trials for frontend transparency
             _n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
             _n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
 
             # ----------------------------------------------------------------
+            # 5b  Probability calibration on held-out validation split
+            # ----------------------------------------------------------------
+            calibration: Dict[str, Any] = {"enabled": False, "mode": "identity"}
+            supports_calibration = (
+                problem_type.startswith("classification")
+                or problem_type == "multilabel_classification"
+            )
+            if supports_calibration and self.best_lightning_module is not None:
+                try:
+                    logits_np, targets_np = self._collect_validation_logits(
+                        self.best_lightning_module,
+                        val_loader,
+                    )
+                    calibrator = ProbabilityCalibrator()
+                    calibration = calibrator.fit(
+                        logits_np,
+                        targets_np,
+                        problem_type=problem_type,
+                        execution_context=self._get_ctx(),
+                    )
+                    if calibration.get("enabled"):
+                        self.probability_calibrator = calibrator
+                        logger.info(
+                            "  Calibration fitted: mode=%s",
+                            calibration.get("mode", "unknown"),
+                        )
+                    else:
+                        self.probability_calibrator = None
+                        logger.info(
+                            "  Calibration skipped: %s",
+                            calibration.get("reason", "not enabled"),
+                        )
+                except Exception as cal_exc:
+                    logger.warning("  Calibration fitting skipped: %s", cal_exc)
+                    self.probability_calibrator = None
+                    calibration = {
+                        "enabled": False,
+                        "mode": "identity",
+                        "error": str(cal_exc),
+                    }
+            else:
+                self.probability_calibrator = None
+
+            # ----------------------------------------------------------------
             # 6  Build phase results compatible with /train-pipeline contract
             # ----------------------------------------------------------------
+            trial_feedback_summary = dict(trial_feedback_summary or {})
+            trial_feedback_summary["best_fit_type"] = best_fit_type
+            trial_feedback_summary["posthoc_calibration"] = dict(calibration or {})
+
             elapsed = time.time() - phase_start
 
             results: Dict[str, Any] = {
@@ -1741,11 +4482,19 @@ class TrainingOrchestrator:
                 "n_trials":          N_TRIALS,
                 "n_pruned":          _n_pruned,
                 "n_complete":        _n_complete,
+                "fit_type":          best_fit_type,
+                "trial_diagnostics": trial_diagnostics,
+                "lw_schedule_history": lw_schedule_history,
+                "trial_feedback_events": trial_feedback_events,
+                "trial_feedback_summary": trial_feedback_summary,
+                "next_run_feedback": next_run_feedback,
+                "adaptive_feedback_state": dict(adaptive_feedback_state),
                 "batch_size":        batch_size,
                 "data_split":        {"train": n_train, "val": n_val, "total": n_total},
                 "problem_type":      problem_type,
                 "num_classes":       num_classes,
                 "input_dims":        input_dims,
+                "hpo_space":         hpo_space,
                 "duration_seconds":  elapsed,
                 # Scalar defaults from Phase 4 (kept for Phase 6 / registry)
                 "epochs":            model_sel.get("epochs", 10),
@@ -1761,7 +4510,48 @@ class TrainingOrchestrator:
                     "vram_budget_mb": round(_jit_result.vram_budget_bytes / 1e6, 2),
                     "rationale": _jit_result.rationale,
                 },
+                "meta_learning_saved": meta_saved,
+                "embedding_cache": self.embedding_cache.stats(),
+                "representation_summary": representation_summary,
+                "alignment_summary": alignment_summary,
+                "alignment_loss_history":   getattr(self.best_lightning_module, "_alignment_loss_history", []),
+                "contrastive_loss_history": getattr(self.best_lightning_module, "_contrastive_loss_history", []),
+                "fusion_summary": fusion_summary,
+                "fusion_aux_weights": fusion_aux_weights,
+                "calibration": calibration,
+                "xai": xai_artifacts,
             }
+
+            results["evaluation"] = self.evaluation_adapter.evaluate_training(
+                results,
+                problem_type=problem_type,
+            )
+
+            self._sync_training_results_to_context(
+                results=results,
+                active_modalities=list(schema_info.get("global_modalities", self.config.modalities)),
+            )
+
+            ctx_for_fit_feedback = self._get_ctx()
+            if ctx_for_fit_feedback is not None:
+                try:
+                    fit_payload = dict(trial_feedback_summary)
+                    fit_payload["trial_diagnostics"] = list(trial_diagnostics)
+                    fit_payload["trial_feedback_events"] = list(trial_feedback_events)
+                    fit_payload["next_run_feedback"] = dict(next_run_feedback or {})
+                    fit_payload["adaptive_feedback_state"] = dict(adaptive_feedback_state)
+
+                    if hasattr(ctx_for_fit_feedback, "apply_training_feedback"):
+                        ctx_for_fit_feedback.apply_training_feedback(
+                            fit_payload,
+                            predictability_factors=dict(
+                                (next_run_feedback or {}).get("predictability_factors", {}) or {}
+                            ),
+                        )
+                    else:
+                        ctx_for_fit_feedback.update_fit_analysis(fit_payload)
+                except Exception as fit_ctx_exc:
+                    logger.debug("  Context fit-analysis update skipped: %s", fit_ctx_exc)
 
             logger.info("\nPhase 5 Summary:")
             logger.info("  Trials completed  : %d (%d pruned)", _n_complete, _n_pruned)
@@ -1771,6 +4561,12 @@ class TrainingOrchestrator:
             logger.info("  Duration          : %.2fs", elapsed)
 
             self.phase_results[Phase.TRAINING] = results
+            self.state.set_slot("phase5_training", results)
+            self.state.set_slot("training_evaluation", results.get("evaluation", {}))
+            self.state.set_slot("training_calibration", results.get("calibration", {}))
+            self.state.set_slot("xai_artifacts", xai_artifacts)
+            self.state.set_phase_timing("TRAINING", elapsed)
+            self._record_phase_timing_in_context("TRAINING", elapsed)
             self.current_phase = Phase.DRIFT_DETECTION
 
         except Exception as exc:
@@ -1799,8 +4595,11 @@ class TrainingOrchestrator:
         logger.info("PHASE 6: DRIFT DETECTION")
         logger.info("=" * 80)
 
+        self._enforce_session_context("Phase 6")
+
         phase_start = time.time()
         MAX_ROWS_PER_SPLIT = 25_000
+        self._phase6_reference_sample = None
 
         try:
             from monitoring.drift_detector import DriftDetector
@@ -1837,19 +4636,45 @@ class TrainingOrchestrator:
                         frames.append(split_ref.head(MAX_ROWS_PER_SPLIT))
 
             # ----------------------------------------------------------------
-            # 2  Materialise to float64 numpy arrays (numeric cols only)
+            # 2  Materialise to pandas + float64 numpy arrays (numeric cols only)
             # ----------------------------------------------------------------
-            def _to_numeric_array(frames_list: list) -> np.ndarray:
+            def _concat_frames(frames_list: list) -> pd.DataFrame:
                 if not frames_list:
+                    return pd.DataFrame()
+                return pd.concat(frames_list, ignore_index=True, sort=False)
+
+            ref_df = _concat_frames(ref_frames)
+            prod_df = _concat_frames(prod_frames)
+
+            def _to_numeric_array(df: pd.DataFrame) -> np.ndarray:
+                if df.empty:
                     return np.zeros((0, 1), dtype=np.float64)
-                df = pd.concat(frames_list, ignore_index=True)
                 numeric_df = df.select_dtypes(include=[np.number])
                 if numeric_df.empty:
                     return np.zeros((len(df), 1), dtype=np.float64)
                 return numeric_df.fillna(0.0).values.astype(np.float64)
 
-            ref_array = _to_numeric_array(ref_frames)
-            prod_array = _to_numeric_array(prod_frames)
+            ref_array = _to_numeric_array(ref_df)
+            prod_array = _to_numeric_array(prod_df)
+
+            schema_info = self.phase_results.get(Phase.SCHEMA_DETECTION, {})
+            modality_columns: Dict[str, List[str]] = {}
+            if isinstance(schema_info, dict):
+                per_dataset = schema_info.get("per_dataset", [])
+                if isinstance(per_dataset, list):
+                    for dataset_schema in per_dataset:
+                        if not isinstance(dataset_schema, dict):
+                            continue
+                        detected = dataset_schema.get("detected_columns", {})
+                        if not isinstance(detected, dict):
+                            continue
+                        for modality, cols in detected.items():
+                            if not isinstance(cols, list):
+                                continue
+                            bucket = modality_columns.setdefault(str(modality), [])
+                            for col in cols:
+                                if isinstance(col, str) and col not in bucket:
+                                    bucket.append(col)
 
             # ----------------------------------------------------------------
             # 3  Derive feature names from tabular preprocessor (best-effort)
@@ -1865,6 +4690,8 @@ class TrainingOrchestrator:
             # ----------------------------------------------------------------
             # 4  Run DriftDetector
             # ----------------------------------------------------------------
+            modality_drift: Dict[str, Any] = {}
+
             if ref_array.shape[0] == 0 or prod_array.shape[0] == 0:
                 logger.warning(
                     "  Phase 6: insufficient data for drift detection "
@@ -1880,8 +4707,34 @@ class TrainingOrchestrator:
                     n_features=0, n_reference=0, n_production=0,
                 )
             else:
-                detector = DriftDetector()
-                report = detector.detect(ref_array, prod_array, feature_names)
+                from pipeline.retraining_orchestrator import RetrainingOrchestrator
+
+                retrain_orchestrator = RetrainingOrchestrator(
+                    production_sources=list(self.config.dataset_sources),
+                    problem_type=self.config.problem_type,
+                    modalities=list(self.config.modalities),
+                    schema_info=self.phase_results.get(Phase.SCHEMA_DETECTION),
+                    cooldown_seconds=3600,
+                    session_id=getattr(self._get_ctx(), "session_id", None),
+                    execution_context=self._get_ctx(),
+                )
+                detector = DriftDetector(
+                    retraining_orchestrator=retrain_orchestrator,
+                    cooldown_seconds=3600,
+                )
+                report = detector.detect(
+                    ref_array,
+                    prod_array,
+                    feature_names,
+                    dataset_id="phase6_default",
+                )
+                self._phase6_reference_sample = getattr(report, "reference_sample", None)
+                if modality_columns:
+                    modality_drift = detector.detect_modality_drift(
+                        reference_df=ref_df,
+                        production_df=prod_df,
+                        modality_columns=modality_columns,
+                    )
 
             logger.info("Drift Detection Results:")
             logger.info("  PSI (Population Stability Index)")
@@ -1896,6 +4749,26 @@ class TrainingOrchestrator:
             logger.info("    -> Value    : %.4f", report.fdd)
             logger.info("    -> Threshold: 0.5000")
             logger.info("    -> Status   : %s", "DRIFT" if report.status["fdd"] else "OK")
+            if modality_drift:
+                logger.info("  Modality-Level Drift")
+                for modality, details in modality_drift.items():
+                    metrics = details.get("metrics", {}) if isinstance(details, dict) else {}
+                    if metrics:
+                        logger.info(
+                            "    -> %s: drift=%s psi=%.4f ks=%.4f fdd=%.4f",
+                            modality,
+                            "YES" if details.get("drift_detected") else "NO",
+                            float(metrics.get("psi", 0.0)),
+                            float(metrics.get("ks_statistic", 0.0)),
+                            float(metrics.get("fdd", 0.0)),
+                        )
+                    else:
+                        logger.info(
+                            "    -> %s: drift=%s (%s)",
+                            modality,
+                            "YES" if details.get("drift_detected") else "NO",
+                            details.get("reason", "no_metrics"),
+                        )
 
             # ----------------------------------------------------------------
             # 5  Store results
@@ -1916,11 +4789,19 @@ class TrainingOrchestrator:
                 "status": report.status,
                 "per_feature_ks":  report.per_feature_ks,
                 "per_feature_psi": report.per_feature_psi,
+                "modality_drift": modality_drift,
                 "n_reference":     report.n_reference,
                 "n_production":    report.n_production,
                 "n_features":      report.n_features,
+                "composite_score": report.composite_score,
+                "reference_sample": getattr(report, "reference_sample", None),
                 "duration_seconds": elapsed,
+                "retrain_triggered": report.retrain_triggered,
+                "retrain_info": report.retrain_info,
             }
+            results["monitor"] = self.drift_adapter.build_monitor_payload(results)
+
+            self._sync_drift_results_to_context(results, modality_drift)
 
             logger.info("\nPhase 6 Summary:")
             logger.info("  Drift Detected : %s", "YES" if report.drift_detected else "NO")
@@ -1929,45 +4810,11 @@ class TrainingOrchestrator:
             logger.info("  Duration       : %.2fs", elapsed)
 
             self.phase_results[Phase.DRIFT_DETECTION] = results
+            self.state.set_slot("phase6_drift", results)
+            self.state.set_slot("drift_monitor", results.get("monitor", {}))
+            self.state.set_phase_timing("DRIFT_DETECTION", elapsed)
+            self._record_phase_timing_in_context("DRIFT_DETECTION", elapsed)
             self.current_phase = Phase.MODEL_REGISTRY
-
-            # ── Autonomous drift → retrain (CI/CD loop) ──────────────────
-            # When drift is confirmed, kick off a fresh training run on the
-            # same data sources in a background thread so Phase 6 returns
-            # immediately.  Phase 6 is intentionally omitted from the retrain
-            # run to prevent infinite recursion.
-            if report.drift_detected:
-                import threading
-
-                def _retrain_background() -> None:
-                    try:
-                        from pipeline.retrain_executor import RetrainingPipeline
-                        retrain_pipeline = RetrainingPipeline(model_id="drift_retrain")
-                        retrain_result = retrain_pipeline.retrain(
-                            production_sources=list(self.config.dataset_sources),
-                            problem_type=self.config.problem_type,
-                            modalities=list(self.config.modalities),
-                            schema_info=self.phase_results.get(Phase.SCHEMA_DETECTION),
-                        )
-                        logger.info(
-                            "  Autonomous retrain complete: new model_id=%s",
-                            retrain_result.get("model_id"),
-                        )
-                    except Exception as re_exc:
-                        logger.warning(
-                            "  Autonomous retraining failed (non-fatal): %s", re_exc
-                        )
-
-                logger.info(
-                    "  Drift confirmed – triggering autonomous retraining "
-                    "(background thread, non-blocking)."
-                )
-                threading.Thread(
-                    target=_retrain_background, daemon=True, name="drift-retrain"
-                ).start()
-                results["retrain_triggered"] = True
-            else:
-                results["retrain_triggered"] = False
 
         except Exception as exc:
             logger.error("Phase 6 failed: %s", str(exc))
@@ -2004,7 +4851,7 @@ class TrainingOrchestrator:
             # 1  Create directory tree
             # ----------------------------------------------------------------
             model_id = f"apex_v1_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            registry_root = Path("models") / "registry" / model_id
+            registry_root = MODEL_REGISTRY_DIR / model_id
             artifacts_dir = registry_root / "artifacts"
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             logger.info("  Registry root : %s", registry_root)
@@ -2027,6 +4874,41 @@ class TrainingOrchestrator:
                 except Exception as exc:
                     logger.warning("  Weight save FAILED: %s", exc)
                     deployment_ready = False
+
+                # Bug 1 fix: persist input_dims so inference can reconstruct head correctly
+                # without heuristic dim reconstruction that breaks for non-ResNet encoders.
+                _idims_to_save = phase5_training.get("input_dims", {}) if isinstance(phase5_training, dict) else {}
+                if _idims_to_save:
+                    _idims_path = artifacts_dir / "input_dims.json"
+                    try:
+                        with open(_idims_path, "w", encoding="utf-8") as _fh:
+                            json.dump(_idims_to_save, _fh, indent=2)
+                        artifact_paths["input_dims"] = str(_idims_path)
+                        logger.info("  input_dims saved: %s", _idims_path)
+                    except Exception as _exc:
+                        logger.warning("  input_dims save FAILED: %s", _exc)
+
+                # Save drift reference sample for stateless /monitor/drift endpoint
+                try:
+                    ref_sample = self._phase6_reference_sample
+                    if ref_sample is None:
+                        drift_res = self.phase_results.get(Phase.DRIFT_DETECTION, {})
+                        if isinstance(drift_res, dict):
+                            ref_sample = drift_res.get("reference_sample")
+
+                    if ref_sample is not None:
+                        if hasattr(ref_sample, "values"):
+                            ref_values = np.asarray(ref_sample.values)
+                        else:
+                            ref_values = np.asarray(ref_sample)
+
+                        if ref_values.size > 0:
+                            ref_path = artifacts_dir / "reference_sample.npy"
+                            np.save(str(ref_path), ref_values.astype(np.float32))
+                            artifact_paths["reference_sample"] = str(ref_path)
+                            logger.info("  Drift reference sample saved: %s", ref_path)
+                except Exception as ref_exc:
+                    logger.warning("Could not save drift reference sample: %s", ref_exc)
 
                 # Save frozen encoder state dicts for inference
                 _img_enc = getattr(self.best_lightning_module, "_image_encoder", None)
@@ -2062,6 +4944,49 @@ class TrainingOrchestrator:
                         logger.info("  TabularEncoder saved: %s", tab_enc_path)
                     except Exception as exc:
                         logger.warning("  TabularEncoder save FAILED: %s", exc)
+
+                # Part A.2 — Save LoRA adapter weights when LoRA was used
+                # lora_text.pth / lora_image.pth contain only the low-rank A/B deltas
+                # so inference can reconstruct the adapted encoder without full fine-tune storage.
+                try:
+                    from modelss.adapters.lora import lora_state_dict as _lora_sd
+                    if _txt_enc is not None:
+                        _text_lora = _lora_sd(_txt_enc)
+                        if _text_lora:
+                            _lora_txt_path = artifacts_dir / "lora_text.pth"
+                            torch.save(_text_lora, _lora_txt_path)
+                            artifact_paths["lora_text"] = str(_lora_txt_path)
+                            logger.info("  LoRA text adapter saved (%d tensors): %s", len(_text_lora), _lora_txt_path)
+                    if _img_enc is not None:
+                        _image_lora = _lora_sd(_img_enc)
+                        if _image_lora:
+                            _lora_img_path = artifacts_dir / "lora_image.pth"
+                            torch.save(_image_lora, _lora_img_path)
+                            artifact_paths["lora_image"] = str(_lora_img_path)
+                            logger.info("  LoRA image adapter saved (%d tensors): %s", len(_image_lora), _lora_img_path)
+                except Exception as _lora_save_exc:
+                    logger.warning("LoRA artifact save FAILED: %s", _lora_save_exc)
+
+                # Part A.2 — Save ULA config when UnifiedLatentFusion was used
+                try:
+                    from modelss.fusion import UnifiedLatentFusion as _ULAClass
+                    _head_fusion = getattr(self.best_lightning_module.model, "fusion", None)
+                    if isinstance(_head_fusion, _ULAClass):
+                        _ula_cfg = {
+                            "latent_dim": _head_fusion.latent_dim,
+                            "n_layers": len(_head_fusion.transformer.layers),
+                            "n_heads": _head_fusion.transformer.layers[0].self_attn.num_heads
+                            if hasattr(_head_fusion.transformer.layers[0], "self_attn") else None,
+                            "token_mode": _head_fusion.token_mode,
+                            "attention_rollout_compatible": True,
+                        }
+                        _ula_cfg_path = artifacts_dir / "ula_config.json"
+                        with open(_ula_cfg_path, "w", encoding="utf-8") as _fh:
+                            json.dump(_ula_cfg, _fh, indent=2, default=str)
+                        artifact_paths["ula_config"] = str(_ula_cfg_path)
+                        logger.info("  ULA config saved: %s", _ula_cfg_path)
+                except Exception as _ula_save_exc:
+                    logger.warning("ULA config save FAILED: %s", _ula_save_exc)
 
                 # Save encoder config so inference knows model names / settings
                 encoder_config: Dict[str, Any] = {}
@@ -2127,6 +5052,18 @@ class TrainingOrchestrator:
                     deployment_ready = False
 
             # ----------------------------------------------------------------
+            # 3c Probability calibrator (classification only)
+            # ----------------------------------------------------------------
+            if self.probability_calibrator is not None and self.probability_calibrator.fitted:
+                calibrator_path = artifacts_dir / "probability_calibrator.joblib"
+                try:
+                    joblib.dump(self.probability_calibrator, calibrator_path)
+                    artifact_paths["probability_calibrator"] = str(calibrator_path)
+                    logger.info("  Probability calibrator saved: %s", calibrator_path)
+                except Exception as exc:
+                    logger.warning("  Probability calibrator save FAILED: %s", exc)
+
+            # ----------------------------------------------------------------
             # 4  Text tokenizer (HuggingFace save_pretrained)
             # ----------------------------------------------------------------
             text_prep = self.fitted_transformers.get("text")
@@ -2162,14 +5099,76 @@ class TrainingOrchestrator:
             # 6  Metadata JSON  (provenance + artifact paths)
             # ----------------------------------------------------------------
             created_at = datetime.now().isoformat()
+            research_metrics = self.research_metrics.compute(self.phase_results)
+            state_snapshot = self.state.snapshot()
+            ctx = self._get_ctx()
+            phase5_training = self.phase_results.get(Phase.TRAINING, {})
+            artifact_versions = dict(getattr(ctx, "artifact_versions", {}) or {}) if ctx is not None else {}
+            training_signals = dict(getattr(ctx, "training_signals", {}) or {}) if ctx is not None else {}
+            training_fit_analysis = dict(getattr(ctx, "training_fit_analysis", {}) or {}) if ctx is not None else {}
+            xai_config = dict(getattr(ctx, "xai_config", {}) or {}) if ctx is not None else {}
+            head_architecture: Dict[str, int] = {}
+            if self.best_lightning_module is not None:
+                runtime_head = getattr(self.best_lightning_module, "model", None)
+                if runtime_head is not None and hasattr(runtime_head, "state_dict"):
+                    try:
+                        head_state = runtime_head.state_dict()
+                        w0 = head_state.get("layers.0.weight")
+                        b_last = None
+                        for last_key in ("layers.3.bias", "layers.4.bias", "layers.5.bias"):
+                            if last_key in head_state:
+                                b_last = head_state[last_key]
+                                break
+                        if w0 is None or b_last is None:
+                            weight_keys = sorted(
+                                [
+                                    key
+                                    for key in head_state
+                                    if key.endswith(".weight") and head_state[key].ndim == 2
+                                ]
+                            )
+                            bias_keys = sorted(
+                                [key for key in head_state if key.endswith(".bias")]
+                            )
+                            if weight_keys and w0 is None:
+                                w0 = head_state[weight_keys[0]]
+                            if bias_keys and b_last is None:
+                                b_last = head_state[bias_keys[-1]]
+
+                        if w0 is not None and b_last is not None:
+                            head_architecture = {
+                                "hidden_dim": int(w0.shape[0]),
+                                "total_dim": int(w0.shape[1]),
+                                "num_outputs": int(b_last.shape[0]),
+                            }
+                    except Exception as exc:
+                        logger.warning("  Head architecture extraction FAILED: %s", exc)
             results: Dict[str, Any] = {
                 "model_id":        model_id,
                 "created_at":      created_at,
                 "config":          asdict(self.config),
                 "phases_summary":  self._summarize_all_phases(),
                 "artifact_paths":  artifact_paths,
+                "artifact_versions": artifact_versions,
+                "head_architecture": head_architecture,
+                "training_signals": training_signals,
+                "training_fit_analysis": training_fit_analysis,
+                "xai_config": xai_config,
                 "status":          "active",
                 "deployment_ready": deployment_ready,
+                "research_metrics": research_metrics,
+                "fusion": {
+                    "strategy": (
+                        self.state.get_slot("schema_derived_fusion")
+                        or (phase5_training.get("fusion_summary", {}) or {}).get("fusion_type", "concatenation")
+                        if isinstance(phase5_training, dict) else "concatenation"
+                    ),
+                    "summary": phase5_training.get("fusion_summary", {}) if isinstance(phase5_training, dict) else {},
+                    "auxiliary_loss_weights": phase5_training.get("fusion_aux_weights", {}) if isinstance(phase5_training, dict) else {},
+                    "alignment_summary": phase5_training.get("alignment_summary", {}) if isinstance(phase5_training, dict) else {},
+                },
+                "xai": self.state.get_slot("xai_artifacts", {}),
+                "state_slots": state_snapshot.get("slots", {}),
             }
 
             metadata_path = registry_root / "metadata.json"
@@ -2195,6 +5194,11 @@ class TrainingOrchestrator:
             logger.info("  Duration  : %.2fs", elapsed)
 
             self.phase_results[Phase.MODEL_REGISTRY] = results
+            self.state.set_slot("phase7_registry", results)
+            self.state.set_slot("research_metrics", research_metrics)
+            self.state.set_phase_timing("MODEL_REGISTRY", elapsed)
+            self._record_phase_timing_in_context("MODEL_REGISTRY", elapsed)
+            self._sync_model_registry_to_context(model_id, deployment_ready)
 
         except Exception as exc:
             logger.error("Phase 7 failed: %s", str(exc))
@@ -2202,14 +5206,62 @@ class TrainingOrchestrator:
     
     def _summarize_all_phases(self) -> Dict[str, Any]:
         """Create summary of all phases."""
+        ctx = self._get_ctx()
+        artifact_versions = dict(getattr(ctx, "artifact_versions", {}) or {}) if ctx is not None else {}
+        training_signals = dict(getattr(ctx, "training_signals", {}) or {}) if ctx is not None else {}
+        training_fit_analysis = dict(getattr(ctx, "training_fit_analysis", {}) or {}) if ctx is not None else {}
+        xai_config = dict(getattr(ctx, "xai_config", {}) or {}) if ctx is not None else {}
         summary = {}
         for phase in Phase:
             if phase in self.phase_results:
                 result = self.phase_results[phase]
-                summary[phase.name] = {
+                phase_summary: Dict[str, Any] = {
                     "duration_seconds": result.get("duration_seconds", 0),
                     "status": "completed"
                 }
+                if phase == Phase.PREPROCESSING:
+                    phase_summary.update({
+                        "total_samples": result.get("total_samples"),
+                        "text_columns": len(result.get("text_columns", [])),
+                        "image_columns": len(result.get("image_columns", [])),
+                        "tabular_columns": len(result.get("tabular_columns", [])),
+                    })
+                elif phase == Phase.MODEL_SELECTION:
+                    phase_summary.update({
+                        "image_encoder": result.get("image_encoder_name") or result.get("image_encoder"),
+                        "text_encoder": result.get("text_encoder_name") or result.get("text_encoder"),
+                        "tabular_encoder": result.get("tabular_encoder_name") or result.get("tabular_encoder"),
+                        "fusion_strategy": result.get("fusion_strategy"),
+                        "batch_size": result.get("batch_size"),
+                    })
+                elif phase == Phase.TRAINING:
+                    phase_summary.update({
+                        "best_trial": result.get("best_trial"),
+                        "best_val_loss": result.get("best_val_loss"),
+                        "best_val_acc": result.get("best_val_acc"),
+                        "best_val_f1": result.get("best_val_f1"),
+                        "best_train_acc": result.get("best_train_acc"),
+                        "n_trials": result.get("n_trials"),
+                        "calibration": result.get("calibration", {}),
+                        "evaluation": result.get("evaluation", {}),
+                        "alignment_summary": result.get("alignment_summary", {}),
+                        "fusion_summary": result.get("fusion_summary", {}),
+                        "fusion_aux_weights": result.get("fusion_aux_weights", {}),
+                        "training_signals": training_signals,
+                        "training_fit_analysis": training_fit_analysis,
+                        "artifact_versions": artifact_versions,
+                        "xai_config": xai_config,
+                    })
+                elif phase == Phase.DRIFT_DETECTION:
+                    monitor = result.get("monitor", {}) if isinstance(result, dict) else {}
+                    phase_summary.update({
+                        "drift_detected": result.get("drift_detected"),
+                        "metrics": result.get("metrics", {}),
+                        "composite_score": result.get("composite_score"),
+                        "severity": monitor.get("severity"),
+                        "retrain_triggered": result.get("retrain_triggered", False),
+                    })
+                summary[phase.name] = phase_summary
         return summary
     
     def _compile_results(self, total_elapsed: float) -> Dict[str, Any]:
@@ -2232,7 +5284,9 @@ class TrainingOrchestrator:
                 "config": asdict(self.config),
                 "timestamp": datetime.now().isoformat(),
                 "pytorch_version": torch.__version__,
-                "device": str(self.device)
+                "device": str(self.device),
+                "state": self.state.snapshot(),
+                "research_metrics": self.state.get_slot("research_metrics", {}),
             }
         }
 

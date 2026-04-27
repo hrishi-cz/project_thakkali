@@ -1,0 +1,379 @@
+{
+  "description": "LoRA rank ablation: r \u2208 {0, 4, 8, 16, 32, 64}",
+  "dataset": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\adult_income_smoke.csv",
+  "seeds": [
+    42
+  ],
+  "ranks_tested": [
+    0,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "results": [
+    {
+      "seed": 42,
+      "lora_r": 0,
+      "val_acc": 0.762499988079071,
+      "val_loss": 0.5407814979553223,
+      "elapsed_s": 8.42,
+      "time_per_epoch_s": 2.807,
+      "total_params": 4929,
+      "trainable_params": 4929,
+      "lora_params": 0,
+      "status": "ok"
+    },
+    {
+      "seed": 42,
+      "lora_r": 4,
+      "val_acc": 0.762499988079071,
+      "val_loss": 0.5438504219055176,
+      "elapsed_s": 7.69,
+      "time_per_epoch_s": 2.563,
+      "total_params": 4929,
+      "trainable_params": 4929,
+      "lora_params": 1024,
+      "status": "ok"
+    },
+    {
+      "seed": 42,
+      "lora_r": 8,
+      "val_acc": 0.762499988079071,
+      "val_loss": 0.5422205328941345,
+      "elapsed_s": 6.61,
+      "time_per_epoch_s": 2.203,
+      "total_params": 4929,
+      "trainable_params": 4929,
+      "lora_params": 2048,
+      "status": "ok"
+    },
+    {
+      "seed": 42,
+      "lora_r": 16,
+      "val_acc": 0.762499988079071,
+      "val_loss": 0.5406786799430847,
+      "elapsed_s": 7.88,
+      "time_per_epoch_s": 2.626,
+      "total_params": 4929,
+      "trainable_params": 4929,
+      "lora_params": 4096,
+      "status": "ok"
+    },
+    {
+      "seed": 42,
+      "lora_r": 32,
+      "val_acc": 0.762499988079071,
+      "val_loss": 0.5427678823471069,
+      "elapsed_s": 7.26,
+      "time_per_epoch_s": 2.421,
+      "total_params": 4929,
+      "trainable_params": 4929,
+      "lora_params": 8192,
+      "status": "ok"
+    },
+    {
+      "seed": 42,
+      "lora_r": 64,
+      "val_acc": 0.762499988079071,
+      "val_loss": 0.5416272878646851,
+      "elapsed_s": 6.83,
+      "time_per_epoch_s": 2.276,
+      "total_params": 4929,
+      "trainable_params": 4929,
+      "lora_params": 16384,
+      "status": "ok"
+    }
+  ],
+  "summary": {
+    "r=0": {
+      "lora_r": 0,
+      "val_acc": {
+        "mean": 0.7625,
+        "std": 0.0,
+        "ci95_low": 0.7625,
+        "ci95_high": 0.7625,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 0.7625,
+        "max": 0.7625,
+        "n": 1
+      },
+      "trainable_params": {
+        "mean": 4929.0,
+        "std": 0.0,
+        "ci95_low": 4929.0,
+        "ci95_high": 4929.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 4929.0,
+        "max": 4929.0,
+        "n": 1
+      },
+      "lora_params": {
+        "mean": 0.0,
+        "std": 0.0,
+        "ci95_low": 0.0,
+        "ci95_high": 0.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 1
+      },
+      "time_per_epoch_s": {
+        "mean": 2.807,
+        "std": 0.0,
+        "ci95_low": 2.807,
+        "ci95_high": 2.807,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 2.807,
+        "max": 2.807,
+        "n": 1
+      },
+      "n_seeds": 1
+    },
+    "r=4": {
+      "lora_r": 4,
+      "val_acc": {
+        "mean": 0.7625,
+        "std": 0.0,
+        "ci95_low": 0.7625,
+        "ci95_high": 0.7625,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 0.7625,
+        "max": 0.7625,
+        "n": 1
+      },
+      "trainable_params": {
+        "mean": 4929.0,
+        "std": 0.0,
+        "ci95_low": 4929.0,
+        "ci95_high": 4929.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 4929.0,
+        "max": 4929.0,
+        "n": 1
+      },
+      "lora_params": {
+        "mean": 1024.0,
+        "std": 0.0,
+        "ci95_low": 1024.0,
+        "ci95_high": 1024.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 1024.0,
+        "max": 1024.0,
+        "n": 1
+      },
+      "time_per_epoch_s": {
+        "mean": 2.563,
+        "std": 0.0,
+        "ci95_low": 2.563,
+        "ci95_high": 2.563,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 2.563,
+        "max": 2.563,
+        "n": 1
+      },
+      "n_seeds": 1
+    },
+    "r=8": {
+      "lora_r": 8,
+      "val_acc": {
+        "mean": 0.7625,
+        "std": 0.0,
+        "ci95_low": 0.7625,
+        "ci95_high": 0.7625,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 0.7625,
+        "max": 0.7625,
+        "n": 1
+      },
+      "trainable_params": {
+        "mean": 4929.0,
+        "std": 0.0,
+        "ci95_low": 4929.0,
+        "ci95_high": 4929.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 4929.0,
+        "max": 4929.0,
+        "n": 1
+      },
+      "lora_params": {
+        "mean": 2048.0,
+        "std": 0.0,
+        "ci95_low": 2048.0,
+        "ci95_high": 2048.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 2048.0,
+        "max": 2048.0,
+        "n": 1
+      },
+      "time_per_epoch_s": {
+        "mean": 2.203,
+        "std": 0.0,
+        "ci95_low": 2.203,
+        "ci95_high": 2.203,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 2.203,
+        "max": 2.203,
+        "n": 1
+      },
+      "n_seeds": 1
+    },
+    "r=16": {
+      "lora_r": 16,
+      "val_acc": {
+        "mean": 0.7625,
+        "std": 0.0,
+        "ci95_low": 0.7625,
+        "ci95_high": 0.7625,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 0.7625,
+        "max": 0.7625,
+        "n": 1
+      },
+      "trainable_params": {
+        "mean": 4929.0,
+        "std": 0.0,
+        "ci95_low": 4929.0,
+        "ci95_high": 4929.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 4929.0,
+        "max": 4929.0,
+        "n": 1
+      },
+      "lora_params": {
+        "mean": 4096.0,
+        "std": 0.0,
+        "ci95_low": 4096.0,
+        "ci95_high": 4096.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 4096.0,
+        "max": 4096.0,
+        "n": 1
+      },
+      "time_per_epoch_s": {
+        "mean": 2.626,
+        "std": 0.0,
+        "ci95_low": 2.626,
+        "ci95_high": 2.626,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 2.626,
+        "max": 2.626,
+        "n": 1
+      },
+      "n_seeds": 1
+    },
+    "r=32": {
+      "lora_r": 32,
+      "val_acc": {
+        "mean": 0.7625,
+        "std": 0.0,
+        "ci95_low": 0.7625,
+        "ci95_high": 0.7625,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 0.7625,
+        "max": 0.7625,
+        "n": 1
+      },
+      "trainable_params": {
+        "mean": 4929.0,
+        "std": 0.0,
+        "ci95_low": 4929.0,
+        "ci95_high": 4929.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 4929.0,
+        "max": 4929.0,
+        "n": 1
+      },
+      "lora_params": {
+        "mean": 8192.0,
+        "std": 0.0,
+        "ci95_low": 8192.0,
+        "ci95_high": 8192.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 8192.0,
+        "max": 8192.0,
+        "n": 1
+      },
+      "time_per_epoch_s": {
+        "mean": 2.421,
+        "std": 0.0,
+        "ci95_low": 2.421,
+        "ci95_high": 2.421,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 2.421,
+        "max": 2.421,
+        "n": 1
+      },
+      "n_seeds": 1
+    },
+    "r=64": {
+      "lora_r": 64,
+      "val_acc": {
+        "mean": 0.7625,
+        "std": 0.0,
+        "ci95_low": 0.7625,
+        "ci95_high": 0.7625,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 0.7625,
+        "max": 0.7625,
+        "n": 1
+      },
+      "trainable_params": {
+        "mean": 4929.0,
+        "std": 0.0,
+        "ci95_low": 4929.0,
+        "ci95_high": 4929.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 4929.0,
+        "max": 4929.0,
+        "n": 1
+      },
+      "lora_params": {
+        "mean": 16384.0,
+        "std": 0.0,
+        "ci95_low": 16384.0,
+        "ci95_high": 16384.0,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 16384.0,
+        "max": 16384.0,
+        "n": 1
+      },
+      "time_per_epoch_s": {
+        "mean": 2.276,
+        "std": 0.0,
+        "ci95_low": 2.276,
+        "ci95_high": 2.276,
+        "bootstrap_ci95_low": null,
+        "bootstrap_ci95_high": null,
+        "min": 2.276,
+        "max": 2.276,
+        "n": 1
+      },
+      "n_seeds": 1
+    }
+  }
+}

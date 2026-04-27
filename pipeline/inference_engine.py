@@ -12,6 +12,7 @@ models/registry/{model_id}/
 │   ├── text_encoder_state.pth      – frozen TextEncoder weights (optional)
 │   ├── image_encoder_state.pth     – frozen ImageEncoder weights (optional)
 │   ├── encoder_config.json         – encoder model names + settings (optional)
+│   ├── probability_calibrator.joblib – post-hoc probability calibration (optional)
 │   └── schema.json                 – GlobalSchema from Phase 2
 └── metadata.json                   – full provenance (config, artifact_paths, …)
 
@@ -37,6 +38,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
+from config.paths import MODEL_REGISTRY_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +75,7 @@ class MultimodalInferenceEngine:
 
     def __init__(self, model_id: str) -> None:
         self.model_id: str = model_id
-        registry_root: Path = Path("models") / "registry" / model_id
+        registry_root: Path = MODEL_REGISTRY_DIR / model_id
         self.artifacts_dir: Path = registry_root / "artifacts"
 
         if not self.artifacts_dir.exists():
@@ -94,6 +97,7 @@ class MultimodalInferenceEngine:
         self.tabular_prep: Optional[Any] = self._load_tabular_prep()
         self.tokenizer: Optional[Any]    = self._load_tokenizer()
         self.target_encoder: Optional[Any] = self._load_target_encoder()
+        self.probability_calibrator: Optional[Any] = self._load_probability_calibrator()
 
         # Load trained tabular encoder (GRN/MLP) if saved
         self._tabular_encoder: Optional[nn.Module] = self._load_tabular_encoder()
@@ -125,11 +129,51 @@ class MultimodalInferenceEngine:
             except Exception as exc:
                 logger.warning("Could not load ImagePreprocessor: %s", exc)
 
+        # Part A.1 — ULA token-mode: detect whether the loaded head uses UnifiedLatentFusion
+        # with token_mode=True, so _build_batch can return full token sequences instead
+        # of pooled vectors — enabling true cross-modal attention at inference time.
+        try:
+            from modelss.fusion import UnifiedLatentFusion as _ULAInfer
+            _head_fusion = getattr(self._head, "fusion", None)
+            self._use_token_sequences: bool = (
+                isinstance(_head_fusion, _ULAInfer) and
+                getattr(_head_fusion, "token_mode", False)
+            )
+        except Exception:
+            self._use_token_sequences = False
+
+        # Part A.1 — Load LoRA adapters if lora_text.pth / lora_image.pth present.
+        # LoRA weights are the low-rank deltas trained during Phase 5 on top of
+        # the frozen encoder backbone — they must be re-applied at inference time.
+        _lora_cfg = self._load_json(self.artifacts_dir / "encoder_config.json") or {}
+        _lora_r = int((_lora_cfg.get("text_encoder") or {}).get("lora_r", 8))
+        _lora_alpha = float((_lora_cfg.get("text_encoder") or {}).get("lora_alpha", 16.0))
+        try:
+            from modelss.adapters.lora import apply_lora, load_lora_state_dict
+            _lora_text_path = self.artifacts_dir / "lora_text.pth"
+            if _lora_text_path.exists() and self._text_encoder is not None:
+                apply_lora(self._text_encoder, r=_lora_r, alpha=_lora_alpha)
+                load_lora_state_dict(
+                    self._text_encoder,
+                    torch.load(_lora_text_path, map_location="cpu", weights_only=True),
+                )
+                logger.info("InferenceEngine: LoRA text adapter loaded (r=%d)", _lora_r)
+            _lora_image_path = self.artifacts_dir / "lora_image.pth"
+            if _lora_image_path.exists() and self._image_encoder is not None:
+                apply_lora(self._image_encoder, r=_lora_r, alpha=_lora_alpha)
+                load_lora_state_dict(
+                    self._image_encoder,
+                    torch.load(_lora_image_path, map_location="cpu", weights_only=True),
+                )
+                logger.info("InferenceEngine: LoRA image adapter loaded (r=%d)", _lora_r)
+        except Exception as _lora_inf_exc:
+            logger.debug("LoRA inference load skipped: %s", _lora_inf_exc)
+
         logger.info(
             "InferenceEngine ready: model_id=%s  problem=%s  "
-            "modalities=%s  input_dims=%s  device=%s",
+            "modalities=%s  input_dims=%s  device=%s  ula_token_mode=%s",
             model_id, self.problem_type, self.modalities,
-            self.input_dims, self.device,
+            self.input_dims, self.device, self._use_token_sequences,
         )
 
     # ------------------------------------------------------------------ #
@@ -139,6 +183,8 @@ class MultimodalInferenceEngine:
     def predict_batch(
         self,
         inputs: Union[List[Dict[str, Any]], pd.DataFrame],
+        execution_context: Optional[Any] = None,
+        modality_mask: Optional[Dict[str, bool]] = None,
     ) -> Dict[str, Any]:
         """
         Run batch inference under ``torch.no_grad()``.
@@ -149,6 +195,13 @@ class MultimodalInferenceEngine:
             Raw feature values.  Each dict / row should contain the column
             names that were present in the original training data.
             Missing columns are zero-filled; extra columns are ignored.
+        execution_context : ExecutionContext, optional
+            If supplied, a decision log entry is written after inference.
+        modality_mask : Dict[str, bool], optional
+            G26: Zero-out specific modality tensors before the forward pass.
+            Example: ``{"image": False}`` runs inference without the image
+            modality (ablation / missing-modality robustness test).  Keys not
+            present default to ``True`` (modality active).
 
         Returns
         -------
@@ -157,9 +210,26 @@ class MultimodalInferenceEngine:
             ``confidences``  – list of float (max class probability or 1.0 for regression)
             ``problem_type`` – str
             ``n_samples``    – int
+            ``modality_mask`` – echoed back when a mask was applied
         """
         batch: Dict[str, torch.Tensor] = self._build_batch(inputs)
         batch = {k: v.to(self.device) for k, v in batch.items()}
+
+        # G26: Apply modality mask — zero-out masked modality tensors
+        if modality_mask:
+            for mod_name, active in modality_mask.items():
+                if not active and mod_name in batch:
+                    logger.debug(
+                        "G26: modality_mask zeroing '%s' tensor for ablation", mod_name
+                    )
+                    batch[mod_name] = torch.zeros_like(batch[mod_name])
+
+        # Detect which modalities are genuinely present vs. dummy-filled
+        trained_mods = set(getattr(self._head, "_keys", []) if self._head else [])
+        present_mods = {k for k in batch if k in trained_mods and batch[k].abs().max() > 1e-6}
+        if trained_mods and present_mods < trained_mods:
+            absent = trained_mods - present_mods
+            logger.warning("predict_batch: modalities absent or dummy-filled: %s", absent)
 
         with torch.no_grad():
             logits: torch.Tensor = self._head(batch)
@@ -201,12 +271,34 @@ class MultimodalInferenceEngine:
             except Exception as exc:
                 logger.warning("target_encoder inverse_transform failed: %s", exc)
 
-        return {
+        result = {
             "predictions":  pred_list,
             "confidences":  confidences.tolist(),
             "problem_type": self.problem_type,
             "n_samples":    len(pred_list),
         }
+        if modality_mask:
+            result["modality_mask"] = {k: bool(v) for k, v in modality_mask.items()}
+
+        if execution_context is not None and hasattr(execution_context, "log_decision"):
+            try:
+                execution_context.log_decision(
+                    "inference",
+                    (
+                        "Predictions generated: "
+                        f"n_samples={len(pred_list)}, "
+                        f"problem_type={self.problem_type}"
+                        + (f", modality_mask={modality_mask}" if modality_mask else "")
+                    ),
+                    evidence=(
+                        "active_prediction_model_id="
+                        f"{getattr(execution_context, 'active_prediction_model_id', None)}"
+                    ),
+                )
+            except Exception:
+                pass
+
+        return result
 
     # ------------------------------------------------------------------ #
     # Public API – explainability
@@ -353,7 +445,190 @@ class MultimodalInferenceEngine:
                     frozen_tabular=batch.get("tabular"),
                 )
 
+        # Image GradCAM — uses the last Conv2d in the image encoder
+        if self._image_encoder is not None and "image_pooled" in self.input_dims:
+            image_tensor: Optional[torch.Tensor] = self._extract_image_tensors(inputs)
+            if image_tensor is not None:
+                explanations["image"] = self._image_gradcam(
+                    image_tensor[:1],     # first sample only
+                    target_class=target_class,
+                )
+
         return explanations
+
+    def _image_gradcam(
+        self,
+        img_tensor: torch.Tensor,
+        target_class: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        GradCAM spatial saliency map for image inputs.
+
+        Hooks the last Conv2d in the image encoder, runs a forward-backward
+        pass, and computes ReLU(Σ_c α_c · A_c) where α_c is the
+        global-average-pooled gradient of the c-th activation map.
+
+        Returns
+        -------
+        dict with keys:
+            ``heatmap``       – list[list[float]] — 2D normalised saliency [0,1]
+            ``heatmap_shape`` – [H, W]
+            ``method``        – "GradCAM"
+            ``input_shape``   – [C, H, W]
+        """
+        try:
+            img = img_tensor.to(self.device).float()
+            img.requires_grad_(True)
+
+            # Locate the last Conv2d in the encoder
+            last_conv: Optional[torch.nn.Module] = None
+            for m in self._image_encoder.modules():
+                if isinstance(m, torch.nn.Conv2d):
+                    last_conv = m
+
+            if last_conv is None:
+                # Part E — Attention Rollout for ViT encoders (Abnar & Zuidema, 2020)
+                # When no Conv2d exists the encoder is a ViT; roll out attention maps
+                # across all transformer layers to produce a patch-level saliency grid.
+                return self._attention_rollout(img)
+
+            activations: list = []
+            gradients: list = []
+
+            def _fwd(m, i, o):
+                activations.clear(); activations.append(o.detach())
+
+            def _bwd(m, gi, go):
+                gradients.clear(); gradients.append(go[0].detach())
+
+            fwd_h = last_conv.register_forward_hook(_fwd)
+            bwd_h = last_conv.register_backward_hook(_bwd)
+
+            try:
+                with torch.enable_grad():
+                    feat = self._image_encoder(img)          # (1, D)
+                    if isinstance(feat, tuple):
+                        feat = feat[0]
+                    # Use the most-activated dimension as the scalar to backprop
+                    score = feat[0, target_class % feat.shape[-1]]
+                    score.backward()
+            finally:
+                fwd_h.remove()
+                bwd_h.remove()
+
+            if not activations or not gradients:
+                return {"gradcam_available": False, "note": "Hook capture failed."}
+
+            act = activations[0][0]                                    # (C, H, W)
+            grd = gradients[0][0]                                      # (C, H, W)
+            weights = grd.mean(dim=(1, 2), keepdim=True)               # (C, 1, 1)
+            cam = torch.nn.functional.relu((weights * act).sum(dim=0)) # (H, W)
+            cam_np = cam.cpu().numpy()
+
+            lo, hi = float(cam_np.min()), float(cam_np.max())
+            cam_norm = ((cam_np - lo) / (hi - lo + 1e-8)).tolist()    # nested list
+
+            return {
+                "gradcam_available": True,
+                "heatmap": cam_norm,
+                "heatmap_shape": list(cam_np.shape),
+                "method": "GradCAM",
+                "input_shape": list(img_tensor.shape[1:]),
+                "note": "GradCAM: ReLU(Σ_c α_c·A_c) over last Conv2d, normalised [0,1].",
+            }
+
+        except Exception as exc:
+            logger.warning("Image GradCAM failed: %s", exc)
+            return {"gradcam_available": False, "note": str(exc)}
+
+    def _attention_rollout(self, img_tensor: torch.Tensor) -> Dict[str, Any]:
+        """
+        Attention Rollout XAI for ViT image encoders (Abnar & Zuidema, 2020).
+
+        Registers forward hooks on every TransformerEncoderLayer to capture
+        per-head attention weights, then recursively multiplies augmented
+        matrices (A_l = 0.5·I + 0.5·mean_heads(attn)) across layers.  The
+        CLS-to-patch row of the final product gives a spatial importance map.
+
+        Returns the same dict shape as GradCAM so the frontend can render it
+        identically, with ``method="AttentionRollout"``.
+        """
+        try:
+            import torch.nn as _nn
+            attns: list = []
+            hooks: list = []
+
+            # Collect attention weight tensors from each encoder layer
+            _enc = self._image_encoder
+            candidates = []
+            for m in _enc.modules():
+                if isinstance(m, _nn.TransformerEncoderLayer):
+                    candidates.append(m)
+
+            if not candidates:
+                return {"gradcam_available": False, "note": "No TransformerEncoderLayer found for attention rollout."}
+
+            def _make_hook(store):
+                def _hook(module, inp, out):
+                    # output_attentions path: out is (tensor, attn_weights)
+                    if isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                        store.append(out[1].detach().cpu())
+                return _hook
+
+            for layer in candidates:
+                hooks.append(layer.register_forward_hook(_make_hook(attns)))
+
+            try:
+                with torch.no_grad():
+                    img = img_tensor.to(self.device).float()
+                    if hasattr(_enc, "forward"):
+                        import inspect as _inspect
+                        _params = _inspect.signature(_enc.forward).parameters
+                        if "output_attentions" in _params:
+                            _enc(img, output_attentions=True)
+                        elif "return_all_tokens" in _params:
+                            _enc(img, return_all_tokens=True)
+                        else:
+                            _enc(img)
+                    else:
+                        _enc(img)
+            finally:
+                for h in hooks:
+                    h.remove()
+
+            if not attns:
+                return {"gradcam_available": False, "note": "Attention hook captured 0 tensors."}
+
+            # Rollout: A_l = 0.5·I + 0.5·mean_heads(attn); product across layers
+            T = attns[0].shape[-1]
+            rollout = torch.eye(T)
+            for a in attns:
+                # a: (N, heads, T, T) — average over heads
+                a_mean = a.mean(dim=1).squeeze(0)          # (T, T)
+                a_aug = 0.5 * torch.eye(T) + 0.5 * a_mean
+                rollout = a_aug @ rollout
+
+            # CLS token (index 0) → all patch tokens (1:)
+            cls_attn = rollout[0, 1:]                      # (P,)
+            patch_grid = int(len(cls_attn) ** 0.5)
+            if patch_grid * patch_grid != len(cls_attn):
+                patch_grid = int(len(cls_attn) ** 0.5) + 1
+
+            grid = cls_attn[:patch_grid * patch_grid].reshape(patch_grid, patch_grid).numpy()
+            lo, hi = float(grid.min()), float(grid.max())
+            grid_norm = ((grid - lo) / (hi - lo + 1e-8)).tolist()
+
+            return {
+                "gradcam_available": True,
+                "heatmap": grid_norm,
+                "heatmap_shape": [patch_grid, patch_grid],
+                "method": "AttentionRollout",
+                "input_shape": list(img_tensor.shape[1:]),
+                "note": "Abnar & Zuidema (2020) Attention Rollout across ViT encoder layers.",
+            }
+        except Exception as exc:
+            logger.warning("Attention rollout failed: %s", exc)
+            return {"gradcam_available": False, "note": str(exc)}
 
     # ------------------------------------------------------------------ #
     # Artifact loaders
@@ -396,6 +671,19 @@ class MultimodalInferenceEngine:
             return enc
         except Exception as exc:
             logger.warning("Could not load target_encoder: %s", exc)
+            return None
+
+    def _load_probability_calibrator(self) -> Optional[Any]:
+        path = self.artifacts_dir / "probability_calibrator.joblib"
+        if not path.exists():
+            return None
+        try:
+            import joblib
+            calibrator = joblib.load(path)
+            logger.info("Loaded probability_calibrator from %s", path)
+            return calibrator
+        except Exception as exc:
+            logger.warning("Could not load probability_calibrator: %s", exc)
             return None
 
     def _load_tabular_encoder(self) -> Optional[nn.Module]:
@@ -491,19 +779,34 @@ class MultimodalInferenceEngine:
             return None
 
     def _load_image_encoder(self) -> Optional[nn.Module]:
-        """Load frozen ImageEncoder from saved state dict (no safe fallback)."""
+        """Load frozen ImageEncoder from saved state dict, with pretrained fallback."""
         if "image" not in self.modalities:
             return None
 
         state_path = self.artifacts_dir / "image_encoder_state.pth"
         if not state_path.exists():
-            logger.warning(
-                "ImageEncoder state dict not found at %s. "
-                "Image features will be zero-filled. "
-                "Retrain to save encoder weights for proper image inference.",
-                state_path,
-            )
-            return None
+            # Fallback: use pretrained ResNet-50 backbone (same as text encoder fallback pattern)
+            try:
+                from models.encoders.image import ImageEncoder
+
+                encoder = ImageEncoder(pretrained=True, freeze_backbone=True)
+                encoder.eval()
+                for p in encoder.parameters():
+                    p.requires_grad = False
+                encoder.to(self.device)
+                logger.warning(
+                    "ImageEncoder state dict not found at %s. "
+                    "Using pretrained ResNet-50 backbone. "
+                    "Retrain to persist fine-tuned encoder weights.",
+                    state_path,
+                )
+                return encoder
+            except Exception as fallback_exc:
+                logger.warning(
+                    "ImageEncoder pretrained fallback failed (%s). Image features will be zero-filled.",
+                    fallback_exc,
+                )
+                return None
 
         try:
             from models.encoders.image import ImageEncoder
@@ -595,22 +898,44 @@ class MultimodalInferenceEngine:
                 "Ensure the model was saved with the standard _MultimodalHead."
             )
 
-        hidden_dim: int  = int(w0.shape[0])
-        total_dim: int   = int(w0.shape[1])
-        num_outputs: int = int(b_last.shape[0])
+        head_arch = (self.metadata or {}).get("head_architecture") or {}
+        try:
+            hidden_dim = int(head_arch.get("hidden_dim", w0.shape[0]))
+        except (TypeError, ValueError):
+            hidden_dim = int(w0.shape[0])
+        try:
+            total_dim = int(head_arch.get("total_dim", w0.shape[1]))
+        except (TypeError, ValueError):
+            total_dim = int(w0.shape[1])
+        try:
+            num_outputs = int(head_arch.get("num_outputs", b_last.shape[0]))
+        except (TypeError, ValueError):
+            num_outputs = int(b_last.shape[0])
 
-        # Derive input_dims from loaded preprocessor + schema
-        input_dims: Dict[str, int] = self._build_input_dims(total_dim)
+        # Bug 1 fix: try loading persisted input_dims.json first (saved by Phase 7).
+        # This is required for non-ResNet encoders (DINOv2=768, SigLIP=768) where
+        # the hard-coded heuristic (TEXT=768, IMAGE=512) produces wrong dimensions.
+        input_dims: Dict[str, int] = {}
+        _idims_path = self.artifacts_dir / "input_dims.json"
+        if _idims_path.exists():
+            try:
+                _persisted = self._load_json(_idims_path)
+                if isinstance(_persisted, dict) and _persisted:
+                    input_dims = {str(k): int(v) for k, v in _persisted.items()}
+                    logger.info("input_dims loaded from persisted file: %s", input_dims)
+            except Exception as _load_exc:
+                logger.warning("input_dims.json load failed: %s — falling back to reconstruction", _load_exc)
 
-        # Sanity-check computed total vs. state dict total
-        computed_total: int = sum(input_dims.values())
-        if computed_total != total_dim:
-            logger.warning(
-                "input_dims total %d != state-dict total_dim %d "
-                "– falling back to single tabular bucket.",
-                computed_total, total_dim,
-            )
-            input_dims = {"tabular": total_dim}
+        if not input_dims:
+            # Fallback: heuristic reconstruction from preprocessor output dims
+            input_dims = self._build_input_dims(total_dim)
+            computed_total: int = sum(input_dims.values())
+            if computed_total != total_dim:
+                raise RuntimeError(
+                    f"input_dims reconstruction mismatch: computed {computed_total} != "
+                    f"saved total_dim {total_dim}. Re-run Phase 7 training to persist "
+                    "input_dims.json with the correct encoder output dimensions."
+                )
 
         from automl.trainer import _MultimodalHead
 
@@ -696,35 +1021,72 @@ class MultimodalInferenceEngine:
                         batch["tabular"].to(self.device)
                     ).cpu()
 
-        # ── Text: encode through BERT when available ────────────────────
+        # ── Text: encode through BERT (pooled CLS or full token sequence for ULA) ──
         if "text_pooled" in self.input_dims:
             text_values: List[str] = self._extract_text_values(inputs)
             if text_values and self._text_encoder is not None:
-                # Pad to batch size if fewer text values than rows
                 while len(text_values) < N:
                     text_values.append("")
                 with torch.no_grad():
-                    text_pooled = self._text_encoder(text_values)  # [N, 768]
-                batch["text_pooled"] = text_pooled.to(self.device)
+                    if self._use_token_sequences and hasattr(self._text_encoder, "transformer"):
+                        # ULA token-mode: full last_hidden_state (N, T, hidden_size)
+                        _tok = getattr(self._text_encoder, "tokenizer", None)
+                        if _tok is not None:
+                            _enc = _tok(
+                                text_values, return_tensors="pt", padding=True, truncation=True
+                            ).to(self.device)
+                            _out = self._text_encoder.transformer(
+                                input_ids=_enc["input_ids"],
+                                attention_mask=_enc.get("attention_mask"),
+                            )
+                            batch["text_pooled"] = _out.last_hidden_state  # (N, T, 768)
+                        else:
+                            batch["text_pooled"] = self._text_encoder(text_values).to(self.device)
+                    else:
+                        batch["text_pooled"] = self._text_encoder(text_values).to(self.device)
             else:
                 if not text_values:
                     logger.debug("_build_batch: no text values found in input")
                 if self._text_encoder is None:
-                    logger.debug("_build_batch: no text encoder loaded")
+                    # Bug 10: upgrade to WARNING — silent dummy fill corrupts predictions
+                    logger.warning(
+                        "Head expects 'text_pooled' but no TextEncoder loaded — "
+                        "using dummy embeddings (accuracy severely degraded). "
+                        "Ensure text_encoder_state.pth is in the model artifacts directory."
+                    )
                 batch["text_pooled"] = torch.full(
                     (N, self.TEXT_DIM), 1e-7, dtype=torch.float32
                 )
 
-        # ── Image: encode through ResNet when available ─────────────────
+        # ── Image: encode through encoder (pooled or patch tokens for ULA) ──
         if "image_pooled" in self.input_dims:
             image_tensor: Optional[torch.Tensor] = self._extract_image_tensors(inputs)
             if image_tensor is not None and self._image_encoder is not None:
                 with torch.no_grad():
-                    image_pooled = self._image_encoder(
-                        image_tensor.to(self.device)
-                    )  # [N, 512]
-                batch["image_pooled"] = image_pooled
+                    if self._use_token_sequences:
+                        import inspect as _inspect
+                        _sig = _inspect.signature(self._image_encoder.forward)
+                        if "return_all_tokens" in _sig.parameters:
+                            # ULA token-mode: patch sequence (N, P, D)
+                            batch["image_pooled"] = self._image_encoder(
+                                image_tensor.to(self.device), return_all_tokens=True
+                            )
+                        else:
+                            batch["image_pooled"] = self._image_encoder(
+                                image_tensor.to(self.device)
+                            )
+                    else:
+                        batch["image_pooled"] = self._image_encoder(
+                            image_tensor.to(self.device)
+                        )  # [N, 512]
             else:
+                if self._image_encoder is None and image_tensor is None:
+                    # Bug 10: upgrade to WARNING — silent dummy fill corrupts predictions
+                    logger.warning(
+                        "Head expects 'image_pooled' but no ImageEncoder loaded or no image "
+                        "inputs provided — using dummy embeddings (accuracy severely degraded). "
+                        "Ensure image_encoder_state.pth is in the model artifacts directory."
+                    )
                 batch["image_pooled"] = torch.full(
                     (N, self.IMAGE_DIM), 1e-7, dtype=torch.float32
                 )
@@ -748,15 +1110,45 @@ class MultimodalInferenceEngine:
         confidences  : max class probability for classification, 1.0 for regression
         """
         if self.problem_type == "classification_binary":
-            probs = torch.sigmoid(logits.squeeze(-1))      # (N,)
+            probs_np = torch.sigmoid(logits.squeeze(-1)).detach().cpu().numpy()  # (N,)
+            if self.probability_calibrator is not None:
+                try:
+                    probs_np = self.probability_calibrator.calibrate(
+                        logits.detach().cpu().numpy(),
+                        probs_np,
+                    )
+                except Exception as exc:
+                    logger.warning("Binary calibration failed: %s", exc)
+
+            probs = torch.tensor(probs_np, dtype=torch.float32)
             preds = (probs >= 0.5).long()
             confidences = torch.where(preds.bool(), probs, 1.0 - probs)
         elif self.problem_type == "multilabel_classification":
-            probs = torch.sigmoid(logits)                  # (N, C)
-            preds = (probs >= 0.5).long()                  # (N, C) multi-hot
-            confidences = probs                            # (N, C) per-class conf
+            probs_np = torch.sigmoid(logits).detach().cpu().numpy()  # (N, C)
+            if self.probability_calibrator is not None:
+                try:
+                    probs_np = self.probability_calibrator.calibrate(
+                        logits.detach().cpu().numpy(),
+                        probs_np,
+                    )
+                except Exception as exc:
+                    logger.warning("Multilabel calibration failed: %s", exc)
+
+            probs = torch.tensor(probs_np, dtype=torch.float32)
+            preds = (probs >= 0.5).long()
+            confidences = probs
         elif self.problem_type.startswith("classification"):
-            probs = torch.softmax(logits, dim=-1)          # (N, C)
+            probs_np = torch.softmax(logits, dim=-1).detach().cpu().numpy()  # (N, C)
+            if self.probability_calibrator is not None:
+                try:
+                    probs_np = self.probability_calibrator.calibrate(
+                        logits.detach().cpu().numpy(),
+                        probs_np,
+                    )
+                except Exception as exc:
+                    logger.warning("Multiclass calibration failed: %s", exc)
+
+            probs = torch.tensor(probs_np, dtype=torch.float32)
             confidences, preds = probs.max(dim=-1)
         else:
             preds       = logits.squeeze(-1)
@@ -1111,19 +1503,40 @@ class MultimodalInferenceEngine:
     ) -> List[str]:
         """Extract text values using schema-detected text columns with fallbacks."""
         per_ds = self.schema.get("per_dataset", [{}])
-        detected = per_ds[0].get("detected_columns", {}) if per_ds else {}
-        text_cols: List[str] = detected.get("text", [])
+        text_cols: List[str] = []
+        for ds_entry in per_ds:
+            detected = ds_entry.get("detected_columns", {}) if isinstance(ds_entry, dict) else {}
+            for col in detected.get("text", []):
+                if col not in text_cols:
+                    text_cols.append(col)
 
         if isinstance(inputs, pd.DataFrame):
             df = inputs
         else:
             df = pd.DataFrame(inputs)
 
-        # Try schema-detected text columns first, then common names
+        candidate_cols: List[str] = []
         for col in text_cols + ["text", "report", "description", "content", "body"]:
-            if col in df.columns:
-                return df[col].fillna("").astype(str).tolist()
-        return []
+            if col in df.columns and col not in candidate_cols:
+                candidate_cols.append(col)
+
+        if not candidate_cols:
+            return []
+
+        subset = df[candidate_cols]
+        output: List[str] = []
+        for _, row in subset.iterrows():
+            parts: List[str] = []
+            for val in row.tolist():
+                if pd.isna(val):
+                    continue
+                text = str(val).strip()
+                if text.lower() in {"", "nan", "none", "null", "<na>"}:
+                    continue
+                parts.append(text)
+            output.append(" ".join(parts))
+
+        return output
 
     def _extract_image_tensors(
         self,
@@ -1134,28 +1547,43 @@ class MultimodalInferenceEngine:
             return None
 
         per_ds = self.schema.get("per_dataset", [{}])
-        detected = per_ds[0].get("detected_columns", {}) if per_ds else {}
-        image_cols: List[str] = detected.get("image", [])
+        image_cols: List[str] = []
+        for ds_entry in per_ds:
+            detected = ds_entry.get("detected_columns", {}) if isinstance(ds_entry, dict) else {}
+            for col in detected.get("image", []):
+                if col not in image_cols:
+                    image_cols.append(col)
 
         if isinstance(inputs, pd.DataFrame):
             df = inputs
         else:
             df = pd.DataFrame(inputs)
 
-        # Find the image column
-        col: Optional[str] = None
+        candidate_cols: List[str] = []
         for candidate in image_cols + ["image_path", "image", "img_path", "file_path"]:
-            if candidate in df.columns:
-                col = candidate
-                break
-        if col is None:
+            if candidate in df.columns and candidate not in candidate_cols:
+                candidate_cols.append(candidate)
+
+        if not candidate_cols:
             return None
 
         from PIL import Image as PILImage
 
         tensors: List[torch.Tensor] = []
-        for path_val in df[col]:
+        for _, row in df[candidate_cols].iterrows():
+            path_val: Optional[str] = None
+            for raw in row.tolist():
+                if pd.isna(raw):
+                    continue
+                candidate_path = str(raw).strip()
+                if candidate_path.lower() in {"", "nan", "none", "null", "<na>"}:
+                    continue
+                path_val = candidate_path
+                break
+
             try:
+                if not path_val:
+                    raise ValueError("no usable image path in row")
                 pil_img = PILImage.open(str(path_val)).convert("RGB")
                 tensor = self._image_preprocessor.preprocess(pil_img)
                 tensors.append(tensor)
@@ -1163,7 +1591,24 @@ class MultimodalInferenceEngine:
                 logger.warning("Image load failed for '%s': %s", path_val, exc)
                 tensors.append(torch.zeros(3, 224, 224, dtype=torch.float32))
 
-        return torch.stack(tensors) if tensors else None
+        if not tensors:
+            return None
+
+        result_stack = torch.stack(tensors)
+
+        # Bug 11: track image path failure rate and warn when degraded
+        _zero = torch.zeros(3, 224, 224)
+        _fail_count = sum(1 for t in tensors if torch.equal(t, _zero))
+        if _fail_count > 0:
+            _rate = _fail_count / len(tensors)
+            _log = logger.warning if _rate > 0.3 else logger.info
+            _log(
+                "Image loading: %d/%d paths failed (%.0f%%)%s",
+                _fail_count, len(tensors), _rate * 100,
+                " — predictions may be unreliable" if _rate > 0.3 else "",
+            )
+
+        return result_stack
 
     # ------------------------------------------------------------------ #
     # Static: safe JSON loader

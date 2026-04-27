@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -oP '\\\\{API_BASE_URL\\\\}/[^\"'\\\\''`\\\\s]+' \"c:/Users/Acer/Desktop/main project/apex2-worktree.worktrees/final_worktree/frontend/app_enhanced.py\")"
+    ]
+  }
+}

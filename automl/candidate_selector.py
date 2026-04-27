@@ -579,8 +579,18 @@ class CandidateSelector:
         -------
         dict  e.g. ``{"tabular": [...], "text": [...], "image": [...]}``
         """
-        modalities = schema_info.get("global_modalities", ["tabular"])
-        dataset_size = schema_info.get("total_samples", 10_000)
+        modalities_raw = schema_info.get("global_modalities")
+        if modalities_raw is None:
+            modalities_raw = schema_info.get("modalities", ["tabular"])
+
+        if isinstance(modalities_raw, dict):
+            modalities = [str(k) for k, v in modalities_raw.items() if bool(v)]
+        elif isinstance(modalities_raw, (list, tuple, set)):
+            modalities = [str(m) for m in modalities_raw]
+        else:
+            modalities = ["tabular"]
+
+        modalities = [m.lower() for m in modalities if m]
 
         candidates: Dict[str, List[Dict]] = {}
 
@@ -588,7 +598,15 @@ class CandidateSelector:
             candidates["tabular"] = list(TABULAR_CANDIDATE_POOL)
 
         if "text" in modalities:
-            avg_tokens = schema_info.get("avg_tokens", 128)
+            avg_tokens_raw = schema_info.get("avg_tokens")
+            if avg_tokens_raw is None:
+                avg_text_len = schema_info.get("avg_text_len", 128)
+                try:
+                    avg_tokens = int(max(8, min(4096, round(float(avg_text_len) / 4.0))))
+                except Exception:
+                    avg_tokens = 128
+            else:
+                avg_tokens = int(avg_tokens_raw)
             candidates["text"] = [
                 c for c in TEXT_CANDIDATE_POOL
                 if avg_tokens <= c["avg_token_limit"]
@@ -633,18 +651,52 @@ class CandidateSelector:
 
         import numpy as np
 
+        X_arr = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
+        y_arr = np.asarray(y).ravel()
+
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(-1, 1)
+
+        n_available = min(len(X_arr), len(y_arr))
+        if n_available <= 1:
+            logger.warning("quick_probe_tabular: insufficient probe rows (%d)", n_available)
+            return {}
+
+        if len(X_arr) != len(y_arr):
+            logger.warning(
+                "quick_probe_tabular: row mismatch X=%d, y=%d; truncating to %d rows",
+                len(X_arr),
+                len(y_arr),
+                n_available,
+            )
+            X_arr = X_arr[:n_available]
+            y_arr = y_arr[:n_available]
+
         # Sub-sample for speed
-        n = min(max_rows, len(X))
-        idx = np.random.default_rng(42).permutation(len(X))[:n]
-        X_s, y_s = X[idx], y[idx]
+        n = min(max_rows, n_available)
+        idx = np.random.default_rng(42).permutation(n_available)[:n]
+        X_s, y_s = X_arr[idx], y_arr[idx]
 
         is_clf = "classification" in problem_type
         
         from sklearn.model_selection import StratifiedKFold, KFold
-        n_splits = 3
+
         if is_clf:
+            _, class_counts = np.unique(y_s, return_counts=True)
+            min_class_count = int(class_counts.min()) if class_counts.size else 0
+            n_splits = min(3, len(y_s), min_class_count)
+            if n_splits < 2:
+                logger.warning(
+                    "quick_probe_tabular: not enough samples per class for CV (min_class_count=%d)",
+                    min_class_count,
+                )
+                return {}
             cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         else:
+            n_splits = min(3, len(y_s))
+            if n_splits < 2:
+                logger.warning("quick_probe_tabular: not enough rows for CV")
+                return {}
             cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
         results: Dict[str, Dict[str, float]] = {}
@@ -737,23 +789,29 @@ class CandidateSelector:
         cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42) if is_clf else KFold(n_splits=3, shuffle=True, random_state=42)
 
         results = {}
+
+        try:
+            import torch
+            from transformers import AutoTokenizer, AutoModel
+        except Exception as exc:
+            logger.warning(
+                "  transformers unavailable, text probe skipped (no synthetic scores): %s",
+                exc,
+            )
+            for cand in candidates:
+                results[cand["name"]] = {
+                    "val_score": None,
+                    "uncertainty": 1.0,
+                    "latency_ms": cand.get("params_m", 100) * 1.5,
+                    "confidence": "NONE",
+                }
+            return results
+
         for cand in candidates:
             name = cand["name"]
             latency_ms_est = cand.get("params_m", 100) * 1.5  # Realistic inference estimate
-            base_acc = {"minilm": 0.78, "distilbert": 0.81, "bert": 0.83, "deberta": 0.85}.get(name, 0.75)
-            
-            # 1. Fallback Proxy Initializer
-            results[name] = {
-                "val_score": base_acc, 
-                "uncertainty": 0.08 + 500 / max(1, n),
-                "latency_ms": latency_ms_est, 
-                "confidence": "LOW (heuristic fallback)"
-            }
 
             try:
-                import torch
-                from transformers import AutoTokenizer, AutoModel
-                
                 # Model lookup mappings
                 hf_map = {
                     "minilm": "sentence-transformers/all-MiniLM-L6-v2",
@@ -814,9 +872,20 @@ class CandidateSelector:
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
 
             except Exception as e:
-                logger.warning("  text linear probe %s failed (falling back to proxy): %s", name, str(e))
+                logger.warning("  text linear probe %s failed: %s", name, str(e))
+                results[name] = {
+                    "val_score": None,
+                    "uncertainty": 1.0,
+                    "latency_ms": latency_ms_est,
+                    "confidence": "NONE",
+                }
 
-        max_unc = max([r.get("uncertainty", 0) for r in results.values()]) if results else 0
+        valid_unc = [
+            r.get("uncertainty", 0)
+            for r in results.values()
+            if r.get("confidence") != "NONE"
+        ]
+        max_unc = max(valid_unc) if valid_unc else 0
         if max_unc > 0.15 and len(texts) > max_rows and not _retried:
             logger.info("  [Adaptive Budget] Text Uncertainty %.4f > 0.15. Retrying with %d rows.", max_unc, max_rows * 2)
             return self.quick_probe_text(candidates, texts, y, problem_type, max_rows * 2, _retried=True)
@@ -1020,7 +1089,8 @@ class CandidateSelector:
             models: List[RankedModel] = []
             for name, cand in tab_pool.items():
                 p = tab_scores.get(name, {})
-                acc = p.get("val_score", 0.0)
+                raw_acc = p.get("val_score")
+                acc = float(raw_acc) if isinstance(raw_acc, (int, float)) else 0.0
                 lat = p.get("latency_ms", 0.0)
                 mem = cand.get("vram_mb", 0.0)
                 unc = p.get("uncertainty", 0.0)
@@ -1040,16 +1110,18 @@ class CandidateSelector:
                 if meta_recommendations and name in meta_recommendations:
                     final += 0.15
                     conf = "META + " + conf
+                has_probe = conf != "NONE"
+                probe_state = "probed" if has_probe else "no_probe_data"
                     
                 rationale = (
-                    f"Probed [{conf}]: acc={acc:.4f} unc=±{unc:.4f} lat={lat:.0f}ms mem={mem:.1f}MB  "
+                    f"{probe_state} [{conf}]: acc={acc:.4f} unc=±{unc:.4f} lat={lat:.0f}ms mem={mem:.1f}MB  "
                     f"final_score={final:.4f} (acc-{lambda_latency}*lat-{mu_memory}*mem-{gamma_unc}*unc)"
                 )
                 models.append(RankedModel(
                     name=name, label=cand["label"], modality="tabular",
                     val_score=acc, latency_ms=lat, cost_score=final,
                     vram_mb=cand["vram_mb"], params_m=cand["params_m"],
-                    rationale=rationale, probed=True,
+                    rationale=rationale, probed=has_probe,
                 ))
             ranked["tabular"] = sorted(models, key=lambda m: m.cost_score, reverse=True)
 
@@ -1059,7 +1131,8 @@ class CandidateSelector:
             models: List[RankedModel] = []
             for name, cand in text_pool.items():
                 p = text_scores.get(name, {})
-                acc = p.get("val_score", 0.0)
+                raw_acc = p.get("val_score")
+                acc = float(raw_acc) if isinstance(raw_acc, (int, float)) else 0.0
                 lat = p.get("latency_ms", 0.0)
                 mem = cand.get("vram_mb", 0.0)
                 unc = p.get("uncertainty", 0.0)
@@ -1072,19 +1145,22 @@ class CandidateSelector:
                 
                 final = norm_acc - (lambda_latency * norm_lat) - (mu_memory * norm_mem) - (gamma_unc * norm_unc)
                 
+                has_probe = conf != "NONE"
+
                 if meta_recommendations and name in meta_recommendations:
                     final += 0.15
                     conf = "META + " + conf
+                probe_state = "probed" if has_probe else "no_probe_data"
                 
                 rationale = (
-                    f"Probed [{conf}]: acc={acc:.4f} unc=±{unc:.4f} lat={lat:.0f}ms mem={mem:.1f}MB  "
+                    f"{probe_state} [{conf}]: acc={acc:.4f} unc=±{unc:.4f} lat={lat:.0f}ms mem={mem:.1f}MB  "
                     f"final_score={final:.4f} (acc-{lambda_latency}*lat-{mu_memory}*mem-{gamma_unc}*unc)"
                 )
                 models.append(RankedModel(
                     name=name, label=cand["label"], modality="text",
                     val_score=acc, latency_ms=lat, cost_score=final,
                     vram_mb=cand["vram_mb"], params_m=cand["params_m"],
-                    rationale=rationale, probed=True,
+                    rationale=rationale, probed=has_probe,
                 ))
             ranked["text"] = sorted(models, key=lambda m: m.cost_score, reverse=True)
 
@@ -1094,7 +1170,8 @@ class CandidateSelector:
             models: List[RankedModel] = []
             for name, cand in image_pool.items():
                 p = image_scores.get(name, {})
-                acc = p.get("val_score", 0.0)
+                raw_acc = p.get("val_score")
+                acc = float(raw_acc) if isinstance(raw_acc, (int, float)) else 0.0
                 lat = p.get("latency_ms", 0.0)
                 mem = cand.get("vram_mb", 0.0)
                 unc = p.get("uncertainty", 0.0)
@@ -1107,19 +1184,22 @@ class CandidateSelector:
                 
                 final = norm_acc - (lambda_latency * norm_lat) - (mu_memory * norm_mem) - (gamma_unc * norm_unc)
                 
+                has_probe = conf != "NONE"
+
                 if meta_recommendations and name in meta_recommendations:
                     final += 0.15
                     conf = "META + " + conf
+                probe_state = "probed" if has_probe else "no_probe_data"
                 
                 rationale = (
-                    f"Probed [{conf}]: acc={acc:.4f} unc=±{unc:.4f} lat={lat:.0f}ms mem={mem:.1f}MB  "
+                    f"{probe_state} [{conf}]: acc={acc:.4f} unc=±{unc:.4f} lat={lat:.0f}ms mem={mem:.1f}MB  "
                     f"final_score={final:.4f} (acc-{lambda_latency}*lat-{mu_memory}*mem-{gamma_unc}*unc)"
                 )
                 models.append(RankedModel(
                     name=name, label=cand["label"], modality="image",
                     val_score=acc, latency_ms=lat, cost_score=final,
                     vram_mb=cand["vram_mb"], params_m=cand["params_m"],
-                    rationale=rationale, probed=True,
+                    rationale=rationale, probed=has_probe,
                 ))
             ranked["image"] = sorted(models, key=lambda m: m.cost_score, reverse=True)
 
@@ -1240,6 +1320,11 @@ class CandidateSelector:
         filtered: Dict[str, List[RankedModel]] = {}
 
         for mod, models in ranked.items():
+            if not models:
+                filtered[mod] = []
+                logger.info("JIT filter: no %s candidates available", mod)
+                continue
+
             passing = [m for m in models if m.vram_mb <= budget_mb]
             if not passing:
                 # Always keep at least the lightest model
@@ -1293,6 +1378,7 @@ class CandidateSelector:
         final_image   = auto_image
         selection_type = "auto"
         override_report = None
+        user_selection = manual_override or {}
 
         if user_selection:
             # We process manual overrides with hard-priority: if it passes JIT, it wins.
@@ -1427,6 +1513,57 @@ class CandidateSelector:
     # FRONTEND API: recommend_models() wrapper for /select-model endpoint
     # ===================================================================
 
+    @staticmethod
+    def _resolve_modality_predictability(
+        modality: str,
+        predictability_scores: Dict[str, float],
+    ) -> Optional[float]:
+        if not predictability_scores:
+            return None
+
+        direct = predictability_scores.get(modality)
+        if isinstance(direct, (int, float)):
+            return float(direct)
+
+        modality_key = str(modality).lower()
+        for key, value in predictability_scores.items():
+            if not isinstance(value, (int, float)):
+                continue
+            if modality_key in str(key).lower():
+                return float(value)
+        return None
+
+    def _filter_modalities_by_predictability(
+        self,
+        modalities: List[str],
+        predictability_scores: Optional[Dict[str, float]],
+    ) -> Tuple[List[str], Dict[str, str]]:
+        score_map = dict(predictability_scores or {})
+        input_modalities = [str(m).lower() for m in modalities if str(m).strip()]
+
+        excluded: Dict[str, str] = {}
+        eligible: List[str] = []
+        for modality in input_modalities:
+            score = self._resolve_modality_predictability(modality, score_map)
+            if score is not None and score < 0.25:
+                excluded[modality] = f"predictability {score:.3f} < 0.250"
+                continue
+            eligible.append(modality)
+
+        if not eligible and input_modalities:
+            ranked = sorted(
+                input_modalities,
+                key=lambda m: self._resolve_modality_predictability(m, score_map)
+                if self._resolve_modality_predictability(m, score_map) is not None
+                else -1.0,
+                reverse=True,
+            )
+            keep = ranked[0]
+            eligible = [keep]
+            excluded.pop(keep, None)
+
+        return eligible or input_modalities, excluded
+
     def recommend_models(
         self,
         problem_type: str,
@@ -1438,6 +1575,7 @@ class CandidateSelector:
         probe_info: Optional[Dict[str, Any]] = None,
         resource_budget: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
+        predictability_scores: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Unified API for /select-model endpoint that matches AdvancedModelSelector interface.
@@ -1464,18 +1602,51 @@ class CandidateSelector:
               "tier": "primary" | "fallback"
             }
         """
+        input_modalities = [str(m).lower() for m in list(modalities or [])]
+        eligible_modalities, excluded_modalities = self._filter_modalities_by_predictability(
+            input_modalities,
+            predictability_scores,
+        )
+
         # Build minimal schema from heuristics
         if not schema_info:
-            modality_count = len(modalities)
+            norm_modalities = list(eligible_modalities)
             schema_info = {
-                "n_rows": dataset_size,
-                "n_classes": 2 if problem_type == "classification_binary" else 10,
                 "problem_type": problem_type,
-                "modalities": modalities,
-                "tabular_columns": ["f1", "f2"] if "tabular" in modalities else [],
-                "text_column": "text" if "text" in modalities else None,
-                "image_column": "image" if "image" in modalities else None,
+                "global_modalities": norm_modalities,
+                "modalities": norm_modalities,
+                "total_samples": int(dataset_size),
+                "dataset_size": int(dataset_size),
+                "avg_tokens": int(avg_tokens),
+                "n_rows": int(dataset_size),
+                "n_classes": 2 if problem_type == "classification_binary" else 10,
+                "tabular_columns": ["f1", "f2"] if "tabular" in norm_modalities else [],
+                "text_column": "text" if "text" in norm_modalities else None,
+                "image_column": "image" if "image" in norm_modalities else None,
             }
+        else:
+            schema_info = dict(schema_info)
+
+            if "global_modalities" not in schema_info or not schema_info.get("global_modalities"):
+                mods_raw = schema_info.get("modalities", eligible_modalities)
+                if isinstance(mods_raw, dict):
+                    inferred = [str(k) for k, v in mods_raw.items() if bool(v)]
+                elif isinstance(mods_raw, (list, tuple, set)):
+                    inferred = [str(m) for m in mods_raw]
+                else:
+                    inferred = [str(m) for m in eligible_modalities]
+                schema_info["global_modalities"] = [m.lower() for m in inferred if m]
+
+            schema_info.setdefault("modalities", list(schema_info.get("global_modalities", eligible_modalities)))
+            schema_info.setdefault(
+                "total_samples",
+                int(schema_info.get("dataset_size", schema_info.get("n_rows", dataset_size))),
+            )
+            schema_info.setdefault("avg_tokens", int(avg_tokens))
+            schema_info.setdefault("problem_type", problem_type)
+
+        schema_info["global_modalities"] = list(eligible_modalities)
+        schema_info["modalities"] = list(eligible_modalities)
 
         # 1. Generate candidates
         candidates = self.generate_candidates(schema_info)
@@ -1493,23 +1664,31 @@ class CandidateSelector:
             except Exception as e:
                 logger.warning("Tabular probe failed in recommend_models: %s", e)
 
-        if data and data.get("text") and candidates.get("text"):
+        if data and candidates.get("text"):
             try:
-                text_data, y = data["text"], data["y"]
-                probe_scores["text"] = self.quick_probe_text(
-                    candidates["text"], text_data, y, problem_type
-                )
-                logger.info("Probed %d text candidates", len(probe_scores["text"]))
+                text_data = data.get("text")
+                if text_data is None:
+                    text_data = data.get("texts")
+                labels = data.get("y") if data.get("y") is not None else data.get("labels")
+                if text_data is not None and labels is not None:
+                    probe_scores["text"] = self.quick_probe_text(
+                        candidates["text"], text_data, labels, problem_type
+                    )
+                    logger.info("Probed %d text candidates", len(probe_scores["text"]))
             except Exception as e:
                 logger.warning("Text probe failed in recommend_models: %s", e)
 
-        if data and data.get("image") and candidates.get("image"):
+        if data and candidates.get("image"):
             try:
-                image_data, y = data["image"], data["y"]
-                probe_scores["image"] = self.quick_probe_image(
-                    candidates["image"], image_data, y, problem_type
-                )
-                logger.info("Probed %d image candidates", len(probe_scores["image"]))
+                image_data = data.get("image")
+                if image_data is None:
+                    image_data = data.get("images")
+                labels = data.get("y") if data.get("y") is not None else data.get("labels")
+                if image_data is not None and labels is not None:
+                    probe_scores["image"] = self.quick_probe_image(
+                        candidates["image"], image_data, labels, problem_type
+                    )
+                    logger.info("Probed %d image candidates", len(probe_scores["image"]))
             except Exception as e:
                 logger.warning("Image probe failed in recommend_models: %s", e)
 
@@ -1530,37 +1709,92 @@ class CandidateSelector:
         # 4. Select final models
         final = self.select_final(
             ranked=ranked,
+            schema_info=schema_info,
             hardware_info=hardware_info,
             manual_override=None,
         )
 
+        ranked_candidates: Dict[str, List[Dict[str, Any]]] = {}
+        for modality, models in (
+            ("tabular", list(final.ranked_tabular or [])),
+            ("text", list(final.ranked_text or [])),
+            ("image", list(final.ranked_image or [])),
+        ):
+            if not models:
+                continue
+            ranked_candidates[modality] = [
+                {
+                    "name": m.name,
+                    "val_score": float(m.val_score),
+                    "latency_ms": float(m.latency_ms),
+                    "cost_score": float(m.cost_score),
+                    "uncertainty": None,
+                    "confidence": "HIGH" if bool(m.probed) else "NONE",
+                    "probed": bool(m.probed),
+                }
+                for m in models
+            ]
+
+        tabular_probe_scores = dict(probe_scores.get("tabular", {}) or {})
+        score_map = {
+            model_name: float(details.get("val_score", 0.0) or 0.0)
+            for model_name, details in tabular_probe_scores.items()
+            if isinstance(details, dict)
+        }
+        top_probe_model = max(score_map, key=score_map.get) if score_map else None
+        top_probe_score = float(score_map[top_probe_model]) if top_probe_model else None
+
+        selection_metadata: Dict[str, Any] = {
+            "probe_method": "tabular_3fold_cv" if tabular_probe_scores else "heuristic",
+            "top_probe_model": top_probe_model,
+            "top_probe_score": top_probe_score,
+            "probe_scores": tabular_probe_scores,
+        }
+
         # 5. Build recommendations list matching AdvancedModelSelector format
+        selected_name_parts = [e for e in [final.image, final.text, final.tabular] if e]
         primary_rec: Dict[str, Any] = {
-            "name": " + ".join([e for e in [final.image, final.text, final.tabular] if e]),
+            "name": " + ".join(selected_name_parts) if selected_name_parts else "Unsupervised",
             "image_encoder": final.image,
             "text_encoder": final.text,
             "tabular_encoder": final.tabular,
             "fusion_strategy": final.fusion_strategy,
-            "batch_size": TABULAR_CANDIDATE_POOL[0].get("batch_size", 32) if "tabular" in modalities else 32,
+            "batch_size": TABULAR_CANDIDATE_POOL[0].get("batch_size", 32) if "tabular" in eligible_modalities else 32,
             "hpo_space": {},  # HPO space filled by AdvancedModelSelector if needed
             "rationale": final.rationale or {},
             "hardware_info": hardware_info,
-            "probe_scores": probe_scores,
+            "probe_scores": dict(probe_scores),
+            "tabular_probe_scores": tabular_probe_scores,
+            "selection_metadata": selection_metadata,
+            "ranked_candidates": ranked_candidates,
+            "selection_contract_version": "model_selection.v2",
+            "eligible_modalities": list(eligible_modalities),
+            "excluded_modalities": dict(excluded_modalities),
             "tier": "primary",
         }
+        if top_probe_model is not None:
+            primary_rec["tabular_probe_top_model"] = str(top_probe_model)
+        if isinstance(top_probe_score, (int, float)):
+            primary_rec["quick_probe_score"] = float(top_probe_score)
+            primary_rec["probe_score"] = float(top_probe_score)
 
         # Fallback recommendation
         fallback_rec: Dict[str, Any] = {
             "name": "Lightweight Fallback",
             "image_encoder": None,
-            "text_encoder": "MiniLM-L6" if "text" in modalities else None,
-            "tabular_encoder": "XGBoost" if "tabular" in modalities else None,
+            "text_encoder": "MiniLM-L6" if "text" in eligible_modalities else None,
+            "tabular_encoder": "XGBoost" if "tabular" in eligible_modalities else None,
             "fusion_strategy": "concatenation",
             "batch_size": 8,
             "hpo_space": {},
             "rationale": {"general": "Lightweight fallback for memory-constrained environments"},
             "hardware_info": hardware_info,
             "probe_scores": {},
+            "selection_metadata": {},
+            "ranked_candidates": {},
+            "selection_contract_version": "model_selection.v2",
+            "eligible_modalities": list(eligible_modalities),
+            "excluded_modalities": dict(excluded_modalities),
             "tier": "fallback",
         }
 

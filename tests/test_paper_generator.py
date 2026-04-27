@@ -249,7 +249,7 @@ class TestPaperGenerator:
         
         assert isinstance(title, str)
         assert len(title) > 0
-        assert "iris" in title.lower() or "APEX" in title
+        assert "iris" in title.lower() or "AutoVision" in title or "autovision" in title.lower()
 
     def test_generate_abstract(self, sample_experiments_for_paper):
         """Test abstract generation from best metrics."""

@@ -29,7 +29,8 @@ RESEARCH:
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict, List, Union, Tuple
+from pathlib import Path
+from typing import Any, Optional, Dict, List, Union, Tuple
 
 import numpy as np
 import pandas as pd
@@ -74,6 +75,7 @@ class ModalityEncoder:
         text_encoder: Optional[nn.Module] = None,
         image_encoder: Optional[nn.Module] = None,
         device: Optional[torch.device] = None,
+        custom_encoders: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize encoder with optional pre-trained models.
@@ -86,7 +88,16 @@ class ModalityEncoder:
             Pre-trained ResNet50 or similar. If None, image_encode() will raise error.
         device : Optional[torch.device]
             Device for computations. Defaults to CUDA if available.
+        custom_encoders : Optional[Dict[str, Any]]
+            Backward-compatible modality-to-encoder mapping. Explicit
+            ``text_encoder`` / ``image_encoder`` values take precedence.
         """
+        if isinstance(custom_encoders, dict):
+            if text_encoder is None:
+                text_encoder = custom_encoders.get("text")
+            if image_encoder is None:
+                image_encoder = custom_encoders.get("image")
+
         self.text_encoder = text_encoder
         self.image_encoder = image_encoder
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
@@ -106,6 +117,61 @@ class ModalityEncoder:
             "present" if text_encoder else "absent",
             "present" if image_encoder else "absent",
         )
+
+    def detect_modality(
+        self,
+        data: Any,
+        field_name: str = "unknown_field",
+    ) -> Optional[str]:
+        """
+        Best-effort modality detection for Integrator compatibility.
+
+        Returns one of ``text``, ``image``, ``tabular`` or ``None``.
+        """
+        field = str(field_name or "").lower()
+        if any(tok in field for tok in ("image", "img", "photo", "picture", "pixel")):
+            return "image"
+        if any(tok in field for tok in ("text", "report", "note", "description", "content", "caption")):
+            return "text"
+
+        if isinstance(data, pd.DataFrame):
+            return "tabular"
+
+        if isinstance(data, np.ndarray):
+            if data.ndim >= 3 and (data.shape[-1] in (1, 3, 4) or data.shape[1] in (1, 3, 4)):
+                return "image"
+            if data.dtype.kind in ("U", "S", "O"):
+                return "text"
+            return "tabular"
+
+        if isinstance(data, (list, tuple)):
+            if len(data) == 0:
+                return None
+            sample = next((item for item in data if item is not None), None)
+            if sample is None:
+                return None
+
+            if Image is not None and isinstance(sample, Image.Image):
+                return "image"
+
+            if torch.is_tensor(sample):
+                return "image" if sample.ndim >= 3 else "tabular"
+
+            if isinstance(sample, np.ndarray):
+                if sample.ndim >= 3 and (sample.shape[-1] in (1, 3, 4) or sample.shape[0] in (1, 3, 4)):
+                    return "image"
+                return "tabular"
+
+            if isinstance(sample, str):
+                suffix = Path(sample).suffix.lower()
+                if suffix in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}:
+                    return "image"
+                return "text"
+
+            if isinstance(sample, (int, float, bool, np.number)):
+                return "tabular"
+
+        return "tabular"
     
     def encode_text(
         self,
@@ -326,38 +392,108 @@ class ModalityEncoder:
     
     def encode(
         self,
-        modality: str,
-        data: Union[List, np.ndarray, pd.DataFrame],
+        modality_or_data: Union[str, List, np.ndarray, pd.DataFrame],
+        data: Optional[Union[List, np.ndarray, pd.DataFrame]] = None,
+        modality: Optional[str] = None,
+        return_metadata: bool = False,
+        field_name: str = "unknown_field",
         **kwargs,
-    ) -> np.ndarray:
+    ) -> Union[np.ndarray, Tuple[np.ndarray, str, Tuple[int, ...]]]:
         """
         Unified encoding interface.
         
         Parameters
         ----------
-        modality : str
-            "text", "image", or "tabular"
-        data : Union[List, np.ndarray, pd.DataFrame]
-            Data to encode.
+        modality_or_data : Union[str, List, np.ndarray, pd.DataFrame]
+            Either modality name (legacy call style) or raw data.
+        data : Optional[Union[List, np.ndarray, pd.DataFrame]]
+            Raw data when ``modality_or_data`` is a modality string.
+        modality : Optional[str]
+            Explicit modality when ``modality_or_data`` is raw data.
+        return_metadata : bool
+            When ``True`` returns ``(embeddings, encoder_name, raw_shape)``.
+        field_name : str
+            Optional field-name hint used for auto-detection.
         **kwargs : dict
             Additional arguments passed to specific encoder.
         
         Returns
         -------
-        np.ndarray, shape (N, D)
-            Numeric embeddings.
+        np.ndarray | Tuple[np.ndarray, str, Tuple[int, ...]]
+            Embeddings, optionally with encoder metadata.
         """
-        if modality == "text":
-            return self.encode_text(data, **kwargs)
-        elif modality == "image":
-            return self.encode_image(data, **kwargs)
-        elif modality == "tabular":
-            return self.encode_tabular(data, **kwargs)
+        resolved_modality: Optional[str] = modality
+        resolved_data: Optional[Union[List, np.ndarray, pd.DataFrame]] = data
+
+        if isinstance(modality_or_data, str):
+            if resolved_modality is None:
+                resolved_modality = modality_or_data
+            if resolved_data is None:
+                raise ValueError(
+                    "encode() missing data. Use encode(modality, data) or "
+                    "encode(data, modality='...')."
+                )
+        else:
+            if resolved_data is not None:
+                raise ValueError(
+                    "encode() received both positional data and 'data' keyword."
+                )
+            resolved_data = modality_or_data
+            if resolved_modality is None:
+                resolved_modality = self.detect_modality(resolved_data, field_name=field_name)
+
+        if resolved_modality is None:
+            raise ValueError("Unable to resolve modality for encode().")
+
+        if resolved_modality == "text":
+            embeddings = self.encode_text(resolved_data, **kwargs)
+        elif resolved_modality == "image":
+            embeddings = self.encode_image(resolved_data, **kwargs)
+        elif resolved_modality == "tabular":
+            embeddings = self.encode_tabular(resolved_data, **kwargs)
         else:
             raise ValueError(
-                f"Unknown modality '{modality}'. "
+                f"Unknown modality '{resolved_modality}'. "
                 "Expected 'text', 'image', or 'tabular'."
             )
+
+        if not return_metadata:
+            return embeddings
+
+        encoder_name = self._resolve_encoder_name(resolved_modality)
+        raw_shape = self._infer_raw_shape(resolved_data)
+        return embeddings, encoder_name, raw_shape
+
+    @staticmethod
+    def _infer_raw_shape(data: Any) -> Tuple[int, ...]:
+        if isinstance(data, pd.DataFrame):
+            return tuple(data.shape)
+        if isinstance(data, np.ndarray):
+            return tuple(data.shape)
+        if isinstance(data, (list, tuple)):
+            return (len(data),)
+        shape = getattr(data, "shape", None)
+        if shape is not None:
+            try:
+                return tuple(shape)
+            except Exception:
+                return tuple()
+        return tuple()
+
+    def _resolve_encoder_name(self, modality: str) -> str:
+        if modality == "text":
+            if self.text_encoder is None:
+                return "text_unavailable"
+            return str(
+                getattr(self.text_encoder, "model_name", type(self.text_encoder).__name__)
+            )
+        if modality == "image":
+            if self.image_encoder is None:
+                return "image_unavailable"
+            return str(
+                getattr(self.image_encoder, "model_name", type(self.image_encoder).__name__)
+            )
+        return "tabular_numeric"
     
     def get_embedding_dim(self, modality: str) -> int:
         """

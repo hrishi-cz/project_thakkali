@@ -56,13 +56,3 @@ class ModelSelector:
             dataset_size=dataset_size,
             avg_tokens=avg_tokens,
         )
-
-    def select_model(self, task: str, data_shape: Dict[str, Any]) -> str:
-        """Legacy stub – returns a descriptive model name string."""
-        modality_map = {
-            "classification": ["tabular"],
-            "regression":     ["tabular"],
-        }
-        modalities = modality_map.get(task, ["tabular"])
-        recs = self.recommend_models(task, modalities)
-        return recs[0]["name"] if recs else "multimodal_predictor"

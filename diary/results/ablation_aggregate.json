@@ -1,0 +1,8 @@
+{
+  "42": {
+    "completed": 5,
+    "failed": 0,
+    "total": 5,
+    "output": "diary\\results\\ablations_seed42.json"
+  }
+}

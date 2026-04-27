@@ -3,9 +3,13 @@ Session Manager
 
 Thin wrapper over ContextDatabase for session lifecycle management.
 SessionContext removed - use ExecutionContext from core.execution_context instead.
+
+This module is a service-layer utility. It should not contain HTTP request/
+response logic; FastAPI routes in api/run_api.py call into this class.
 """
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 from database.context_db import context_db
@@ -20,15 +24,19 @@ class SessionManager:
     
     Thin CRUD wrapper over ContextDatabase.
     Use ExecutionContext (from core.execution_context) for session state.
+    Endpoint behavior belongs in route handlers, not this class.
     """
     
     _instance = None
+    _lock = threading.Lock()
     
     def __new__(cls):
         """Singleton pattern."""
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
         return cls._instance
     
     def __init__(self):
@@ -69,7 +77,10 @@ class SessionManager:
         )
         
         # Persist to database
-        context_db.save_context(ctx.to_dict())
+        ctx.revision = context_db.save_context(
+            ctx.to_dict(),
+            expected_revision=0,
+        )
         
         logger.info("Created session %s", ctx.session_id)
         return ctx
@@ -89,6 +100,19 @@ class SessionManager:
             return ExecutionContext.from_dict(data)
         return None
     
+    def get_or_create_session(self, session_id: str, **kwargs) -> ExecutionContext:
+        """Return existing session context or create a new one atomically.
+
+        Used at ingestion start and schema detection to guarantee the sessions
+        table row exists before FK-constrained child tables are written to.
+        """
+        ctx = self.get_session(session_id)
+        if ctx is not None:
+            return ctx
+        ctx = self.create_session(session_id=session_id, **kwargs)
+        logger.info("get_or_create_session: created session %s", session_id)
+        return ctx
+
     def update_session(self, ctx: ExecutionContext) -> None:
         """
         Update an existing session.
@@ -96,8 +120,12 @@ class SessionManager:
         Args:
             ctx: ExecutionContext to update
         """
+        expected_revision = int(getattr(ctx, "revision", 0) or 0)
         ctx.update_timestamp()
-        context_db.save_context(ctx.to_dict())
+        ctx.revision = context_db.save_context(
+            ctx.to_dict(),
+            expected_revision=expected_revision,
+        )
         logger.debug("Updated session %s", ctx.session_id)
     
     def list_sessions(
@@ -119,9 +147,36 @@ class SessionManager:
         Returns:
             List of session summaries
         """
-        # TODO: Add user_id and status filtering to context_db.list_sessions()
-        # For now, just pass through to DB without filters
-        return context_db.list_sessions(limit=limit, offset=offset)
+        raw_sessions = context_db.list_sessions(
+            limit=limit,
+            offset=offset,
+            user_id=user_id,
+            status=status,
+        )
+        summaries: List[Dict[str, Any]] = []
+
+        for row in raw_sessions:
+            session_id_value = row.get("session_id")
+            context_payload = context_db.load_context(session_id_value) or {}
+
+            session_status = context_payload.get("status")
+            if not session_status:
+                session_status = "closed" if row.get("pipeline_stage") == "closed" else "active"
+
+            summaries.append(
+                {
+                    "session_id": session_id_value,
+                    "created_at": row.get("created_at"),
+                    "updated_at": row.get("updated_at"),
+                    "status": session_status,
+                    "pipeline_stage": row.get("pipeline_stage"),
+                    "user_id": context_payload.get("user_id"),
+                    "project_name": context_payload.get("project_name"),
+                    "description": context_payload.get("description"),
+                }
+            )
+
+        return summaries
     
     def close_session(self, session_id: str) -> bool:
         """
@@ -173,9 +228,9 @@ class SessionManager:
             ctx: ExecutionContext to update
         """
         if ctx.session_id != session_id:
-            logger.warning(
-                "Session ID mismatch: %s != %s. Using context's session_id.",
-                session_id, ctx.session_id
+            raise ValueError(
+                f"Session ID mismatch: route session_id={session_id} "
+                f"does not match context session_id={ctx.session_id}"
             )
         self.update_session(ctx)
     

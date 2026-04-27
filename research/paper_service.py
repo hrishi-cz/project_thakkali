@@ -8,6 +8,7 @@ Combines experiment collection, ablation, plotting, and paper writing.
 import logging
 from typing import Tuple, Optional
 
+from config.paths import MODEL_REGISTRY_DIR
 from research.experiment_collector import ExperimentCollector
 from research.ablation import build_ablation
 from research.paper_generator import PaperGenerator
@@ -21,12 +22,12 @@ class PaperService:
     End-to-end paper generation service.
     
     Usage:
-        service = PaperService(registry_dir="models")
+        service = PaperService(registry_dir="models/registry")
         paper_text, plot_path = service.generate()
         # Save paper_text to file, use plot_path for metadata
     """
 
-    def __init__(self, registry_dir: str = "models"):
+    def __init__(self, registry_dir: str = str(MODEL_REGISTRY_DIR)):
         """
         Parameters
         ----------

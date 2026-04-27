@@ -11,7 +11,7 @@ Usage
 
 Endpoints
 ---------
-    API:  http://localhost:8000
+    API:  http://localhost:8001
     UI:   http://localhost:8501
 
 Logs
@@ -29,6 +29,7 @@ import logging
 import logging.handlers
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -228,6 +229,45 @@ class ServerOrchestrator:
         self._processes: List[ManagedProcess] = []
 
     # ------------------------------------------------------------------ #
+    # Port preflight checks
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+        """Return True when a TCP listener already exists on host:port."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex((host, int(port))) == 0
+
+    def _preflight_ports(self) -> bool:
+        """
+        Validate that required ports are free before starting child processes.
+
+        Returns
+        -------
+        True when both API and UI ports are available, False otherwise.
+        """
+        ok = True
+
+        if self._is_port_in_use(API_PORT):
+            log.critical(
+                "API port %d is already in use. "
+                "Stop the existing process on that port before running the process manager.",
+                API_PORT,
+            )
+            ok = False
+
+        if self._is_port_in_use(UI_PORT):
+            log.critical(
+                "UI port %d is already in use. "
+                "Stop the existing process on that port before running the process manager.",
+                UI_PORT,
+            )
+            ok = False
+
+        return ok
+
+    # ------------------------------------------------------------------ #
     # Build child commands
     # ------------------------------------------------------------------ #
 
@@ -371,6 +411,10 @@ class ServerOrchestrator:
         log.info("  Logs: %s", LOG_FILE)
         log.info("  PID : %d (manager)", os.getpid())
         log.info("=" * 72)
+
+        if not self._preflight_ports():
+            log.info("Preflight failed; not starting child processes.")
+            return 1
 
         # Start children
         try:

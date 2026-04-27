@@ -155,7 +155,7 @@ def get_optuna_distributions() -> Dict[str, Dict[str, Any]]:
         # ── Architecture ──────────────────────────────────────────────
         "image_encoder_name": {
             "type":    "categorical",
-            "choices": ["MobileNetV3", "ResNet50", "ViT-Base"],
+            "choices": ["resnet50"],
             "description": "Image backbone",
         },
         "text_model_name": {
@@ -165,12 +165,18 @@ def get_optuna_distributions() -> Dict[str, Dict[str, Any]]:
         },
         "tabular_encoder_name": {
             "type":    "categorical",
-            "choices": ["MLP", "TabNet", "FT-Transformer"],
+            "choices": ["xgboost", "lightgbm", "grn", "mlp"],
             "description": "Tabular encoder architecture",
         },
         "fusion_strategy": {
             "type":    "categorical",
-            "choices": ["attention", "concatenation"],
+            "choices": [
+                "attention",
+                "concatenation",
+                "graph",
+                "uncertainty",
+                "uncertainty_graph",
+            ],
             "description": "Multimodal fusion head strategy",
         },
         "fusion_output_dim": {
@@ -198,7 +204,7 @@ HYPERPARAMETERS: Dict[str, Dict[str, Any]] = {
     "image_encoder_name": {
         "type":    "string",
         "default": "resnet50",
-        "options": ["resnet50", "mobilenet_v3_small", "efficientnet_b0", "vit_base_patch16_224"],
+        "options": ["resnet50"],
     },
     "image_output_dim":  {"type": "integer", "default": 2048, "min": 64,  "max": 2048},
     "tabular_output_dim":{"type": "integer", "default": 128,  "min": 32,  "max": 512},
@@ -212,7 +218,13 @@ HYPERPARAMETERS: Dict[str, Dict[str, Any]] = {
     "fusion_strategy": {
         "type":    "string",
         "default": "attention",
-        "options": ["concatenation", "attention", "weighted"],
+        "options": [
+            "attention",
+            "concatenation",
+            "graph",
+            "uncertainty",
+            "uncertainty_graph",
+        ],
     },
     "learning_rate": {"type": "float",   "default": 1e-3,  "min": 1e-6, "max": 1e-1},
     "batch_size":    {"type": "integer", "default": 32,
@@ -297,6 +309,87 @@ def load_dynamic_config(config_path: Optional[str] = None) -> HyperparameterConf
             return HyperparameterConfig.from_json(config_path)
         raise ValueError(f"Unsupported config file type: {ext}")
     return HyperparameterConfig()
+
+
+def get_modality_optuna_distributions(
+    active_modalities: List[str],
+    n_tabular_features: int = 0,
+    avg_text_len: float = 0.0,
+    problem_type: str = "classification",
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Return Optuna distribution specs adapted to the active modalities and
+    dataset characteristics gathered during schema detection.
+
+    Rules (additive — later rules override earlier ones):
+    ─────────────────────────────────────────────────────
+    Text-only / text-dominant (text in modalities, no image):
+      • LR ceiling drops to 5e-4 (transformer fine-tuning needs small LR)
+      • Warmup steps min raised to 100
+
+    Image-present:
+      • Batch size minimum raised to 16 (vision nets need bigger batches)
+      • Dropout ceiling raised to 0.6 (ResNet is over-parameterised)
+
+    Tabular-only (no text, no image):
+      • LR range widened to [1e-4, 5e-2] (tree/MLP can handle higher LR)
+      • Warmup steps max lowered to 0 (no transformer, warmup irrelevant)
+
+    Large tabular feature space (n_tabular_features > 100):
+      • Dropout minimum raised to 0.1 (regularise wide networks)
+
+    Regression:
+      • Fusion output dim ceiling raised to 1024 (richer representation)
+
+    Parameters
+    ----------
+    active_modalities : list of "tabular", "text", "image", "timeseries"
+    n_tabular_features : int   — from feature_intelligence / global_schema
+    avg_text_len : float       — average token count per text sample
+    problem_type : str         — "regression", "classification_*", etc.
+
+    Returns
+    -------
+    Same dict shape as ``get_optuna_distributions()``.
+    """
+    base = get_optuna_distributions()
+
+    has_text = "text" in active_modalities
+    has_image = "image" in active_modalities
+    has_tabular = "tabular" in active_modalities or "timeseries" in active_modalities
+    tabular_only = has_tabular and not has_text and not has_image
+
+    # ── Text modality ────────────────────────────────────────────────────────
+    if has_text:
+        base["learning_rate"] = {**base["learning_rate"], "high": 5e-4}
+        base["warmup_steps"] = {**base["warmup_steps"], "low": 100}
+        # Long texts benefit from larger batches to stabilise gradient estimates
+        if avg_text_len > 128:
+            base["warmup_steps"] = {**base["warmup_steps"], "high": 2000}
+
+    # ── Image modality ───────────────────────────────────────────────────────
+    if has_image:
+        base["dropout"] = {**base["dropout"], "high": 0.6}
+
+    # ── Tabular-only ─────────────────────────────────────────────────────────
+    if tabular_only:
+        base["learning_rate"] = {
+            **base["learning_rate"],
+            "low": 1e-4,
+            "high": 5e-2,
+        }
+        base["warmup_steps"] = {**base["warmup_steps"], "low": 0, "high": 0}
+
+    # ── Large feature space ───────────────────────────────────────────────────
+    if n_tabular_features > 100:
+        base["dropout"] = {**base["dropout"], "low": 0.1}
+        base["weight_decay"] = {**base["weight_decay"], "low": 1e-5}
+
+    # ── Regression ────────────────────────────────────────────────────────────
+    if "regression" in str(problem_type).lower():
+        base["fusion_output_dim"] = {**base["fusion_output_dim"], "high": 1024}
+
+    return base
 
 
 def get_presets() -> Dict[str, Dict[str, Any]]:
