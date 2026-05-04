@@ -1,0 +1,56 @@
+services:
+  api:
+    build:
+      context: .
+      target: base
+    ports:
+      - "8001:8001"
+    environment:
+      - APEX_MODE=production
+      - APEX_SEED=42
+      - APEX_CORS_ORIGINS=http://localhost:8501
+    volumes:
+      - ./data:/app/data
+      - ./diary:/app/diary
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: .
+      target: base
+    command: ["streamlit", "run", "frontend/app_enhanced.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    environment:
+      - APEX_API_BASE_URL=http://api:8001
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # GPU training worker (optional — start with: docker compose up gpu-worker)
+  gpu-worker:
+    build:
+      context: .
+      target: gpu
+    command: ["python3.11", "-m", "uvicorn", "api.run_api:app", "--host", "0.0.0.0", "--port", "8001"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - APEX_MODE=production
+      - APEX_SEED=42
+    volumes:
+      - ./data:/app/data
+      - ./diary:/app/diary
+    profiles:
+      - gpu

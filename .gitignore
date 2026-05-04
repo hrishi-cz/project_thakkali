@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime databases
+tasks.db
+tasks.db-wal
+tasks.db-shm
+
+# Logs
+logs/
+api/logs/
+*.log
+
+# Data / cache (user-generated at runtime)
+data/
+cache/
+models/
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# Temp files from claude sessions
+tmpclaude-*-cwd
+
+# Saved model artifacts
+*.pt
+*.pth
+*.ckpt
+*.pkl
+# Added by code-review-graph
+.code-review-graph/
+
+# Secrets
+.env
+*.env
+.env.*

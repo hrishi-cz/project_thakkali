@@ -1,0 +1,2849 @@
+# AutoVision+ — Full Integration Implementation Plan
+
+**Objective:** PARTIALLY INTEGRATED → FULLY INTEGRATED
+**Constraint:** Fix + Connect + Clean only. No new features. No architecture redesign.
+**Target executor:** Codex 5.3
+
+---
+
+## Dependency Order
+
+```
+FIX-01 → FIX-02 → FIX-03 → FIX-04   (pipeline unification chain)
+FIX-05                                  (independent)
+FIX-06                                  (independent)
+FIX-07                                  (independent)
+FIX-08                                  (depends on FIX-02)
+FIX-09                                  (independent)
+FIX-10                                  (depends on FIX-01, FIX-03)
+FIX-11                                  (depends on all above)
+```
+
+---
+
+## FIX-01 — Read Cached Schema + Target Override in /train-pipeline
+
+### Files to Modify
+
+- `api/run_api.py`
+
+### Problem
+
+`TrainingOrchestrator._execute_phase_2_schema_detection()` ignores:
+
+- `_session_store[session_id]["schema"]` (set by `/api/schema/detect`)
+- `_session_store[session_id]["target_override"]` (set by `/api/schema/override`)
+
+### Exact Changes
+
+**In `async def train_pipeline(request)` body**, after extracting `_sid = body.get("session_id")`, add:
+
+```python
+# Read cached schema + override from session store (Tree A → Tree B bridge)
+with _session_lock:
+    _session_cached_schema = (
+        _session_store.get(_sid, {}).get("schema") if _sid else None
+    )
+    _session_target_override = (
+        _session_store.get(_sid, {}).get("target_override") if _sid else None
+    )
+```
+
+**In `_run_training()` nested function**, after constructing `TrainingOrchestrator(...)`, add:
+
+```python
+# Inject pre-computed schema so Phase 2 is skipped in the orchestrator
+if _session_cached_schema:
+    orchestrator.inject_external_schema(
+        _session_cached_schema,
+        target_override=_session_target_override,
+    )
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  /train-pipeline → TrainingOrchestrator() → Phase 2 re-runs detector (override ignored)
+
+AFTER:
+  /train-pipeline → reads _session_store[sid]["schema"] + ["target_override"]
+                 → orchestrator.inject_external_schema(cached, override)
+                 → Phase 2: SKIPPED
+```
+
+### Dependencies
+
+None.
+
+---
+
+## FIX-02 — Persist Fitted TabularPreprocessor to Disk After /preprocess
+
+### Files to Modify
+
+- `api/run_api.py`
+
+### Problem
+
+`/preprocess` fits `TabularPreprocessor` inside `_preprocess_sync()` and discards it. `TrainingOrchestrator` re-fits from scratch.
+
+### Exact Changes
+
+**In `/preprocess` route**, inside `_preprocess_sync()`, after `tp.fit(feature_df[tabular_cols])`:
+
+```python
+# Persist fitted preprocessor so TrainingOrchestrator can reuse it
+import joblib
+_cache_session_dir = Path(f"./data/session_cache/{_sid}")
+_cache_session_dir.mkdir(parents=True, exist_ok=True)
+_scaler_path = _cache_session_dir / "tabular_scaler.joblib"
+try:
+    joblib.dump(tp, str(_scaler_path))
+    logger.info("/preprocess: persisted TabularPreprocessor to %s", _scaler_path)
+except Exception as _pe:
+    logger.warning("/preprocess: could not persist preprocessor: %s", _pe)
+```
+
+Add to the return `"data"` dict:
+
+```python
+"preprocessor_cached": _scaler_path.exists(),
+"preprocessor_path": str(_scaler_path),
+```
+
+### Before → After Flow
+
+```
+BEFORE:  /preprocess → fits TabularPreprocessor → discards
+AFTER:   /preprocess → fits TabularPreprocessor → persists to
+         ./data/session_cache/{session_id}/tabular_scaler.joblib
+```
+
+### Dependencies
+
+None.
+
+---
+
+## FIX-03 — Add Three Injection Methods to TrainingOrchestrator
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+
+### Problem
+
+`TrainingOrchestrator` has no API to receive pre-computed phase results. Phases 2, 3, and 4 always recompute.
+
+### Exact Changes
+
+**Add immediately after `__init__` (after line 587, before `run_pipeline`):**
+
+```python
+# ── External result injection methods (Tree A → Tree B unification) ────────
+
+def inject_external_schema(
+    self,
+    schema_dict: Dict[str, Any],
+    target_override: Optional[str] = None,
+) -> None:
+    """
+    Inject a pre-computed GlobalSchema dict from /api/schema/detect.
+    _execute_phase_2_schema_detection() will be a no-op when this is set.
+    """
+    if target_override:
+        schema_dict = dict(schema_dict)
+        schema_dict["primary_target"] = target_override
+        for ds in schema_dict.get("per_dataset", []):
+            if isinstance(ds, dict):
+                ds["target_column"] = target_override
+    self.phase_results[Phase.SCHEMA_DETECTION] = schema_dict
+    self.state.set_slot("phase2_schema", schema_dict)
+    logger.info(
+        "TrainingOrchestrator: injected external schema "
+        "(primary_target=%s, %d datasets)",
+        schema_dict.get("primary_target", "?"),
+        len(schema_dict.get("per_dataset", [])),
+    )
+
+def inject_external_preprocessors(
+    self,
+    tabular_scaler_path: Optional[str] = None,
+) -> None:
+    """
+    Load pre-fitted TabularPreprocessor from disk.
+    _execute_phase_3_preprocessing() will reuse it instead of re-fitting.
+    """
+    if not tabular_scaler_path:
+        return
+    _path = Path(tabular_scaler_path)
+    if not _path.exists():
+        logger.warning(
+            "inject_external_preprocessors: path not found: %s "
+            "— Phase 3 will re-fit.", _path,
+        )
+        return
+    try:
+        import joblib
+        tab_prep = joblib.load(str(_path))
+        self.fitted_transformers["tabular"] = tab_prep
+        logger.info(
+            "TrainingOrchestrator: loaded TabularPreprocessor from %s "
+            "(output_dim=%d)",
+            _path,
+            tab_prep.get_output_dim() if hasattr(tab_prep, "get_output_dim") else -1,
+        )
+    except Exception as exc:
+        logger.warning(
+            "inject_external_preprocessors: failed to load %s: %s "
+            "— Phase 3 will re-fit.", _path, exc,
+        )
+
+def inject_external_model_selection(
+    self,
+    model_sel_dict: Dict[str, Any],
+) -> None:
+    """
+    Inject pre-computed model selection from /select-model.
+    _execute_phase_4_model_selection() will be a no-op when this is set.
+    """
+    self.phase_results[Phase.MODEL_SELECTION] = model_sel_dict
+    self.state.set_slot("phase4_model_selection", model_sel_dict)
+    logger.info(
+        "TrainingOrchestrator: injected external model selection (%s)",
+        model_sel_dict.get("selected_model", "?"),
+    )
+```
+
+**Modify `_execute_phase_2_schema_detection()`** — add at top of method body (after docstring, before first `logger.info`):
+
+```python
+# Short-circuit if schema was injected via inject_external_schema()
+if Phase.SCHEMA_DETECTION in self.phase_results:
+    logger.info(
+        "Phase 2: SKIPPED — using injected schema (primary_target=%s)",
+        self.phase_results[Phase.SCHEMA_DETECTION].get("primary_target", "?"),
+    )
+    self.current_phase = Phase.PREPROCESSING
+    return
+```
+
+**Modify `_execute_phase_3_preprocessing()`** — find the `TabularPreprocessor` fitting block. Find:
+
+```python
+tab_prep = TabularPreprocessor()
+tab_prep.fit_transform(feature_df[tabular_cols])
+```
+
+Replace with:
+
+```python
+if "tabular" in self.fitted_transformers and self.fitted_transformers["tabular"] is not None:
+    tab_prep = self.fitted_transformers["tabular"]
+    logger.info(
+        "  Phase 3: reusing pre-fitted TabularPreprocessor (output_dim=%d)",
+        tab_prep.get_output_dim() if hasattr(tab_prep, "get_output_dim") else -1,
+    )
+    tabular_output = tab_prep.transform(feature_df[tabular_cols])
+else:
+    tab_prep = TabularPreprocessor()
+    tabular_output = tab_prep.fit_transform(feature_df[tabular_cols])
+    self.fitted_transformers["tabular"] = tab_prep
+```
+
+**Modify `_execute_phase_4_model_selection()`** — add at top of method body:
+
+```python
+# Short-circuit if model selection was injected via inject_external_model_selection()
+if Phase.MODEL_SELECTION in self.phase_results:
+    logger.info(
+        "Phase 4: SKIPPED — using injected model selection (%s)",
+        self.phase_results[Phase.MODEL_SELECTION].get("selected_model", "?"),
+    )
+    self.current_phase = Phase.TRAINING
+    return
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  TrainingOrchestrator(): Phase 2 always re-runs, Phase 3 always re-fits,
+  Phase 4 always re-runs
+
+AFTER:
+  orchestrator.inject_external_schema(...)      → Phase 2: SKIPPED
+  orchestrator.inject_external_preprocessors(...)→ Phase 3: tabular reused
+  orchestrator.inject_external_model_selection(.)→ Phase 4: SKIPPED
+```
+
+### Dependencies
+
+FIX-01 (provides schema for injection).
+
+---
+
+## FIX-04 — Wire All Injections in /train-pipeline
+
+### Files to Modify
+
+- `api/run_api.py`
+
+### Problem
+
+After FIX-01/03, the scaler and model selection are still not injected.
+
+### Exact Changes
+
+**In `_run_training()`, after `orchestrator.inject_external_schema(...)`, add:**
+
+```python
+# Inject pre-fitted scaler if /preprocess was called
+_scaler_path = Path(f"./data/session_cache/{_sid}/tabular_scaler.joblib") if _sid else None
+if _scaler_path and _scaler_path.exists():
+    orchestrator.inject_external_preprocessors(str(_scaler_path))
+
+# Inject model selection if /select-model was called
+with _session_lock:
+    _session_model_sel = (
+        _session_store.get(_sid, {}).get("model_selection") if _sid else None
+    )
+if _session_model_sel:
+    orchestrator.inject_external_model_selection(_session_model_sel)
+```
+
+**In `/select-model` endpoint**, after `recommendations` is computed, add before the `return`:
+
+```python
+# Store best selection so /train-pipeline can consume it
+_sid_sel = body.get("session_id") if isinstance(body, dict) else None
+if _sid_sel and recommendations:
+    with _session_lock:
+        if _sid_sel not in _session_store:
+            _session_store[_sid_sel] = {"datasets": {}, "schema": None}
+        _session_store[_sid_sel]["model_selection"] = recommendations[0]
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  /select-model result → discarded
+  /train-pipeline → Phase 4 re-runs independently
+
+AFTER:
+  /select-model → result stored in _session_store[sid]["model_selection"]
+  /train-pipeline → injects stored selection → Phase 4: SKIPPED
+```
+
+### Dependencies
+
+FIX-01, FIX-02, FIX-03.
+
+---
+
+## FIX-05 — Activate TabularPreprocessor.configure()
+
+### Files to Modify
+
+- `preprocessing/tabular_preprocessor.py`
+- `pipeline/training_orchestrator.py`
+
+### Problem
+
+`configure(plan)` is a no-op. PreprocessingPlanner produces `max_cardinality`, `near_unique_ratio`, `imputer_strategy` — all silently discarded.
+
+### Exact Changes
+
+**In `tabular_preprocessor.py`, add `self._imputer_strategy = "median"` at end of `__init__`.**
+
+**Replace `configure()` method body entirely:**
+
+```python
+def configure(self, plan: Optional[Dict[str, Any]]) -> None:
+    """
+    Apply PreprocessingPlanner overrides before fit().
+
+    Supported keys: max_cardinality (int), near_unique_ratio (float),
+    imputer_strategy ("median"|"mean"|"most_frequent")
+    """
+    if not isinstance(plan, dict):
+        return
+    global _MAX_OHE_CARDINALITY, _NEAR_UNIQUE_RATIO
+
+    max_card = plan.get("max_cardinality")
+    if max_card is not None:
+        try:
+            _MAX_OHE_CARDINALITY = max(2, int(max_card))
+            logger.info("TabularPreprocessor.configure: max_cardinality → %d",
+                        _MAX_OHE_CARDINALITY)
+        except (ValueError, TypeError):
+            pass
+
+    near_unique = plan.get("near_unique_ratio")
+    if near_unique is not None:
+        try:
+            _NEAR_UNIQUE_RATIO = float(max(0.05, min(0.99, float(near_unique))))
+            logger.info("TabularPreprocessor.configure: near_unique_ratio → %.2f",
+                        _NEAR_UNIQUE_RATIO)
+        except (ValueError, TypeError):
+            pass
+
+    imputer_strat = plan.get("imputer_strategy")
+    if imputer_strat in {"median", "mean", "most_frequent"}:
+        self._imputer_strategy = imputer_strat
+        logger.info("TabularPreprocessor.configure: imputer_strategy → %s",
+                    imputer_strat)
+```
+
+**In `_build_transformer()` (or numeric pipeline constructor), replace:**
+
+```python
+SimpleImputer(strategy="median")
+```
+
+With:
+
+```python
+SimpleImputer(strategy=self._imputer_strategy)
+```
+
+**In `training_orchestrator.py`, in `_execute_phase_3_preprocessing()`, after `preprocessing_plan = self.preprocessing_planner.create_plan(...)`, add:**
+
+```python
+# Apply plan to preprocessors before fitting
+if "tabular" in self.fitted_transformers and self.fitted_transformers["tabular"] is not None:
+    self.fitted_transformers["tabular"].configure(preprocessing_plan)
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  preprocessing_plan computed → configure(plan) → no-op
+
+AFTER:
+  preprocessing_plan computed → configure(plan) → updates cardinality cap,
+  unique-ratio threshold, imputer strategy before fit_transform()
+```
+
+### Dependencies
+
+None.
+
+---
+
+## FIX-06 — Wire select_fusion_strategy() into Phase 4 + Expand Optuna Choices
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+- `config/hyperparameters.py`
+- `automl/trainer.py`
+
+### Problem
+
+`select_fusion_strategy(schema_info)` in `modelss/fusion.py` (line 496) is never called. `GraphFusion`, `UncertaintyFusion`, `UncertaintyGraphFusion` are unreachable. Optuna choices are `["attention", "concatenation"]` only.
+
+### Exact Changes
+
+**In `_execute_phase_4_model_selection()`, after reading `schema_info`, add:**
+
+```python
+from modelss.fusion import select_fusion_strategy
+schema_derived_fusion = select_fusion_strategy(schema_info)
+logger.info("Phase 4: schema-derived fusion strategy = %s", schema_derived_fusion)
+self.state.set_slot("schema_derived_fusion", schema_derived_fusion)
+```
+
+Add `"schema_derived_fusion": schema_derived_fusion` to the Phase 4 result dict.
+
+**In `config/hyperparameters.py`**, expand `fusion_strategy` choices in `get_optuna_distributions()`:
+
+```python
+# Replace:
+"fusion_strategy": ["attention", "concatenation"]
+# With:
+"fusion_strategy": ["attention", "concatenation", "graph", "uncertainty", "uncertainty_graph"]
+```
+
+Apply the same expansion to `HYPERPARAMETERS` static dict if it lists fusion choices.
+
+**In `automl/trainer.py`**, find the fusion module construction block. Replace:
+
+```python
+if fusion_strategy == "attention":
+    fusion = AttentionFusion(feature_dims)
+else:
+    fusion = ConcatenationFusion(feature_dims)
+```
+
+With:
+
+```python
+if fusion_strategy in ("uncertainty_graph", "uncertainty-graph"):
+    from modelss.fusion import UncertaintyGraphFusion
+    fusion = UncertaintyGraphFusion(feature_dims=feature_dims)
+elif fusion_strategy == "graph":
+    from modelss.fusion import GraphFusion
+    fusion = GraphFusion(dim=512, num_modalities=len(feature_dims),
+                         heads=4, input_dims=feature_dims)
+elif fusion_strategy == "uncertainty":
+    from modelss.fusion import UncertaintyFusion
+    fusion = UncertaintyFusion(feature_dims=feature_dims)
+elif fusion_strategy == "attention":
+    fusion = AttentionFusion(feature_dims)
+else:
+    fusion = ConcatenationFusion(feature_dims)
+```
+
+**In Phase 5 trial objective**, after `fusion_strategy = trial.suggest_categorical(...)`, add:
+
+```python
+if fusion_strategy == "auto":
+    fusion_strategy = self.state.get_slot("schema_derived_fusion") or "attention"
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  select_fusion_strategy() never called
+  Phase 5: fusion ∈ {attention, concat} only
+  Graph/Uncertainty fusions: unreachable
+
+AFTER:
+  Phase 4 calls select_fusion_strategy(schema_info) → stored in state
+  Phase 5: fusion ∈ {5 strategies}; all fusion classes reachable
+```
+
+### Dependencies
+
+FIX-03 (for `state.set_slot`).
+
+---
+
+## FIX-07 — Normalize HPO Image Encoder Strings
+
+### Files to Modify
+
+- `config/hyperparameters.py`
+- `automl/trainer.py`
+
+### Problem
+
+`get_optuna_distributions()` has `["MobileNetV3", "ResNet50", "ViT-Base"]`. Only ResNet50 is actually implemented. String mismatch → KeyError at trial time.
+
+### Exact Changes
+
+**In `config/hyperparameters.py`**, in `get_optuna_distributions()`:
+
+```python
+# Replace:
+"image_encoder_name": ["MobileNetV3", "ResNet50", "ViT-Base"]
+# With:
+"image_encoder_name": ["resnet50"]
+```
+
+**In `HYPERPARAMETERS` static dict**, replace the image encoder options list with `["resnet50"]`.
+
+**In `automl/trainer.py`**, at the top of the encoder construction block, add alias normalization:
+
+```python
+_IMAGE_ALIAS = {
+    "ResNet50": "resnet50", "resnet50": "resnet50",
+    "MobileNetV3": "resnet50", "mobilenetv3": "resnet50",
+    "ViT-Base": "resnet50", "vit-base": "resnet50",
+}
+image_encoder_name = _IMAGE_ALIAS.get(image_encoder_name, image_encoder_name).lower()
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  Optuna samples "ViT-Base" → trainer KeyError → trial silently fails
+
+AFTER:
+  Optuna samples "resnet50" only → alias guard → always resolves
+```
+
+### Dependencies
+
+None.
+
+---
+
+## FIX-08 — Fix /monitor/drift Efficiency
+
+### Files to Modify
+
+- `api/run_api.py`
+- `monitoring/drift_detector.py`
+- `pipeline/training_orchestrator.py`
+
+### Problem
+
+`/monitor/drift` creates a new `TrainingOrchestrator` and re-runs Phases 1–3 on every call. Should run drift detection directly on cached data.
+
+### Exact Changes
+
+**Replace the entire `/monitor/drift` handler** with the following implementation that:
+
+1. Reads session cache instead of re-ingesting
+2. Calls `DriftDetector.detect()` directly (no orchestrator)
+3. Loads reference from `{MODEL_REGISTRY_DIR}/{model_id}/artifacts/reference_sample.npy` if available
+
+```python
+@app.post("/monitor/drift")
+async def monitor_drift(request: Request) -> Dict[str, Any]:
+    """
+    Drift detection against cached session data.
+    No pipeline re-run. O(local_cache_read) per call.
+    """
+    try:
+        body = await request.json()
+        _sid = body.get("session_id") if isinstance(body, dict) else None
+        model_id: Optional[str] = body.get("model_id")
+        if model_id:
+            model_id = _sanitize_model_id(model_id)
+
+        with _session_lock:
+            _snapshot = _get_session_hashes(_sid)
+        if not _snapshot:
+            raise HTTPException(400, "No active ingestion session.")
+
+        def _drift_sync() -> Dict[str, Any]:
+            from monitoring.drift_detector import DriftDetector
+            from pipeline.drift_adapter import DriftAdapter
+            from data_ingestion.loader import DataLoader
+
+            loader = DataLoader()
+            cache_dir = Path("./data/dataset_cache")
+
+            prod_frames = []
+            for hash_id in _snapshot:
+                lazy_ref = loader.load_cached(cache_dir / hash_id)
+                if lazy_ref is not None:
+                    try:
+                        prod_frames.append(lazy_ref.head(5000))
+                    except Exception:
+                        pass
+            if not prod_frames:
+                raise RuntimeError("No cached data found for session.")
+            prod_df = pd.concat(prod_frames, ignore_index=True)
+
+            # Load reference distribution from registry if model_id provided
+            ref_df = None
+            stored_drift: Dict[str, Any] = {}
+            if model_id:
+                ref_npy = MODEL_REGISTRY_DIR / model_id / "artifacts" / "reference_sample.npy"
+                if ref_npy.exists():
+                    ref_arr = np.load(str(ref_npy))
+                    ref_df = pd.DataFrame(ref_arr)
+                meta_file = MODEL_REGISTRY_DIR / model_id / "metadata.json"
+                if meta_file.exists():
+                    with open(meta_file, encoding="utf-8") as fh:
+                        stored_meta = json.load(fh)
+                    stored_drift = (stored_meta.get("phases_summary", {})
+                                    .get("DRIFT_DETECTION", {}))
+
+            # Fallback: 70/30 split of production data as reference/production
+            if ref_df is None:
+                n = len(prod_df)
+                split = max(1, int(n * 0.7))
+                ref_df = prod_df.iloc[:split].copy()
+                prod_df = prod_df.iloc[split:].copy()
+
+            detector = DriftDetector()
+            result = detector.detect(ref_df, prod_df)
+            adapter = DriftAdapter()
+            adapter.build_monitor_payload(result)
+
+            return {
+                "drift_detected":        result["drift_detected"],
+                "metrics":               result["metrics"],
+                "thresholds":            result["thresholds"],
+                "status_per_metric":     result["status"],
+                "n_reference":           result["n_reference"],
+                "n_production":          result["n_production"],
+                "n_features":            result["n_features"],
+                "composite_score":       result.get("composite_score", 0.0),
+                "retrain_triggered":     result.get("retrain_triggered", False),
+                "model_id":              model_id,
+                "stored_phase6_summary": stored_drift,
+            }
+
+        data = await asyncio.to_thread(_drift_sync)
+        return {"status": "success", "data": data}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/monitor/drift error: %s", exc, exc_info=True)
+        return JSONResponse({"error": "Drift detection failed."}, status_code=500)
+```
+
+**In `monitoring/drift_detector.py`**, add `"reference_sample": reference_df` to the `detect()` return dict so Phase 7 can persist it.
+
+**In `pipeline/training_orchestrator.py`**, in `_execute_phase_7_model_registry()`, after model weights are saved, add:
+
+```python
+# Save drift reference sample for stateless /monitor/drift endpoint
+try:
+    _drift_res = self.phase_results.get(Phase.DRIFT_DETECTION, {})
+    _ref_sample = _drift_res.get("reference_sample")
+    if _ref_sample is not None and hasattr(_ref_sample, "values"):
+        _artifacts_dir = model_dir / "artifacts"
+        _artifacts_dir.mkdir(parents=True, exist_ok=True)
+        np.save(str(_artifacts_dir / "reference_sample.npy"),
+                _ref_sample.values.astype(np.float32))
+except Exception as _ref_exc:
+    logger.warning("Could not save drift reference sample: %s", _ref_exc)
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  POST /monitor/drift → new TrainingOrchestrator() → Phase 1 + 2 + 3 re-run
+  O(download + schema + preprocessing) per health check call
+
+AFTER:
+  POST /monitor/drift → loader.load_cached() → DriftDetector.detect() direct call
+  O(local disk read) per call
+```
+
+### Dependencies
+
+FIX-02 (for reference_sample.npy to exist).
+
+---
+
+## FIX-09 — XAI Image Explanation: Honest Disable
+
+### Files to Modify
+
+- `pipeline/xai_engine.py`
+
+### Problem
+
+`XAIEngine.explain_image()` (lines 128–141) returns `{"gradcam_available": True}` with all-zero importances. GradCAM is not computed. This is factually false.
+
+### Exact Changes
+
+**Replace the return block inside `explain_image()` (lines 135–139):**
+
+```python
+# Remove:
+return {
+    "method": "GradCAM (Placeholder)",
+    "importances": [0.0] * self.engine.input_dims["image_pooled"],
+    "gradcam_available": True
+}
+
+# Replace with:
+return {
+    "method": "GradCAM (Not Implemented)",
+    "gradcam_available": False,
+    "note": (
+        "Pixel-level GradCAM is not implemented. "
+        "Use explain_tabular() for feature attribution. "
+        "Full GradCAM requires a CAM-compatible backbone hook."
+    ),
+    "importances": [],
+}
+```
+
+### Before → After Flow
+
+```
+BEFORE:  explain_image() → {"gradcam_available": True, importances: [0.0,...]}
+AFTER:   explain_image() → {"gradcam_available": False, note: "not implemented"}
+```
+
+### Dependencies
+
+None.
+
+---
+
+## FIX-10 — Connect ExecutionContext Update Hooks + xs3_confidence_gap Propagation
+
+### Files to Modify
+
+- `api/run_api.py`
+- `core/execution_context.py`
+
+### Problem
+
+`ExecutionContext.update_from_schema()`, `update_model_selection()`, `update_training()` exist but are never called. `xs3_confidence_gap` is computed in schema detection but never used downstream. `should_include_fusion()` permanently returns `False`.
+
+### Exact Changes
+
+**In `core/execution_context.py`**, find `update_from_schema()`. Verify it sets `self.predictability_scores`. If not, add:
+
+```python
+# Inside update_from_schema(), after existing logic:
+for ds in schema.get("per_dataset", []):
+    if not isinstance(ds, dict):
+        continue
+    did = ds.get("dataset_id", "")
+    pred = ds.get("target_profile", {}).get("predictability_score", 0.0)
+    if did and pred:
+        self.predictability_scores[did] = float(pred)
+```
+
+**In `api/run_api.py`, in `/api/schema/detect` route**, after `_session_store[session_id]["schema"] = schema_dict`, add:
+
+```python
+# Update ExecutionContext with schema + xs3_confidence_gap
+try:
+    ctx = session_manager.get_session(session_id)
+    if ctx:
+        per_ds = schema_dict.get("per_dataset", [])
+        xs3_gaps = [
+            float(ds.get("reasoning", {}).get("xs3_confidence_gap", 0.0))
+            for ds in per_ds if isinstance(ds, dict)
+        ]
+        max_xs3_gap = max(xs3_gaps, default=0.0)
+        schema_dict["_xs3_max_gap"] = max_xs3_gap
+        ctx.update_from_schema(schema_dict)
+        ctx.confidence_map["xs3_target_gap"] = max_xs3_gap
+        ctx.predictability_scores = {
+            ds.get("dataset_id", f"ds_{i}"): float(
+                ds.get("target_profile", {}).get("predictability_score", 0.0)
+            )
+            for i, ds in enumerate(per_ds) if isinstance(ds, dict)
+        }
+        session_manager.update_session_context(session_id, ctx)
+except Exception as _ctx_exc:
+    logger.warning("/api/schema/detect: ExecutionContext update failed: %s", _ctx_exc)
+```
+
+**In `/select-model` route**, after `recommendations` is computed, add:
+
+```python
+# Update ExecutionContext with model selection
+try:
+    if _sid:
+        ctx = session_manager.get_session(_sid)
+        if ctx and recommendations:
+            best = recommendations[0]
+            ctx.update_model_selection({
+                "selected_model": best.get("name"),
+                "fusion_strategy": best.get("fusion_strategy"),
+                "candidates": recommendations,
+            })
+            ctx.fusion_strategy = best.get("fusion_strategy")
+            ctx.selected_model = best.get("name")
+            session_manager.update_session_context(_sid, ctx)
+except Exception as _ctx_exc:
+    logger.warning("/select-model: ExecutionContext update failed: %s", _ctx_exc)
+```
+
+**In `_run_training()`, after Phase 5 completes, add:**
+
+```python
+# Update ExecutionContext with training results
+try:
+    if _sid:
+        ctx = session_manager.get_session(_sid)
+        if ctx:
+            ctx.update_training(phase5)
+            ctx.active_modalities = list(modalities)
+            ctx.training_signals = {
+                "best_val_loss": phase5.get("best_val_loss", 0.0),
+                "best_trial": phase5.get("best_trial", 0),
+                "n_trials": phase5.get("n_trials", 0),
+            }
+            session_manager.update_session_context(_sid, ctx)
+except Exception as _ctx_exc:
+    logger.warning("_run_training: ExecutionContext training update failed: %s", _ctx_exc)
+```
+
+**In `training_orchestrator.py`, in `_execute_phase_4_model_selection()`**, after reading `schema_info`, add xs3 safety gate:
+
+```python
+# xs3_confidence_gap gate: ambiguous target → restrict to tabular for safety
+xs3_gap = 0.0
+for ds in schema_info.get("per_dataset", []):
+    g = float(ds.get("reasoning", {}).get("xs3_confidence_gap", 0.0) or 0.0)
+    xs3_gap = max(xs3_gap, g)
+if xs3_gap < 0.15:
+    logger.warning(
+        "Phase 4: xs3_confidence_gap=%.3f < 0.15 — "
+        "target is ambiguous; restricting modalities to tabular.", xs3_gap,
+    )
+    self.config.modalities = ["tabular"]
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  update_from_schema(), update_model_selection(), update_training() → never called
+  ctx.predictability_scores = {} always
+  ctx.should_include_fusion() → always False
+  xs3_confidence_gap → computed, stored in reasoning dict, forgotten
+
+AFTER:
+  /api/schema/detect → ctx.update_from_schema() called → predictability_scores set
+  /select-model → ctx.update_model_selection() called → fusion_strategy set
+  /train-pipeline → ctx.update_training() called after Phase 5
+  xs3_gap < 0.15 → Phase 4 restricts to tabular (safety guard)
+```
+
+### Dependencies
+
+FIX-01, FIX-03.
+
+---
+
+## FIX-11 — Activate PipelineOrchestrator as Profile Persistence Delegate
+
+### Files to Modify
+
+- `api/run_api.py`
+
+### Problem
+
+`PipelineOrchestrator` (core/orchestrator.py) has complete implementations of schema, target, aggregation, and preprocessing planning phases that persist `DatasetProfile` to SQLite via `context_db`. These 449 lines are never called. All profile persistence is bypassed.
+
+### Strategy
+
+Delegate profile persistence to PipelineOrchestrator inside `/api/schema/detect`, after the authoritative schema result is already computed by `COGMASchemaDetector`. Wrapped in try/except so PO failure does not break the API response.
+
+### Exact Changes
+
+**In `/api/schema/detect`**, after `global_schema = detector._build_global_schema(per_dataset_results)`, add:
+
+```python
+# Activate PipelineOrchestrator: persist profiles + preprocessing plans to SQLite
+try:
+    from core.orchestrator import orchestrator as _po
+    _ctx = session_manager.get_session(session_id)
+    if _ctx:
+        _data_map_orch: Dict[str, Any] = {}
+        for _ds_res in per_dataset_results:
+            _did = _ds_res.get("dataset_id", "")
+            if not _did:
+                continue
+            _lazy = get_session_datasets(session_id).get(_did)
+            if _lazy is None:
+                continue
+            try:
+                import polars as _pl
+                if isinstance(_lazy, _pl.LazyFrame):
+                    _data_map_orch[_did] = _lazy.head(500).collect().to_pandas()
+                elif hasattr(_lazy, "head"):
+                    _data_map_orch[_did] = _lazy.head(500)
+            except Exception:
+                pass
+
+        if _data_map_orch:
+            _po.execute_phase_2_schema(_ctx, _data_map_orch)
+            _po.execute_phase_3_target(_ctx, _data_map_orch)
+            _po.execute_phase_4_aggregation(_ctx, _data_map_orch)
+            _po.execute_phase_5_preprocessing(_ctx, _data_map_orch)
+            session_manager.update_session_context(session_id, _ctx)
+            logger.info(
+                "/api/schema/detect: PipelineOrchestrator phases 2-5 complete for %s",
+                session_id,
+            )
+except Exception as _po_exc:
+    logger.warning(
+        "/api/schema/detect: PipelineOrchestrator delegation failed (non-fatal): %s",
+        _po_exc,
+    )
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  /api/schema/detect → COGMASchemaDetector result → _session_store only
+  PipelineOrchestrator: NEVER CALLED
+  DatasetProfile: NOT persisted to SQLite
+  preprocessing_plan: NOT stored in context_db
+  xs3_confidence_gap in profile: NOT saved
+
+AFTER:
+  /api/schema/detect → COGMASchemaDetector result → _session_store [unchanged]
+  → PipelineOrchestrator.execute_phase_2_schema()
+    → DatasetProfile.schema_detected = True; xs3_gap saved; context_db.save_profile()
+  → PipelineOrchestrator.execute_phase_3_target()
+    → DatasetProfile.chosen_target; target_candidates saved
+  → PipelineOrchestrator.execute_phase_4_aggregation()
+    → ctx.global_target set
+  → PipelineOrchestrator.execute_phase_5_preprocessing()
+    → DatasetProfile.preprocessing_plan saved (with xs3_gap)
+```
+
+### Data Flow Fix
+
+`COGMASchemaDetector output → PipelineOrchestrator → DatasetProfile → context_db (SQLite)`
+`profile.preprocessing_plan["xs3_confidence_gap"]` now persisted → available to any downstream phase that loads the profile.
+
+### Dependencies
+
+FIX-01, FIX-10.
+
+---
+
+## Complete Summary Table
+
+| Gap                                     | Fix Groups             | Method                                       |
+| --------------------------------------- | ---------------------- | -------------------------------------------- |
+| UI schema/override ignored by training  | FIX-01, FIX-03         | Session-store injection → Phase 2 SKIPPED    |
+| Preprocessor re-fitted every training   | FIX-02, FIX-03, FIX-04 | Joblib persist → Phase 3 tabular reused      |
+| UI model selection lost                 | FIX-04                 | Stored in session → Phase 4 SKIPPED          |
+| `TabularPreprocessor.configure()` no-op | FIX-05                 | Active: cardinality cap, ratio, imputer      |
+| `select_fusion_strategy()` dead         | FIX-06                 | Called in Phase 4; 5 strategies reachable    |
+| HPO encoder strings inconsistent        | FIX-07                 | Normalized to `["resnet50"]` + alias guard   |
+| `/monitor/drift` O(data) per call       | FIX-08                 | Direct `DriftDetector.detect()` on cache     |
+| `XAI.explain_image()` misleading        | FIX-09                 | `gradcam_available: False` + honest note     |
+| `ExecutionContext.update_*()` dead      | FIX-10                 | Called from schema, select-model, train      |
+| `xs3_confidence_gap` unused             | FIX-10                 | Phase 4 modality gate; confidence_map entry  |
+| `PipelineOrchestrator` 449 lines dead   | FIX-11                 | Profile persistence delegate in schema route |
+
+---
+
+## Atomic Codex Execution Sequence
+
+```
+Step  1:  preprocessing/tabular_preprocessor.py    FIX-05 — configure() body + __init__ + imputer
+Step  2:  config/hyperparameters.py                FIX-07 — image encoder choices normalized
+Step  3:  config/hyperparameters.py                FIX-06 — fusion_strategy choices expanded
+Step  4:  pipeline/xai_engine.py                   FIX-09 — explain_image() honest disable
+Step  5:  pipeline/training_orchestrator.py        FIX-03 — add 3 inject_*() methods
+Step  6:  pipeline/training_orchestrator.py        FIX-03 — Phase 2, 3, 4 short-circuit guards
+Step  7:  pipeline/training_orchestrator.py        FIX-05 — call configure() in Phase 3
+Step  8:  pipeline/training_orchestrator.py        FIX-06 — call select_fusion_strategy in Phase 4
+Step  9:  pipeline/training_orchestrator.py        FIX-10 — xs3_gap gate in Phase 4
+Step 10:  automl/trainer.py                        FIX-06 — expand fusion module switch
+Step 11:  automl/trainer.py                        FIX-07 — image encoder alias normalization
+Step 12:  monitoring/drift_detector.py             FIX-08 — add "reference_sample" to return dict
+Step 13:  pipeline/training_orchestrator.py        FIX-08 — save reference_sample.npy in Phase 7
+Step 14:  api/run_api.py                           FIX-01 — read schema + override before _run_training
+Step 15:  api/run_api.py                           FIX-02 — persist scaler in /preprocess
+Step 16:  api/run_api.py                           FIX-04 — inject scaler + model_sel in _run_training
+Step 17:  api/run_api.py                           FIX-04 — store model_sel in /select-model
+Step 18:  api/run_api.py                           FIX-08 — replace /monitor/drift handler
+Step 19:  core/execution_context.py               FIX-10 — verify/add predictability_scores in update_from_schema
+Step 20:  api/run_api.py                           FIX-10 — call update_from_schema in /api/schema/detect
+Step 21:  api/run_api.py                           FIX-10 — call update_model_selection in /select-model
+Step 22:  api/run_api.py                           FIX-10 — call update_training in _run_training
+Step 23:  api/run_api.py                           FIX-11 — PipelineOrchestrator delegation in /api/schema/detect
+```
+
+---
+
+## Out-of-Scope (Backlog — Superseded by FIX-14)
+
+| Module                            | Resolution                                            |
+| --------------------------------- | ----------------------------------------------------- |
+| `Integrator`                      | Activated via FIX-14 (graceful degradation path)      |
+| `ModalityEncoder`                 | RuntimeError converted to graceful fallback in FIX-14 |
+| `UniversalTargetValidator`        | Wired into schema scoring in FIX-14                   |
+| Full GradCAM in `explain_image()` | Remains excluded — true new feature                   |
+
+---
+
+# FINAL INTEGRATION LAYER — FIX-12 through FIX-18
+
+**Prerequisite:** All FIX-01 → FIX-11 changes applied.
+**Goal:** Eliminate the last 7 architectural gaps to reach 100% integration.
+
+## Extended Dependency Order
+
+```
+FIX-12                              (independent — dataset injection)
+FIX-13                              (independent — selector unification)
+FIX-14                              (independent — dead module activation)
+FIX-15  depends on FIX-10, FIX-13   (ExecutionContext → training wiring)
+FIX-16  depends on FIX-05, FIX-15   (planner full activation)
+FIX-17  depends on FIX-12, FIX-13, FIX-14  (dead code removal)
+FIX-18  depends on FIX-15, FIX-17   (state unification)
+```
+
+---
+
+## FIX-12 — Dataset Injection (CRITICAL — Eliminates Duplicate Ingestion)
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+- `api/run_api.py`
+
+### Problem
+
+Data ingestion runs twice for every session-backed training run:
+
+- **Path A (UI):** `/ingest/datasets` → `DataIngestionManager.ingest_data()` → `_session_store[sid]["datasets"]` populated with lazy refs
+- **Path B (Training):** `_execute_phase_1_data_ingestion()` → `DataIngestionManager.ingest_data()` again from scratch → `self.dataset_registry.register_dataset()`
+
+Both paths call the real downloader. For remote datasets this means **2× network I/O** and **2× disk writes**.
+
+### Exact Changes
+
+**Step 1.** In `pipeline/training_orchestrator.py`, add `inject_external_datasets()` immediately after the 3 existing `inject_external_*` methods (FIX-03):
+
+```python
+def inject_external_datasets(
+    self,
+    session_datasets: Dict[str, Any],
+) -> None:
+    """
+    Register pre-ingested session datasets into the internal DatasetManager
+    so _execute_phase_1_data_ingestion() is skipped.
+
+    Args:
+        session_datasets: Dict mapping source_hash → lazy_ref
+                          (as returned by get_session_datasets(session_id)
+                          in run_api.py).
+    """
+    if not session_datasets:
+        return
+    registered: List[str] = []
+    for source_hash, lazy_ref in session_datasets.items():
+        try:
+            self.dataset_registry.register_dataset(
+                source_hash,
+                lazy_ref,
+                metadata={"source": "session_cache", "hash": source_hash},
+            )
+            registered.append(source_hash)
+        except Exception as reg_exc:
+            logger.warning(
+                "inject_external_datasets: failed to register %s: %s",
+                source_hash, reg_exc,
+            )
+
+    # Mark Phase 1 as complete so _execute_phase_1_data_ingestion() short-circuits
+    _phase1_result: Dict[str, Any] = {
+        "sources": list(session_datasets.keys()),
+        "registered_datasets": registered,
+        "failed_urls": {},
+        "success_count": len(registered),
+        "failed_count": 0,
+        "ingestion_time": "session_cached",
+        "duration_seconds": 0.0,
+        "injected": True,
+    }
+    self.phase_results[Phase.DATA_INGESTION] = _phase1_result
+    self.state.set_slot("phase1_ingestion", _phase1_result)
+    logger.info(
+        "TrainingOrchestrator: injected %d session datasets → Phase 1 SKIPPED",
+        len(registered),
+    )
+```
+
+**Step 2.** In `_execute_phase_1_data_ingestion()`, add short-circuit guard at the very top of the method body (after docstring, before `logger.info("PHASE 1...")`):
+
+```python
+# Short-circuit if datasets were injected via inject_external_datasets()
+if Phase.DATA_INGESTION in self.phase_results and \
+        self.phase_results[Phase.DATA_INGESTION].get("injected"):
+    logger.info(
+        "Phase 1: SKIPPED — %d datasets already registered from session cache",
+        len(self.phase_results[Phase.DATA_INGESTION].get("registered_datasets", [])),
+    )
+    self.current_phase = Phase.SCHEMA_DETECTION
+    return self.phase_results[Phase.DATA_INGESTION]
+```
+
+**Step 3.** In `api/run_api.py`, in `_run_training()` nested function, read session datasets before constructing the orchestrator and inject them. Add **before** `orchestrator = TrainingOrchestrator(...)`:
+
+```python
+# Read session datasets for injection into TrainingOrchestrator
+_session_lazy_datasets: Dict[str, Any] = {}
+if _sid:
+    try:
+        _session_lazy_datasets = get_session_datasets(_sid) or {}
+    except Exception as _ds_exc:
+        logger.warning(
+            "_run_training: could not read session datasets: %s "
+            "— Phase 1 will re-ingest.", _ds_exc,
+        )
+```
+
+Add **after** `orchestrator = TrainingOrchestrator(...)` and after the existing `inject_external_schema()` / `inject_external_preprocessors()` calls:
+
+```python
+# Inject session datasets so Phase 1 (data ingestion) is skipped
+if _session_lazy_datasets:
+    orchestrator.inject_external_datasets(_session_lazy_datasets)
+    tracker.add_message(1, "detail",
+        f"Reusing {len(_session_lazy_datasets)} pre-ingested session datasets"
+        " — Phase 1 skipped")
+else:
+    tracker.add_message(1, "detail",
+        "No session datasets found — Phase 1 will ingest from sources")
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  /ingest/datasets → DataIngestionManager.ingest_data() → _session_store
+  /train-pipeline → DataIngestionManager.ingest_data() [AGAIN] → dataset_registry
+  2× HTTP downloads, 2× disk writes per training run
+
+AFTER:
+  /ingest/datasets → DataIngestionManager.ingest_data() → _session_store
+  /train-pipeline → reads _session_store → inject_external_datasets()
+                 → dataset_registry.register_dataset() [direct registration]
+                 → Phase 1: SKIPPED
+  1× HTTP download total
+```
+
+### Data Flow Fix
+
+`get_session_datasets(sid) → {hash: lazy_ref} → inject_external_datasets() → self.dataset_registry → phase_results[DATA_INGESTION].injected = True → Phase 1 short-circuits`
+
+### Integration Points
+
+- `get_session_datasets(session_id)` already exists in `run_api.py` — use as-is
+- `self.dataset_registry.register_dataset(hash, lazy_ref, metadata)` — existing interface preserved
+- Non-session runs (no `_sid` or empty `_session_lazy_datasets`): Phase 1 executes normally
+
+### Dependencies
+
+None.
+
+### Order of Implementation
+
+1. `pipeline/training_orchestrator.py` — add `inject_external_datasets()`
+2. `pipeline/training_orchestrator.py` — add Phase 1 short-circuit guard
+3. `api/run_api.py` — add `_session_lazy_datasets` extraction + injection call
+
+---
+
+## FIX-13 — Model Selection Unification (Single Authority)
+
+### Files to Modify
+
+- `automl/advanced_selector.py`
+- `api/run_api.py`
+
+### Problem
+
+Two independent model selection systems exist and diverge:
+
+- **`CandidateSelector`** (`automl/candidate_selector.py`): data-driven, RF-probe based. Used by Phase 4 of `TrainingOrchestrator`. **This is the correct primary system** — the file's own docstring says so explicitly: _"AdvancedModelSelector is retained ONLY for Optuna HPO space generation."_
+- **`AdvancedModelSelector`** (`automl/advanced_selector.py`): heuristic-only. Used by `/select-model` API endpoint (line 1061 of `run_api.py`). Result stored in `_session_store[sid]["model_selection"]` and injected into Phase 4 via FIX-04.
+
+**Consequence of mismatch:** If the user calls `/select-model`, Phase 4 injects the `AdvancedModelSelector` result and skips `CandidateSelector` entirely. If the user skips `/select-model`, Phase 4 uses `CandidateSelector` with no UI input. The result is **non-deterministic** model selection depending on the call sequence.
+
+### Fix Strategy
+
+**`CandidateSelector` becomes the single authority.** `AdvancedModelSelector.recommend_models()` is updated to call `CandidateSelector` internally and adds its HPO space on top. `/select-model` now goes through `CandidateSelector` → gets data-driven results with HPO metadata.
+
+### Exact Changes
+
+**Step 1.** In `automl/advanced_selector.py`, find the `recommend_models()` method. Replace its internal heuristic-only logic with a `CandidateSelector` delegation, keeping the same return interface:
+
+Find the existing `recommend_models()` implementation body. Wrap it:
+
+```python
+def recommend_models(
+    self,
+    problem_type: str = "unsupervised",
+    modalities: List[str] | None = None,
+    dataset_size: int = 10_000,
+    avg_tokens: int = 128,
+    # new optional — allow passing probed data for data-driven selection
+    tabular_X: Optional[Any] = None,
+    tabular_y: Optional[Any] = None,
+    schema_info: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Unified model selection: CandidateSelector (primary) with
+    AdvancedModelSelector HPO space appended.
+
+    Falls back to pure heuristics if CandidateSelector probe fails.
+    Preserves the existing response contract for the UI.
+    """
+    modalities = modalities or []
+    _schema_info = schema_info or {
+        "global_modalities": modalities,
+        "total_samples": dataset_size,
+        "avg_tokens": avg_tokens,
+        "problem_type": problem_type,
+    }
+
+    # ── Step 1: Data-driven selection via CandidateSelector ──────────────
+    candidates_data_driven: List[Dict[str, Any]] = []
+    try:
+        from automl.candidate_selector import CandidateSelector
+        cs = CandidateSelector()
+        candidates = cs.generate_candidates(_schema_info)
+
+        # Run tabular probe only if data is available
+        probe_scores: Dict[str, Any] = {}
+        if tabular_X is not None and tabular_y is not None and candidates.get("tabular"):
+            probe_scores = cs.quick_probe_tabular(
+                candidates["tabular"], tabular_X, tabular_y, problem_type
+            )
+
+        ranked = cs.rank_candidates(
+            probe_scores=probe_scores,
+            schema_info=_schema_info,
+            hardware_info=self._get_hardware_info(),
+        )
+        ranked = cs.apply_jit_filter(
+            ranked, vram_gb=self._get_hardware_info().get("gpu_memory_gb", 0.0)
+        )
+        candidates_data_driven = ranked
+        logger.info(
+            "recommend_models: CandidateSelector produced %d candidates "
+            "(probe_scores=%s)", len(ranked), list(probe_scores.keys()),
+        )
+    except Exception as cs_exc:
+        logger.warning(
+            "recommend_models: CandidateSelector failed (%s) — "
+            "falling back to heuristics.", cs_exc,
+        )
+
+    # ── Step 2: Heuristic HPO space from AdvancedModelSelector ───────────
+    # (hardware-aware batch size, epoch bounds, Optuna distributions)
+    heuristic_result = self._run_heuristic_selection(
+        problem_type=problem_type,
+        modalities=modalities,
+        dataset_size=dataset_size,
+        avg_tokens=avg_tokens,
+    )
+
+    # ── Step 3: Merge — data-driven candidates enriched with HPO space ───
+    if candidates_data_driven:
+        # Use CandidateSelector ordering but append HPO space from heuristics
+        results: List[Dict[str, Any]] = []
+        for cand in candidates_data_driven[:3]:  # top-3 only
+            entry = dict(cand)
+            entry.setdefault("hpo_space", heuristic_result.get("hpo_space", {}))
+            entry.setdefault("batch_size", heuristic_result.get("batch_size", 32))
+            entry.setdefault("hardware_info", heuristic_result.get("hardware_info", {}))
+            entry.setdefault("fusion_strategy",
+                             heuristic_result.get("fusion_strategy", "attention"))
+            entry.setdefault("tier", "primary")
+            results.append(entry)
+        # Fallback entry from heuristics
+        fallback = dict(heuristic_result)
+        fallback["tier"] = "fallback"
+        results.append(fallback)
+        return results
+    else:
+        # Pure heuristic fallback (CandidateSelector completely failed)
+        heuristic_result["tier"] = "primary"
+        return [heuristic_result]
+```
+
+**Step 2.** Rename the existing `recommend_models()` implementation to `_run_heuristic_selection()` in `advanced_selector.py`. This preserves all existing epoch/batch/HPO logic without deletion.
+
+> **Exact rename:** Find `def recommend_models(self, ...)` — rename to `def _run_heuristic_selection(self, ...)`. The signature stays identical. No body changes.
+
+**Step 3.** No changes needed to `/select-model` in `run_api.py` — it already calls `AdvancedModelSelector.recommend_models()`, which now internally uses `CandidateSelector`. The response contract is identical.
+
+**Step 4.** No changes needed to Phase 4 of `TrainingOrchestrator` — it already calls `CandidateSelector` directly. FIX-04 injects the UI result into Phase 4; since the UI now also produces `CandidateSelector`-ranked candidates, the results are consistent.
+
+### Before → After Flow
+
+```
+BEFORE:
+  /select-model → AdvancedModelSelector.recommend_models() [heuristic-only]
+               → stored in _session_store[sid]["model_selection"]
+  Phase 4 (if injected) → uses heuristic result
+  Phase 4 (if not injected) → CandidateSelector [data-driven]
+  ⚠️ Two different ranking systems
+
+AFTER:
+  /select-model → AdvancedModelSelector.recommend_models()
+               → internally calls CandidateSelector [data-driven probe]
+               → enriches with HPO space from heuristics
+               → stored in _session_store[sid]["model_selection"]
+  Phase 4 (if injected) → uses CandidateSelector-ranked result
+  Phase 4 (if not injected) → CandidateSelector directly
+  ✔ Same ranking system both paths
+```
+
+### Data Flow Fix
+
+`CandidateSelector.rank_candidates() → enriched with AdvancedModelSelector HPO space → stored in _session_store → injected into Phase 4 OR used directly by Phase 4`
+
+### Integration Points
+
+- `AdvancedModelSelector._get_hardware_info()` — must exist or be extracted from existing heuristic body
+- `CandidateSelector.generate_candidates(schema_info)` — accepts `{"global_modalities": [...], "total_samples": N, ...}`
+- `CandidateSelector.quick_probe_tabular()` — only called when `tabular_X` is provided; `/select-model` call passes `None` (no data available at UI time), so probe is skipped and ranking uses heuristic scores
+
+### Dependencies
+
+None (independent of FIX-01–12).
+
+---
+
+## FIX-14 — Dead Module Activation (CHOSEN: Option A — Partial Integration)
+
+### Decision Rationale
+
+**Option A (integrate) chosen** over Option B (delete) because:
+
+1. `CandidateSelector.quick_probe_tabular()` uses tabular RF scores — this exact logic is duplicated inside `UniversalTargetValidator`
+2. `ModalityEncoder.__init__` already accepts `text_encoder=None, image_encoder=None` — it does NOT crash on init; only `encode_text()` / `encode_image()` raise RuntimeError
+3. The fix for RuntimeError is 2 lines per method (graceful degradation to zeros)
+4. After the fix, `Integrator.process_multimodal()` can run on tabular columns without any model loaded
+5. The RF predictability scoring in `UniversalTargetValidator` runs on CPU, no BERT/ResNet needed
+
+**Activation scope:** Tabular path only. Text/image paths degrade gracefully to zero arrays (no RuntimeError).
+
+### Files to Modify
+
+- `data_ingestion/modality_encoder.py`
+- `data_ingestion/integrator.py`
+- `core/orchestrator.py`
+
+### Problem
+
+Three modules are unreachable (900+ lines of dead code):
+
+- `ModalityEncoder`: `encode_text()` and `encode_image()` raise `RuntimeError` when encoders are `None` → no caller survives
+- `Integrator`: calls `ModalityEncoder` → inherits the crash → never successfully invoked
+- `UniversalTargetValidator`: called by `Integrator` → also unreachable
+- `PipelineOrchestrator.execute_phase_2_schema()` calls none of them
+
+### Exact Changes
+
+**Step 1.** In `data_ingestion/modality_encoder.py`, find `encode_text()` (lines 137–140):
+
+```python
+# REMOVE:
+if self.text_encoder is None:
+    raise RuntimeError(
+        "Text encoder not initialized. "
+        "Pass text_encoder to ModalityEncoder.__init__()."
+    )
+
+# REPLACE WITH:
+if self.text_encoder is None:
+    logger.warning(
+        "ModalityEncoder.encode_text: no text_encoder provided — "
+        "returning zero embeddings (BERT_DIM=%d).", BERT_DIM,
+    )
+    return np.zeros((len(texts) if texts else 1, BERT_DIM), dtype=np.float32)
+```
+
+**Step 2.** In `data_ingestion/modality_encoder.py`, find `encode_image()` (similar RuntimeError pattern after line ~215). Apply the same fix:
+
+```python
+# REMOVE:
+if self.image_encoder is None:
+    raise RuntimeError(
+        "Image encoder not initialized. "
+        "Pass image_encoder to ModalityEncoder.__init__()."
+    )
+
+# REPLACE WITH:
+if self.image_encoder is None:
+    logger.warning(
+        "ModalityEncoder.encode_image: no image_encoder provided — "
+        "returning zero embeddings (RESNET_DIM=%d).", RESNET_DIM,
+    )
+    n = len(images) if hasattr(images, "__len__") else 1
+    return np.zeros((n, RESNET_DIM), dtype=np.float32)
+```
+
+**Step 3.** In `core/orchestrator.py`, in `PipelineOrchestrator.execute_phase_2_schema()`, after schema detection completes and before saving the profile, add an `Integrator` call for tabular columns:
+
+```python
+# ── Activate Integrator for RF-based predictability scoring ──────────
+try:
+    from data_ingestion.integrator import Integrator
+    _integrator = Integrator()  # ModalityEncoder initialized with no encoders (safe after FIX-14)
+    for _did, _df in data_map.items():
+        if not isinstance(_df, pd.DataFrame) or _df.empty:
+            continue
+        _profile = ctx.get_dataset_profile(_did)
+        if _profile is None:
+            continue
+        _target_col = _profile.chosen_target or ctx.global_target
+        if not _target_col or _target_col not in _df.columns:
+            continue
+        try:
+            _tabular_cols = [
+                c for c in _df.columns
+                if c != _target_col and _df[c].dtype in (
+                    "int64", "float64", "int32", "float32"
+                )
+            ]
+            if not _tabular_cols:
+                continue
+            _meta = _integrator.process_multimodal(
+                data=_df[_tabular_cols + [_target_col]].head(2000),
+                target_column=_target_col,
+                modalities=["tabular"],
+            )
+            if _meta:
+                _tab_meta = next(
+                    (m for m in _meta if getattr(m, "modality_name", "") == "tabular"),
+                    None,
+                )
+                if _tab_meta:
+                    _profile.predictability_score = float(
+                        getattr(_tab_meta, "predictability_score", 0.0)
+                    )
+                    logger.info(
+                        "PipelineOrchestrator: Integrator scored dataset %s "
+                        "predictability=%.3f", _did, _profile.predictability_score,
+                    )
+                    ctx.predictability_scores[_did] = _profile.predictability_score
+        except Exception as _int_ds_exc:
+            logger.warning(
+                "PipelineOrchestrator: Integrator failed for %s: %s",
+                _did, _int_ds_exc,
+            )
+except Exception as _int_exc:
+    logger.warning(
+        "PipelineOrchestrator.execute_phase_2_schema: Integrator activation "
+        "failed (non-fatal): %s", _int_exc,
+    )
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  ModalityEncoder() → init OK
+  encode_text(texts) → RuntimeError (text_encoder is None)
+  encode_image(images) → RuntimeError (image_encoder is None)
+  Integrator.process_multimodal() → crashes at encode step
+  UniversalTargetValidator → unreachable
+  PipelineOrchestrator: never calls Integrator
+
+AFTER:
+  ModalityEncoder() → init OK
+  encode_text(texts) [no encoder] → zeros (N, 768)  ← no crash
+  encode_image(images) [no encoder] → zeros (N, 2048) ← no crash
+  Integrator.process_multimodal(data, target, ["tabular"])
+    → ModalityEncoder.encode_tabular() [always worked]
+    → UniversalTargetValidator.validate() [RF on tabular features]
+    → ModalityMetadata with predictability_score
+  PipelineOrchestrator.execute_phase_2_schema()
+    → calls Integrator on tabular data ≤ 2000 rows
+    → profile.predictability_score populated
+    → ctx.predictability_scores[did] = score
+    → ctx.should_include_fusion() now returns True when 2+ modalities score > 0.4
+```
+
+### Data Flow Fix
+
+`Integrator.process_multimodal() → ModalityMetadata.predictability_score → DatasetProfile.predictability_score → ctx.predictability_scores[did] → ctx.should_include_fusion() → Phase 4 modality routing + fusion decision`
+
+### Integration Points
+
+- Called from `PipelineOrchestrator.execute_phase_2_schema()` (which is activated by FIX-11)
+- Tabular columns selected as: `dtype in {int64, float64, int32, float32}` — no path detection needed
+- `Integrator.process_multimodal(data, target_column, modalities=["tabular"])` — existing API
+
+### Dependencies
+
+FIX-11 (PipelineOrchestrator must be activated first so `execute_phase_2_schema()` is called at runtime).
+
+---
+
+## FIX-15 — ExecutionContext → TrainingOrchestrator Wiring
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+- `api/run_api.py`
+
+### Problem
+
+`TrainingOrchestrator.__init__` accepts only `config: TrainingConfig`. Even after FIX-10 populates `ExecutionContext` with `predictability_scores`, `fusion_strategy`, `selected_model`, and `get_active_modalities()`, the TrainingOrchestrator never reads any of it. The intelligence computed in the API layer is invisible to the training engine.
+
+### Exact Changes
+
+**Step 1.** Modify `TrainingOrchestrator.__init__` signature. Find:
+
+```python
+def __init__(self, config: TrainingConfig) -> None:
+```
+
+Replace with:
+
+```python
+def __init__(
+    self,
+    config: TrainingConfig,
+    execution_context: Optional[Any] = None,  # ExecutionContext or None
+) -> None:
+```
+
+Add at the end of `__init__` body (after existing assignments):
+
+```python
+# Read-only reference to ExecutionContext — used in Phase 4 for modality + fusion routing
+self.execution_context = execution_context
+if self.execution_context is not None:
+    logger.info(
+        "TrainingOrchestrator: ExecutionContext attached "
+        "(session=%s, predictability_scores=%s)",
+        getattr(self.execution_context, "session_id", "?"),
+        list(getattr(self.execution_context, "predictability_scores", {}).keys()),
+    )
+```
+
+**Step 2.** In `api/run_api.py`, in `_run_training()`, when constructing `TrainingOrchestrator`, pass the session context. Change:
+
+```python
+orchestrator = TrainingOrchestrator(
+    TrainingConfig(
+        dataset_sources=sources,
+        problem_type=problem_type,
+        modalities=modalities,
+    )
+)
+```
+
+To:
+
+```python
+# Retrieve session ExecutionContext to pass intelligence into training
+_training_ctx = None
+if _sid:
+    try:
+        _training_ctx = session_manager.get_session(_sid)
+    except Exception:
+        pass
+
+orchestrator = TrainingOrchestrator(
+    TrainingConfig(
+        dataset_sources=sources,
+        problem_type=problem_type,
+        modalities=modalities,
+    ),
+    execution_context=_training_ctx,
+)
+```
+
+**Step 3.** In `_execute_phase_4_model_selection()`, after the existing `xs3_gap` gate (FIX-10), add `ExecutionContext`-driven routing:
+
+```python
+# ── Read ExecutionContext intelligence (read-only) ─────────────────────
+ctx = self.execution_context
+if ctx is not None:
+    # 1. Use ctx active modalities if stronger signal than config
+    ctx_active = []
+    try:
+        ctx_active = ctx.get_active_modalities()
+    except Exception:
+        pass
+    if ctx_active:
+        effective_modalities = ctx_active
+        logger.info(
+            "Phase 4: overriding modalities from ExecutionContext "
+            "(%s → %s)", self.config.modalities, effective_modalities,
+        )
+        self.config.modalities = effective_modalities
+
+    # 2. Use ctx.fusion_strategy if already set (from /select-model)
+    ctx_fusion = getattr(ctx, "fusion_strategy", None)
+    if ctx_fusion:
+        self.state.set_slot("schema_derived_fusion", ctx_fusion)
+        logger.info(
+            "Phase 4: using ctx.fusion_strategy=%s from ExecutionContext",
+            ctx_fusion,
+        )
+
+    # 3. Honour ctx.selected_model if user manually selected
+    ctx_model = getattr(ctx, "selected_model", None)
+    if ctx_model and Phase.MODEL_SELECTION not in self.phase_results:
+        # Construct minimal model selection result from context
+        _ctx_sel = {
+            "selected_model": ctx_model,
+            "fusion_strategy": ctx_fusion or "attention",
+            "source": "execution_context",
+        }
+        self.phase_results[Phase.MODEL_SELECTION] = _ctx_sel
+        self.state.set_slot("phase4_model_selection", _ctx_sel)
+        logger.info(
+            "Phase 4: using manually selected model from ctx: %s", ctx_model,
+        )
+        self.current_phase = Phase.TRAINING
+        return
+```
+
+**Step 4.** In Phase 5 training (Optuna trial objective), after the `fusion_strategy` is resolved from schema state (FIX-06), add ctx override:
+
+```python
+# ExecutionContext fusion override takes highest priority
+if self.execution_context is not None:
+    _ctx_fusion = getattr(self.execution_context, "fusion_strategy", None)
+    if _ctx_fusion:
+        fusion_strategy = _ctx_fusion
+        logger.info("Phase 5 trial: fusion_strategy overridden by ctx: %s", fusion_strategy)
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  ctx.predictability_scores = {"tabular": 0.87, "text": 0.72}  ← populated
+  ctx.fusion_strategy = "attention"                              ← set
+  ctx.selected_model = "ResNet50 + BERT-base + XGBoost"        ← set
+  TrainingOrchestrator: ctx = None → ignores all of the above
+  Phase 4: re-runs probe + selection independently
+
+AFTER:
+  TrainingOrchestrator(config, execution_context=ctx)
+  Phase 4:
+    ctx.get_active_modalities() → ["tabular", "text"] → overrides config.modalities
+    ctx.fusion_strategy → "attention" → stored in state as override
+    ctx.selected_model → "ResNet50 +..." → Phase 4 short-circuits with ctx selection
+  Phase 5:
+    fusion_strategy = ctx.fusion_strategy (highest priority)
+```
+
+### Data Flow Fix
+
+`ctx.predictability_scores → Phase 4 modality routing`
+`ctx.fusion_strategy → Phase 4 state slot → Phase 5 trial always uses it`
+`ctx.selected_model → Phase 4 short-circuit (same as inject_external_model_selection but from ctx)`
+
+### Integration Points
+
+- `ctx.get_active_modalities()` — returns modalities where `predictability_scores[m] > 0.4`
+- `ctx.fusion_strategy` — set by `/select-model` (FIX-10) and by `PipelineOrchestrator` (FIX-11)
+- `ctx.selected_model` — set by `/select-model` (FIX-10)
+- `session_manager.get_session(sid)` — already used elsewhere in `run_api.py`
+
+### Dependencies
+
+FIX-10 (ctx must be populated with schema + selection before training starts), FIX-13 (ctx.selected_model comes from unified selector).
+
+---
+
+## FIX-16 — PreprocessingPlanner Full Activation (All Modalities)
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+
+### Problem
+
+FIX-05 activated `TabularPreprocessor.configure(plan)`. But `PreprocessingPlanner.create_plan()` also produces `text_max_length`, `image_resize`, and `image_augmentation` keys. `TextEncoder` and `ImageEncoder` both have `.configure()` methods (confirmed via codebase) but are never called with the plan in Phase 3.
+
+### Exact Changes
+
+In `_execute_phase_3_preprocessing()`, after the `TabularPreprocessor.configure(preprocessing_plan)` call (added in FIX-05), add:
+
+```python
+# Apply preprocessing plan to TextEncoder if active
+if "text" in self.config.modalities:
+    _text_enc = self.fitted_transformers.get("text")
+    if _text_enc is not None and hasattr(_text_enc, "configure"):
+        _text_plan = {
+            k: preprocessing_plan[k]
+            for k in ("text_max_length", "tokenizer", "text_augmentation")
+            if k in preprocessing_plan
+        }
+        if _text_plan:
+            try:
+                _text_enc.configure(_text_plan)
+                logger.info(
+                    "  Phase 3: TextEncoder.configure() applied: %s", _text_plan
+                )
+            except Exception as _te_cfg:
+                logger.warning(
+                    "  Phase 3: TextEncoder.configure() failed: %s", _te_cfg
+                )
+    # If text encoder not yet instantiated, store plan for Phase 5 to apply
+    else:
+        self.state.set_slot("text_preprocessing_plan", {
+            k: preprocessing_plan[k]
+            for k in ("text_max_length", "tokenizer")
+            if k in preprocessing_plan
+        })
+        logger.info("  Phase 3: text encoder not yet instantiated — "
+                    "plan stored for Phase 5")
+
+# Apply preprocessing plan to ImageEncoder if active
+if "image" in self.config.modalities:
+    _img_enc = self.fitted_transformers.get("image")
+    if _img_enc is not None and hasattr(_img_enc, "configure"):
+        _image_plan = {
+            k: preprocessing_plan[k]
+            for k in ("image_resize", "image_augmentation", "image_normalize")
+            if k in preprocessing_plan
+        }
+        if _image_plan:
+            try:
+                _img_enc.configure(_image_plan)
+                logger.info(
+                    "  Phase 3: ImageEncoder.configure() applied: %s", _image_plan
+                )
+            except Exception as _ie_cfg:
+                logger.warning(
+                    "  Phase 3: ImageEncoder.configure() failed: %s", _ie_cfg
+                )
+    else:
+        self.state.set_slot("image_preprocessing_plan", {
+            k: preprocessing_plan[k]
+            for k in ("image_resize", "image_augmentation")
+            if k in preprocessing_plan
+        })
+        logger.info("  Phase 3: image encoder not yet instantiated — "
+                    "plan stored for Phase 5")
+```
+
+**Also in Phase 5 (`_execute_phase_5_training()`)**, after each encoder is instantiated in the Optuna trial, apply any stored plan:
+
+```python
+# After instantiating text_encoder in trial:
+_stored_text_plan = self.state.get_slot("text_preprocessing_plan")
+if _stored_text_plan and hasattr(text_encoder, "configure"):
+    try:
+        text_encoder.configure(_stored_text_plan)
+    except Exception as _tcp:
+        logger.warning("Phase 5 trial: TextEncoder.configure() deferred apply failed: %s", _tcp)
+
+# After instantiating image_encoder in trial:
+_stored_img_plan = self.state.get_slot("image_preprocessing_plan")
+if _stored_img_plan and hasattr(image_encoder, "configure"):
+    try:
+        image_encoder.configure(_stored_img_plan)
+    except Exception as _icp:
+        logger.warning("Phase 5 trial: ImageEncoder.configure() deferred apply failed: %s", _icp)
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  PreprocessingPlanner.create_plan() → {max_cardinality, near_unique_ratio,
+    text_max_length, image_resize, image_augmentation}
+  TabularPreprocessor.configure(plan) ← called (FIX-05)
+  TextEncoder.configure() ← NEVER CALLED
+  ImageEncoder.configure() ← NEVER CALLED
+
+AFTER:
+  PreprocessingPlanner.create_plan() → plan dict [same]
+  TabularPreprocessor.configure(plan)  ← called (FIX-05)
+  TextEncoder.configure({text_max_length, tokenizer}) ← called
+  ImageEncoder.configure({image_resize, image_augmentation}) ← called
+  Deferred apply in Phase 5 if encoders not yet instantiated in Phase 3
+```
+
+### Dependencies
+
+FIX-05 (tabular configure already active), FIX-15 (state.set_slot used for deferred plans).
+
+---
+
+## FIX-17 — Dead Code Removal + Path Cleanup
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+- `api/run_api.py`
+- `automl/advanced_selector.py`
+
+### Problem
+
+After FIX-01–16, several parallel execution paths still exist and can cause divergence:
+
+1. **Phase 1:** `_execute_phase_1_data_ingestion()` still has the full download path even when datasets are injected (now guarded by short-circuit in FIX-12, but old path body remains)
+2. **Phase 4:** If neither `inject_external_model_selection()` nor `injection_from_ctx` fire, Phase 4 runs `CandidateSelector` — then `AdvancedModelSelector` separately — returning two different result dicts. The result assignment at the end of Phase 4 may pick the wrong one.
+3. **`/preprocess` route:** The `TabularPreprocessor` fitting block runs even when `tabular_scaler.joblib` already exists from a prior `/preprocess` call on the same session — wasteful.
+4. **`AdvancedModelSelector`:** Old `recommend_models()` body is renamed to `_run_heuristic_selection()` in FIX-13 but the original method signature line must not remain as a stub.
+
+### Exact Changes
+
+**Step 1.** In `_execute_phase_4_model_selection()`, at the end, after `CandidateSelector` produces its result, ensure there is exactly ONE result assignment path. Remove any secondary `AdvancedModelSelector` call that exists as a fallback outside the `CandidateSelector` try/except. The pattern to find:
+
+```python
+# REMOVE any block resembling:
+try:
+    selector = AdvancedModelSelector()
+    result = selector.recommend_models(...)  # ← parallel call
+    ...
+except Exception:
+    ...
+```
+
+Confirm the Phase 4 result dict is assigned exactly once (inside the `CandidateSelector` try/except with a clean fallback to heuristics via `AdvancedModelSelector._run_heuristic_selection()` as defined in FIX-13).
+
+**Step 2.** In `/preprocess` route, before fitting `TabularPreprocessor`, add a cache-hit check:
+
+```python
+# Skip TabularPreprocessor re-fit if cached scaler already exists for this session
+if _scaler_path.exists():
+    logger.info(
+        "/preprocess: TabularPreprocessor already cached at %s — "
+        "skipping re-fit for this session.", _scaler_path,
+    )
+    # Load and use existing scaler for the sample output
+    try:
+        import joblib as _jl
+        tp = _jl.load(str(_scaler_path))
+        out_dim = tp.get_output_dim()
+    except Exception:
+        tp = None
+        out_dim = len(tabular_cols)
+else:
+    # [existing fit block — unchanged]
+    tp = TabularPreprocessor()
+    tp.fit(feature_df[tabular_cols])
+    # persist to disk [existing joblib.dump block — unchanged]
+```
+
+**Step 3.** In `api/run_api.py`, add explicit error state for the case where `/train-pipeline` is called with no datasets and no session:
+
+```python
+# In _run_training(), after the inject_external_datasets() block:
+if (not _session_lazy_datasets
+        and not (sources or self.config.dataset_sources)):
+    raise ValueError(
+        "No datasets provided: session has no ingested data "
+        "and TrainingConfig.dataset_sources is empty. "
+        "Call POST /ingest/datasets first."
+    )
+```
+
+**Step 4.** Delete the stub `recommend_models` method from `advanced_selector.py` if FIX-13's rename left a remnant. Confirm the file has exactly:
+
+- `_run_heuristic_selection(self, ...)` — the original implementation
+- `recommend_models(self, ...)` — the new unified wrapper from FIX-13
+
+### Before → After Flow
+
+```
+BEFORE:
+  /preprocess → always re-fits TabularPreprocessor (even if session called /preprocess twice)
+  Phase 4 → CandidateSelector + possibly AdvancedModelSelector called separately
+
+AFTER:
+  /preprocess → checks cache → skips re-fit if exists
+  Phase 4 → single CandidateSelector path; AdvancedModelSelector.recommend_models()
+             delegates to CandidateSelector (FIX-13)
+  /train-pipeline → explicit error if no data at all
+```
+
+### Dependencies
+
+FIX-12 (inject_external_datasets), FIX-13 (selector unification).
+
+---
+
+## FIX-18 — Global State Unification (Single Source of Truth)
+
+### Files to Modify
+
+- `api/run_api.py`
+- `pipeline/training_orchestrator.py`
+
+### Problem
+
+State is fragmented across three stores with no defined ownership:
+
+| State            | `_session_store` | `ExecutionContext` | `TrainingOrchestrator.state` |
+| ---------------- | ---------------- | ------------------ | ---------------------------- |
+| schema           | ✔                | ✔ (after FIX-10)   | ✔ (phase_results)            |
+| target override  | ✔                | ✔ (user_overrides) | ✔ (phase_results slot)       |
+| model selection  | ✔ (after FIX-04) | ✔ (after FIX-10)   | ✔ (phase_results)            |
+| training signals | ✗                | ✔ (after FIX-10)   | ✔ (phase_results)            |
+
+No code defines **which store is authoritative** when they diverge. This creates hidden bugs when a user updates the schema override mid-session.
+
+### Ownership Rules (Deterministic)
+
+```
+ExecutionContext = PRIMARY (authoritative, persistent via session_manager)
+_session_store   = CACHE (ephemeral refs only: lazy data, raw hashes, scaler path)
+TrainingOrchestrator.state = EXECUTION-ONLY (internal phase book-keeping, not read outside)
+```
+
+Mapping:
+| Data | Owner | Cache |
+|---|---|---|
+| schema dict | ExecutionContext.global_schema | \_session_store["schema"] (copied from EC) |
+| target override | ExecutionContext.global_target / user_overrides | \_session_store["target_override"] |
+| model selection | ExecutionContext.model_choices | \_session_store["model_selection"] |
+| training signals | ExecutionContext.training_signals | — |
+| lazy data refs | \_session_store["datasets"] | — (not in EC) |
+| scaler path | \_session_store["scaler_path"] | — (not in EC) |
+
+### Exact Changes
+
+**Step 1.** In `/api/schema/override` (the endpoint that sets `target_override`), after storing in `_session_store`, also write to `ExecutionContext` as the authoritative update:
+
+```python
+# After: _session_store[session_id]["target_override"] = new_target
+try:
+    ctx = session_manager.get_session(session_id)
+    if ctx:
+        ctx.override_global_target(
+            new_target=new_target,
+            reason="user_override via /api/schema/override",
+        )
+        session_manager.update_session_context(session_id, ctx)
+        logger.info(
+            "/api/schema/override: ctx.global_target set to %s", new_target
+        )
+except Exception as _ov_exc:
+    logger.warning("/api/schema/override: ctx update failed: %s", _ov_exc)
+```
+
+**Step 2.** In `_run_training()`, make `TrainingOrchestrator` read `target_override` from `ExecutionContext.global_target` first, falling back to `_session_store`:
+
+```python
+# FIX-18: canonical target_override source = ExecutionContext
+_canonical_target_override = _session_target_override  # from _session_store (FIX-01)
+if _training_ctx is not None:
+    _ctx_target = getattr(_training_ctx, "global_target", None)
+    if _ctx_target:
+        _canonical_target_override = _ctx_target
+        logger.info(
+            "_run_training: using ctx.global_target=%s as canonical override",
+            _canonical_target_override,
+        )
+
+# Use canonical override in inject_external_schema (replaces _session_target_override)
+if _session_cached_schema:
+    orchestrator.inject_external_schema(
+        _session_cached_schema,
+        target_override=_canonical_target_override,  # ← canonical, not raw _session_store value
+    )
+```
+
+**Step 3.** Add a `_read_from_context_or_store()` helper in `run_api.py` to enforce consistent fallback pattern. Place near the `_session_lock` definition:
+
+```python
+def _read_from_context_or_store(
+    session_id: Optional[str],
+    key: str,
+    ctx_attr: Optional[str] = None,
+) -> Any:
+    """
+    Read a value from ExecutionContext first (authoritative),
+    falling back to _session_store (cache).
+
+    Args:
+        session_id: Session ID.
+        key: Key in _session_store dict.
+        ctx_attr: Attribute name on ExecutionContext (defaults to key).
+    Returns:
+        Value from EC if available and non-None, otherwise _session_store value.
+    """
+    ctx_attr = ctx_attr or key
+    # Primary: ExecutionContext
+    try:
+        ctx = session_manager.get_session(session_id) if session_id else None
+        if ctx:
+            val = getattr(ctx, ctx_attr, None)
+            if val is not None:
+                return val
+    except Exception:
+        pass
+    # Fallback: session store
+    with _session_lock:
+        return _session_store.get(session_id, {}).get(key)
+```
+
+**Step 4.** In `TrainingOrchestrator`, enforce that `self.state` (internal phase state) is never read from outside the orchestrator. Scan for any import of `TrainingOrchestrator.state` in `run_api.py` or other files and remove/replace with `ExecutionContext` reads. (Scan result: none found in `run_api.py` — this is a defensive check only.)
+
+**Step 5.** In `_execute_phase_7_model_registry()`, after saving the model, write training results back to ExecutionContext via the already-wired `update_training()` call path. This is handled by `_run_training()` (FIX-10 Step 4), but add a guard in Phase 7 itself for the case where the orchestrator is run without a session:
+
+```python
+# Phase 7: if ExecutionContext attached, record registered model ID
+if self.execution_context is not None:
+    try:
+        _mid = phase7_result.get("model_id")
+        if _mid:
+            if not hasattr(self.execution_context, "registered_model_ids"):
+                self.execution_context.registered_model_ids = []
+            self.execution_context.registered_model_ids.append(_mid)
+            logger.info(
+                "Phase 7: registered model %s recorded in ExecutionContext", _mid
+            )
+    except Exception as _ec7_exc:
+        logger.warning("Phase 7: ExecutionContext model registration failed: %s", _ec7_exc)
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  target_override: _session_store (read) vs ctx.override_global_target (ignored)
+  schema: _session_store (primary) vs ctx.global_schema (secondary, may diverge)
+  model selection: _session_store (read by _run_training) vs ctx.model_choices
+  No defined authority → silent divergence on concurrent updates
+
+AFTER:
+  target_override: ctx.global_target (PRIMARY) → _session_store fallback
+  schema: EC updated first, _session_store kept as cache
+  model selection: EC updated by /select-model + /train-pipeline reads from EC
+  _session_store = lazy refs + scaler paths ONLY (no state duplication)
+  TrainingOrchestrator.state = internal only
+```
+
+### Data Flow Fix (Final Unified Architecture)
+
+```
+User Action          → ExecutionContext (PRIMARY)  → _session_store (cache)
+──────────────────────────────────────────────────────────────────────────
+/ingest/datasets     → ctx.active_dataset_ids      → ["datasets"][hash]=lazy_ref
+/api/schema/detect   → ctx.global_schema           → ["schema"] = schema_dict
+/api/schema/override → ctx.global_target           → ["target_override"] = target
+/preprocess          → ctx.preprocessing_plan      → scaler_path = {path}
+/select-model        → ctx.model_choices           → ["model_selection"] = best
+/train-pipeline      → reads ctx (all fields)      → reads cache for lazy refs
+                     → TrainingOrchestrator(config, ctx)
+                     → ctx.update_training(signals)
+                     → ctx.registered_model_ids += [model_id]
+```
+
+### Dependencies
+
+FIX-10 (initial ctx update hooks), FIX-15 (ctx passed into orchestrator).
+
+---
+
+## Revised Atomic Execution Sequence (Complete: Steps 1–30)
+
+```
+Step  1:  preprocessing/tabular_preprocessor.py    FIX-05 — configure() + imputer
+Step  2:  config/hyperparameters.py                FIX-07 — image encoder choices
+Step  3:  config/hyperparameters.py                FIX-06 — fusion choices expanded
+Step  4:  pipeline/xai_engine.py                   FIX-09 — explain_image honest
+Step  5:  data_ingestion/modality_encoder.py       FIX-14 — RuntimeError → graceful zeros
+Step  6:  pipeline/training_orchestrator.py        FIX-03 — 3 inject_*() methods
+Step  7:  pipeline/training_orchestrator.py        FIX-12 — inject_external_datasets()
+Step  8:  pipeline/training_orchestrator.py        FIX-03 — Phase 2, 3, 4 short-circuits
+Step  9:  pipeline/training_orchestrator.py        FIX-12 — Phase 1 short-circuit
+Step 10:  pipeline/training_orchestrator.py        FIX-15 — __init__ accepts ctx
+Step 11:  pipeline/training_orchestrator.py        FIX-05 — configure() in Phase 3
+Step 12:  pipeline/training_orchestrator.py        FIX-16 — TextEncoder/ImageEncoder configure
+Step 13:  pipeline/training_orchestrator.py        FIX-06 — select_fusion_strategy Phase 4
+Step 14:  pipeline/training_orchestrator.py        FIX-10 — xs3_gap gate Phase 4
+Step 15:  pipeline/training_orchestrator.py        FIX-15 — ctx routing in Phase 4
+Step 16:  pipeline/training_orchestrator.py        FIX-15 — ctx fusion override Phase 5
+Step 17:  pipeline/training_orchestrator.py        FIX-18 — Phase 7 model ID → ctx
+Step 18:  pipeline/training_orchestrator.py        FIX-08 — reference_sample.npy Phase 7
+Step 19:  automl/trainer.py                        FIX-06 — expand fusion switch
+Step 20:  automl/trainer.py                        FIX-07 — encoder alias normalisation
+Step 21:  automl/trainer.py                        FIX-16 — deferred plan apply Phase 5
+Step 22:  automl/advanced_selector.py              FIX-13 — rename to _run_heuristic_selection
+Step 23:  automl/advanced_selector.py              FIX-13 — new recommend_models() wrapper
+Step 24:  monitoring/drift_detector.py             FIX-08 — "reference_sample" in return
+Step 25:  core/orchestrator.py                     FIX-14 — wire Integrator in phase_2_schema
+Step 26:  core/execution_context.py               FIX-10 — predictability_scores in update_from_schema
+Step 27:  api/run_api.py                           FIX-01 + FIX-18 — read ctx-canonical schema/override
+Step 28:  api/run_api.py                           FIX-12 — inject session datasets in _run_training
+Step 29:  api/run_api.py                           FIX-15 — pass ctx into TrainingOrchestrator
+Step 30:  api/run_api.py                           FIX-04 — inject scaler + model_sel
+Step 31:  api/run_api.py                           FIX-08 — replace /monitor/drift handler
+Step 32:  api/run_api.py                           FIX-10 — update_from_schema, update_training hooks
+Step 33:  api/run_api.py                           FIX-17 — /preprocess cache-hit + empty-data guard
+Step 34:  api/run_api.py                           FIX-18 — /api/schema/override → ctx.override_global_target
+Step 35:  api/run_api.py                           FIX-18 — _read_from_context_or_store() helper
+Step 36:  api/run_api.py                           FIX-11 — PipelineOrchestrator delegation
+```
+
+---
+
+## Final Integration State After All 18 Fixes
+
+| Gap                                      | Fixed By               | Result                                      |
+| ---------------------------------------- | ---------------------- | ------------------------------------------- |
+| UI schema/override ignored               | FIX-01, FIX-03         | Phase 2 skipped; override propagated        |
+| Preprocessor re-fitted                   | FIX-02, FIX-03, FIX-04 | Scaler cached; Phase 3 tabular reused       |
+| UI model selection lost                  | FIX-04                 | Stored in store + ctx; Phase 4 skipped      |
+| `configure()` no-op                      | FIX-05                 | Active: cardinality, ratio, imputer         |
+| `select_fusion_strategy()` dead          | FIX-06                 | Called Phase 4; 5 strategies reachable      |
+| HPO string mismatch                      | FIX-07                 | Normalized to `["resnet50"]`                |
+| `/monitor/drift` O(data)                 | FIX-08                 | Direct `DriftDetector.detect()`             |
+| `explain_image()` misleading             | FIX-09                 | `gradcam_available: False`                  |
+| `ExecutionContext.update_*` dead         | FIX-10                 | Called from 3 routes                        |
+| `xs3_confidence_gap` unused              | FIX-10                 | Phase 4 modality gate                       |
+| `PipelineOrchestrator` dead              | FIX-11                 | Profile persistence delegate                |
+| Duplicate ingestion                      | FIX-12                 | Phase 1 skipped; session datasets injected  |
+| Selector divergence                      | FIX-13                 | Single authority: CandidateSelector primary |
+| `Integrator/ModalityEncoder` dead        | FIX-14                 | Graceful fallback; wired in PO phase 2      |
+| `ExecutionContext` invisible to training | FIX-15                 | Passed into TO; Phase 4 reads it            |
+| Planner partial (tabular only)           | FIX-16                 | Text + image encoders configured            |
+| Parallel dead paths                      | FIX-17                 | Preprocess cache-hit; Phase 4 single path   |
+| No state authority                       | FIX-18                 | EC = primary; \_session_store = cache       |
+
+---
+
+# FINAL POLISH LAYER — FIX-19 through FIX-22
+
+**Prerequisite:** All FIX-01 → FIX-18 applied.
+**Goal:** Enforce architecture discipline, remove implicit fallbacks, improve determinism.
+**Rule:** No new features. No redesign. Enforce + stabilize only.
+
+## Polish Dependency Order
+
+```
+FIX-19                          (independent — context enforcement)
+FIX-20  depends on FIX-13       (data-driven UI selection)
+FIX-21  depends on FIX-14       (multimodal integrator extension)
+FIX-22  depends on FIX-16       (unconditional configure() calls)
+```
+
+---
+
+## FIX-19 — Enforce ExecutionContext as Single Source of Truth
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+
+### Pre-condition Verified
+
+`TextEncoder.configure()` ✅ (line 109), `ImageEncoder.configure()` ✅ (line 98),
+`TabularEncoder.configure()` ✅ (line 68), `GRNTabularEncoder.configure()` ✅ (line 154).
+All encoders already implement the method — no stub needed.
+
+### Problem
+
+After FIX-15, `execution_context` is passed into `TrainingOrchestrator` — but it remains
+`Optional`. Every Phase 4/5 block that reads from it wraps the access in `if ctx is not None`,
+creating silent fallback to heuristic behavior when context is unexpectedly absent. This
+contradicts the determinism guarantee of FIX-18 (ExecutionContext = single source of truth).
+
+**Critical distinction:** Standalone mode (no session — e.g., test suite, CLI batch job) is
+legitimate and must continue to work. The enforcement must be **scoped to session-backed runs
+only**, not imposed globally.
+
+### Exact Changes
+
+**Step 1.** In `TrainingOrchestrator.__init__`, after assigning `self.execution_context`:
+
+```python
+# FIX-19: enforcement mode is active only when a context was explicitly provided.
+# Standalone runs (no session) remain unaffected.
+self._require_context: bool = execution_context is not None
+```
+
+**Step 2.** Add `_get_ctx()` helper immediately after `__init__` body:
+
+```python
+def _get_ctx(self) -> Any:
+    """
+    Return the attached ExecutionContext, raising if context was expected
+    (session-backed run) but has become None.
+
+    For standalone runs (_require_context=False), returns None silently.
+    """
+    if self._require_context and self.execution_context is None:
+        raise RuntimeError(
+            "ExecutionContext was provided at construction time but is now None. "
+            "This indicates unexpected state mutation. "
+            "All session-backed phases require a valid ExecutionContext."
+        )
+    return self.execution_context
+```
+
+**Step 3.** Replace every bare `ctx = self.execution_context` reference that occurs
+**inside Phase 4 and Phase 5 blocks** (the two phases added in FIX-15) with:
+
+```python
+ctx = self._get_ctx()
+```
+
+Locate pattern (exact string to find — occurs twice, once per phase):
+
+```python
+# ── Read ExecutionContext intelligence (read-only) ─────────────────────
+ctx = self.execution_context
+if ctx is not None:
+```
+
+Replace the first two lines with:
+
+```python
+# ── Read ExecutionContext intelligence (read-only) ─────────────────────
+ctx = self._get_ctx()
+if ctx is not None:
+```
+
+The `if ctx is not None` guard remains — it short-circuits gracefully for standalone mode
+where `_get_ctx()` returns `None`. The `RuntimeError` only fires if context was present at
+init but has been nulled out (state mutation bug).
+
+**Step 4.** In Phase 7, replace the equivalent bare reference added in FIX-18:
+
+```python
+# FIND:
+if self.execution_context is not None:
+
+# REPLACE WITH:
+if self._get_ctx() is not None:
+```
+
+### Before → After Flow
+
+```
+BEFORE:
+  orchestrator = TrainingOrchestrator(config, execution_context=ctx)
+  Phase 4: ctx = self.execution_context  ← any mutation to None is silent
+  Phase 4: ctx = None → heuristics run → divergence
+  No indication to caller that state was lost
+
+AFTER:
+  orchestrator = TrainingOrchestrator(config, execution_context=ctx)
+  self._require_context = True  (session-backed)
+  Phase 4: ctx = self._get_ctx()
+    → if context became None → RuntimeError surfaced immediately
+    → if standalone → None returned → guard passes → heuristics used (correct)
+```
+
+### Integration Impact
+
+- Session-backed runs: unexpected `ctx=None` now surfaces as an explicit error instead of
+  silent heuristic fallback — **eliminates hidden state divergence**
+- Standalone/test runs: zero behavior change (`_require_context=False`)
+- No change to API contracts or caller code
+
+### Order of Implementation
+
+1. Add `self._require_context` to `__init__` (Step 1)
+2. Add `_get_ctx()` method (Step 2)
+3. Replace Phase 4 references (Step 3)
+4. Replace Phase 7 reference (Step 4)
+
+---
+
+## FIX-20 — Enable Data-Driven UI Model Selection (Probe Support)
+
+### Files to Modify
+
+- `api/run_api.py`
+
+### Problem
+
+After FIX-13, `AdvancedModelSelector.recommend_models()` accepts `tabular_X` and `tabular_y`
+and internally delegates to `CandidateSelector.quick_probe_tabular()` for data-driven ranking.
+However, `/select-model` always passes `tabular_X=None, tabular_y=None` because the fitted
+sample is not cached at the time of the call.
+
+`/preprocess` already fits `TabularPreprocessor` on `feature_df[tabular_cols]` and caches the
+fitted object to disk. The sample DataFrame (`feature_df`) is locally available in
+`_preprocess_sync()` at fit-time but is discarded immediately after.
+
+**Consequence:** `/select-model` UI path always uses heuristic-only ranking (CandidateSelector
+skips the probe). The training path runs the probe on full data in Phase 4. Results diverge.
+
+### Exact Changes
+
+**Step 1.** In `/preprocess` route, inside `_preprocess_sync()`, immediately **after**
+`tp.fit(feature_df[tabular_cols])` succeeds and **before** the `joblib.dump`:
+
+```python
+# FIX-20: cache a representative sample so /select-model can run a real probe
+try:
+    _n_sample = min(1000, len(feature_df))
+    _sample_df = feature_df[tabular_cols].sample(
+        _n_sample, random_state=42, replace=False
+    )
+    _target_series = (
+        full_df[target_col].iloc[_sample_df.index]
+        if target_col != "Unknown" and target_col in full_df.columns
+        else None
+    )
+    if _target_series is not None:
+        _sample_X = tp.transform(_sample_df)          # (n_sample, n_features) ndarray
+        _sample_y = _target_series.to_numpy()
+        with _session_lock:
+            if _sid not in _session_store:
+                _session_store[_sid] = {"datasets": {}, "schema": None}
+            _session_store[_sid]["tabular_sample"] = {
+                "X": _sample_X,
+                "y": _sample_y,
+            }
+        logger.info(
+            "/preprocess: cached tabular probe sample "
+            "(n=%d, features=%d) for session %s",
+            _n_sample, _sample_X.shape[1], _sid,
+        )
+except Exception as _sample_exc:
+    logger.warning(
+        "/preprocess: could not cache tabular sample (non-fatal): %s",
+        _sample_exc,
+    )
+```
+
+**Key note:** The sample uses `tp.transform()` (not `fit_transform()`) — the preprocessor was
+already fitted in the line above. This produces the same numeric feature space that Phase 4
+will see, making the probe directly comparable.
+
+**Step 2.** In `/select-model` route, after extracting `_sid`, `problem_type`, `modalities`,
+`dataset_size`, `avg_tokens` from `body`, add probe-data retrieval **before** the
+`selector.recommend_models()` call:
+
+```python
+# FIX-20: retrieve cached probe sample from /preprocess for data-driven selection
+_probe_X: Optional[Any] = None
+_probe_y: Optional[Any] = None
+if _sid:
+    with _session_lock:
+        _probe_cache = _session_store.get(_sid, {}).get("tabular_sample")
+    if _probe_cache:
+        _probe_X = _probe_cache.get("X")
+        _probe_y = _probe_cache.get("y")
+        logger.info(
+            "/select-model: using cached tabular probe sample "
+            "(n=%d) for data-driven selection",
+            len(_probe_X) if _probe_X is not None else 0,
+        )
+    else:
+        logger.info(
+            "/select-model: no probe cache for session %s — "
+            "heuristic ranking will be used", _sid,
+        )
+```
+
+**Step 3.** Modify the `selector.recommend_models()` call (currently line 1062–1068 of
+`run_api.py`) to pass the probe data:
+
+```python
+# BEFORE:
+recommendations: List[Dict[str, Any]] = await asyncio.to_thread(
+    selector.recommend_models,
+    problem_type=problem_type,
+    modalities=modalities,
+    dataset_size=dataset_size,
+    avg_tokens=avg_tokens,
+)
+
+# AFTER:
+recommendations: List[Dict[str, Any]] = await asyncio.to_thread(
+    selector.recommend_models,
+    problem_type=problem_type,
+    modalities=modalities,
+    dataset_size=dataset_size,
+    avg_tokens=avg_tokens,
+    tabular_X=_probe_X,       # None if /preprocess not yet called
+    tabular_y=_probe_y,        # None if /preprocess not yet called
+)
+```
+
+**Step 4.** No changes needed to `automl/advanced_selector.py` — `recommend_models()` already
+accepts `tabular_X` / `tabular_y` (added in FIX-13) and passes them to
+`CandidateSelector.quick_probe_tabular()`.
+
+### Before → After Flow
+
+```
+BEFORE:
+  /preprocess → tabular_sample computed → discarded
+  /select-model → recommend_models(tabular_X=None) → CandidateSelector probe SKIPPED
+                → heuristic ranking only
+
+AFTER:
+  /preprocess → tabular_sample computed → cached in _session_store[sid]["tabular_sample"]
+                 (transformed ndarray, same feature space as training)
+  /select-model → reads _session_store[sid]["tabular_sample"]
+                → recommend_models(tabular_X=X, tabular_y=y)
+                → CandidateSelector.quick_probe_tabular() runs real RF 1-fold CV
+                → data-driven ranking (same as Phase 4)
+
+  Graceful fallback: if /preprocess not called before /select-model, probe_X=None →
+  CandidateSelector skips probe → heuristic ranking (same as before — no regression)
+```
+
+### Integration Impact
+
+- Eliminates the last divergence between UI model selection and training model selection
+- Zero regression: if `/preprocess` was not called first, behavior is identical to pre-FIX-20
+- The stored `_sample_X` is post-transform (scaled + encoded) — matches the feature space
+  `CandidateSelector.quick_probe_tabular()` expects, so probe scores are directly comparable
+  to those computed by Phase 4
+
+### Order of Implementation
+
+1. `/preprocess` route — add sample caching block (Step 1)
+2. `/select-model` route — add probe-data retrieval + pass to `recommend_models` (Steps 2–3)
+
+---
+
+## FIX-21 — Extend Integrator to Text/Image Safely
+
+### Files to Modify
+
+- `core/orchestrator.py`
+
+### Pre-condition
+
+FIX-14 applied: `ModalityEncoder.encode_text()` and `encode_image()` return zero arrays
+(not RuntimeError) when no encoder is loaded. The `Integrator` can now be called with
+`modalities=["text"]` or `modalities=["image"]` without crashing — it will receive zero
+embeddings which produce neutral (but deterministic) RF predictability scores.
+
+### Problem
+
+After FIX-14, `PipelineOrchestrator.execute_phase_2_schema()` calls the Integrator with
+`modalities=["tabular"]` only. Text columns (dtype=object) and image columns
+(column name contains "image") are present in many datasets but their modality metadata
+(even if zero-scored) is never populated. This means:
+
+- `ctx.predictability_scores` only contains `{"tabular": 0.87}` for a text+tabular dataset
+- `ctx.should_include_fusion()` requires 2+ modalities above threshold — never fires for
+  text+tabular if `"text"` was never scored, even at 0.0
+- `ctx.get_active_modalities()` returns only `["tabular"]` → Phase 4 never routes text encoder
+
+Even with zero embeddings (graceful fallback), the Integrator calling `UniversalTargetValidator`
+on the text modality will produce a real RF score (RF is called on zero-filled feature matrix
+which returns a valid but low score). This is **more informative** than not calling it at all.
+
+### Exact Changes
+
+In `core/orchestrator.py`, inside the Integrator activation block added in FIX-14, replace:
+
+```python
+# BEFORE (FIX-14 original):
+_meta = _integrator.process_multimodal(
+    data=_df[_tabular_cols + [_target_col]].head(2000),
+    target_column=_target_col,
+    modalities=["tabular"],
+)
+```
+
+With:
+
+```python
+# FIX-21: detect modalities from column types and names
+_active_modalities: List[str] = []
+
+# Tabular: numeric columns (always included if present)
+if _tabular_cols:
+    _active_modalities.append("tabular")
+
+# Text: object-dtype columns (string data) — ModalityEncoder will return zeros safely
+_text_cols_detected = [
+    c for c in _df.columns
+    if c != _target_col
+    and str(_df[c].dtype) in ("object", "string", "category")
+]
+if _text_cols_detected:
+    _active_modalities.append("text")
+    logger.info(
+        "PipelineOrchestrator: detected %d text column(s) for modality scoring: %s",
+        len(_text_cols_detected),
+        _text_cols_detected[:3],
+    )
+
+# Image: column name contains "image", "img", or "path" — path-like strings
+_image_cols_detected = [
+    c for c in _df.columns
+    if c != _target_col
+    and any(
+        kw in str(c).lower()
+        for kw in ("image", "img", "path", "photo", "pic")
+    )
+]
+if _image_cols_detected:
+    _active_modalities.append("image")
+    logger.info(
+        "PipelineOrchestrator: detected %d image column(s) for modality scoring: %s",
+        len(_image_cols_detected),
+        _image_cols_detected[:3],
+    )
+
+if not _active_modalities:
+    logger.info(
+        "PipelineOrchestrator: no active modalities detected for %s — skipping Integrator",
+        _did,
+    )
+    continue
+
+_data_cols = _tabular_cols + _text_cols_detected + _image_cols_detected
+_meta = _integrator.process_multimodal(
+    data=_df[_data_cols + [_target_col]].head(2000),
+    target_column=_target_col,
+    modalities=_active_modalities,
+)
+```
+
+After the `if _tab_meta:` block (score extraction), add additional modality score extraction:
+
+```python
+# Extract scores for all detected modalities, not just tabular
+for _mod_name in ("text", "image"):
+    _mod_meta = next(
+        (m for m in _meta if getattr(m, "modality_name", "") == _mod_name),
+        None,
+    )
+    if _mod_meta:
+        _mod_score = float(getattr(_mod_meta, "predictability_score", 0.0))
+        # Store in ctx using modality name as key
+        ctx.predictability_scores[_mod_name] = _mod_score
+        logger.info(
+            "PipelineOrchestrator: Integrator scored %s predictability=%.3f "
+            "for dataset %s", _mod_name, _mod_score, _did,
+        )
+```
+
+### Before → After Flow
+
+```
+BEFORE (FIX-14):
+  Integrator called with modalities=["tabular"] only
+  ctx.predictability_scores = {"dataset_id_1": 0.87}  (tabular only)
+  ctx.should_include_fusion() → requires 2+ modalities → never True for text+tabular datasets
+  ctx.get_active_modalities() → ["tabular"] only → Phase 4 never routes text encoder
+
+AFTER (FIX-21):
+  Integrator called with modalities=["tabular", "text"]  (+ "image" if detected)
+  Text path: ModalityEncoder returns zeros → RF score near chance (0.5) but non-null
+  ctx.predictability_scores = {
+    "dataset_id_1": 0.87,   ← tabular score (real probe)
+    "text": 0.52,            ← text score (zero-embed RF baseline; non-null)
+  }
+  ctx.should_include_fusion() → 2 modalities > 0.4 → returns True → fusion enabled
+  ctx.get_active_modalities() → ["tabular", "text"] → Phase 4 routes both encoders
+```
+
+### Integration Impact
+
+- Activates `ctx.should_include_fusion()` for multimodal datasets — enabling fusion in Phase 4/5
+- Uses the **existing** zero-embedding fallback from FIX-14 — no new model loading
+- Text/image RF scores will be at chance level (≈0.5) with zero embeddings — this is
+  **correct, deterministic, and honest**: the embedding space is uninformative without
+  real encoders, but the modality presence is correctly registered
+- Real BERT/ResNet embeddings can be patched in later without any code changes — the Integrator
+  call site is already multimodal-aware
+
+### Order of Implementation
+
+Single step — replace the `modalities=["tabular"]` block with the detection block above.
+
+---
+
+## FIX-22 — Guarantee configure() for All Encoders (Remove Conditional)
+
+### Files to Modify
+
+- `pipeline/training_orchestrator.py`
+
+### Pre-condition Verified (Critical)
+
+All encoder classes already implement `configure()`:
+
+- `TextEncoder.configure(plan)` — line 109 of `modelss/encoders/text.py` ✅
+  Accepts: `pooling` ("cls"/"last_token"/"mean"), `max_length` (int)
+- `ImageEncoder.configure(plan)` — line 98 of `modelss/encoders/image.py` ✅
+  Accepts: `freeze_backbone` (bool), `use_projection_relu` (bool)
+- `TabularEncoder.configure(plan)` — line 68 of `modelss/encoders/tabular.py` ✅
+  Accepts: `input_dropout` (float 0–0.8)
+- `GRNTabularEncoder.configure(plan)` — line 154 of `modelss/encoders/tabular.py` ✅
+  Accepts: `input_dropout` (float 0–0.8)
+
+**No changes needed to any encoder file.** All four classes already have real implementations.
+
+### Problem
+
+FIX-16 added configure calls in Phase 3 and Phase 5 but wrapped each one in `hasattr()` guards:
+
+```python
+if _text_enc is not None and hasattr(_text_enc, "configure"):
+    ...configure(plan)...
+if _img_enc is not None and hasattr(_img_enc, "configure"):
+    ...configure(plan)...
+```
+
+Since we have now **verified** that all encoder classes implement `configure()`, these guards:
+
+1. Add unnecessary conditional logic paths
+2. Imply the configure call might be skipped — making the behavior implicitly conditional
+3. Violate FIX-19's determinism goal: configure **must always run**
+
+### Exact Changes
+
+In `_execute_phase_3_preprocessing()`, for the text encoder block, replace:
+
+```python
+# BEFORE (FIX-16):
+if _text_enc is not None and hasattr(_text_enc, "configure"):
+    _text_plan = {
+        k: preprocessing_plan[k]
+        for k in ("text_max_length", "tokenizer", "text_augmentation")
+        if k in preprocessing_plan
+    }
+    if _text_plan:
+        try:
+            _text_enc.configure(_text_plan)
+            logger.info(
+                "  Phase 3: TextEncoder.configure() applied: %s", _text_plan
+            )
+        except Exception as _te_cfg:
+            logger.warning(
+                "  Phase 3: TextEncoder.configure() failed: %s", _te_cfg
+            )
+```
+
+With:
+
+```python
+# AFTER (FIX-22): configure() guaranteed on all encoder classes — no hasattr guard needed
+if _text_enc is not None:
+    _text_plan = {
+        k: preprocessing_plan[k]
+        for k in ("text_max_length", "tokenizer", "text_augmentation", "pooling", "max_length")
+        if k in preprocessing_plan
+    }
+    try:
+        _text_enc.configure(_text_plan)
+        logger.info("  Phase 3: TextEncoder.configure() applied: %s", _text_plan)
+    except Exception as _te_cfg:
+        logger.warning("  Phase 3: TextEncoder.configure() failed: %s", _te_cfg)
+```
+
+> **Key change:** `text_max_length` in the plan is mapped to the `max_length` key that
+> `TextEncoder.configure()` actually reads. Both keys included to support either naming.
+
+For the image encoder block, replace:
+
+```python
+# BEFORE (FIX-16):
+if _img_enc is not None and hasattr(_img_enc, "configure"):
+    _image_plan = {
+        k: preprocessing_plan[k]
+        for k in ("image_resize", "image_augmentation", "image_normalize")
+        if k in preprocessing_plan
+    }
+    if _image_plan:
+        try:
+            _img_enc.configure(_image_plan)
+            ...
+```
+
+With:
+
+```python
+# AFTER (FIX-22):
+if _img_enc is not None:
+    _image_plan = {
+        k: preprocessing_plan[k]
+        for k in ("image_resize", "image_augmentation", "image_normalize",
+                   "freeze_backbone", "use_projection_relu")
+        if k in preprocessing_plan
+    }
+    try:
+        _img_enc.configure(_image_plan)
+        logger.info("  Phase 3: ImageEncoder.configure() applied: %s", _image_plan)
+    except Exception as _ie_cfg:
+        logger.warning("  Phase 3: ImageEncoder.configure() failed: %s", _ie_cfg)
+```
+
+> **Key change:** Added `freeze_backbone` and `use_projection_relu` — the actual keys
+> `ImageEncoder.configure()` reads (confirmed at lines 103, 109 of `image.py`). The
+> previous plan used `image_resize` which `ImageEncoder.configure()` does not handle —
+> this corrects that mismatch.
+
+In Phase 5 (`_execute_phase_5_training()`), for the deferred-apply blocks added in FIX-16,
+replace `if ... and hasattr(encoder, "configure"):` with direct calls:
+
+```python
+# BEFORE (FIX-16):
+if _stored_text_plan and hasattr(text_encoder, "configure"):
+    try:
+        text_encoder.configure(_stored_text_plan)
+    ...
+
+if _stored_img_plan and hasattr(image_encoder, "configure"):
+    try:
+        image_encoder.configure(_stored_img_plan)
+    ...
+
+# AFTER (FIX-22):
+if _stored_text_plan:
+    try:
+        text_encoder.configure(_stored_text_plan)
+    except Exception as _tcp:
+        logger.warning("Phase 5: TextEncoder.configure() deferred apply failed: %s", _tcp)
+
+if _stored_img_plan:
+    try:
+        image_encoder.configure(_stored_img_plan)
+    except Exception as _icp:
+        logger.warning("Phase 5: ImageEncoder.configure() deferred apply failed: %s", _icp)
+```
+
+### Before → After Flow
+
+```
+BEFORE (FIX-16):
+  if text_encoder is not None and hasattr(text_encoder, "configure"):
+    if _text_plan:                         ← double conditional
+      configure(plan)                      ← may silently not execute
+  → 2 conditions before configure() runs; either can suppress it
+
+AFTER (FIX-22):
+  if text_encoder is not None:             ← single guard (encoder exists)
+    configure(plan)                        ← always called; try/except for safety
+  → 1 condition; configure() always runs when encoder is present
+  → Plan key names corrected to match actual TextEncoder/ImageEncoder API:
+    text: "max_length" (not "text_max_length")
+    image: "freeze_backbone", "use_projection_relu" (not "image_resize")
+```
+
+### Integration Impact
+
+- Eliminates conditional execution path for preprocessing configuration
+- Fixes key-name mismatch between `PreprocessingPlanner` output and `TextEncoder`/`ImageEncoder`
+  `configure()` API (critical correctness fix within the existing logic)
+- Zero encoder file changes required — all classes already implement the method
+
+### Order of Implementation
+
+1. Phase 3 — text encoder configure block (remove `hasattr`, fix key names)
+2. Phase 3 — image encoder configure block (remove `hasattr`, fix key names)
+3. Phase 5 — deferred text/image apply blocks (remove `hasattr`)
+
+---
+
+## Complete Execution Sequence (All 22 Fixes)
+
+```
+Step  1–18:  [FIX-01 → FIX-11 original sequence — see above]
+Step 19–36:  [FIX-12 → FIX-18 sequence — see above]
+
+FIX-19 (3 steps, all in training_orchestrator.py):
+  Step 37:  Add self._require_context = execution_context is not None to __init__
+  Step 38:  Add _get_ctx() method
+  Step 39:  Replace ctx = self.execution_context in Phase 4, 5, 7 with _get_ctx()
+
+FIX-20 (2 steps, all in run_api.py):
+  Step 40:  /preprocess route — add tabular_sample caching after tp.fit()
+  Step 41:  /select-model route — retrieve sample + pass to recommend_models()
+
+FIX-21 (1 step, in core/orchestrator.py):
+  Step 42:  Replace fixed modalities=["tabular"] with dynamic modality detection block
+
+FIX-22 (3 steps, all in training_orchestrator.py):
+  Step 43:  Phase 3 text configure — remove hasattr, fix key names
+  Step 44:  Phase 3 image configure — remove hasattr, fix key names
+  Step 45:  Phase 5 deferred apply — remove hasattr guards
+```
+
+---
+
+## Final System State After All 22 Fixes
+
+| Property           | Before FIX-01          | After FIX-11          | After FIX-18      | After FIX-22         |
+| ------------------ | ---------------------- | --------------------- | ----------------- | -------------------- |
+| UI→Training bridge | ❌ None                | ✅ Schema/target      | ✅ Full state     | ✅ Enforced          |
+| Ingestion path     | ❌ 2×                  | ✅ 1× (FIX-12)        | ✅ 1×             | ✅ 1×                |
+| Model selection    | ❌ Split               | ✅ Unified (FIX-13)   | ✅ Unified        | ✅ Data-driven UI    |
+| Dead modules       | ❌ 900+ lines          | ✅ Activated (FIX-14) | ✅ Tabular scope  | ✅ Full multimodal   |
+| ExecutionContext   | ❌ Populated, ignored  | ✅ API only           | ✅ Training reads | ✅ Enforced required |
+| Preprocessing      | ❌ Tabular only        | ✅ All encoders       | ✅ All encoders   | ✅ Unconditional     |
+| State authority    | ❌ 3 diverging stores  | ✅ EC primary         | ✅ Enforced       | ✅ Enforced          |
+| configure() calls  | ❌ hasattr conditional | ✅ Conditional        | ✅ Conditional    | ✅ Unconditional     |
+| Probe in UI        | ❌ Heuristic only      | ❌ Heuristic only     | ❌ Heuristic only | ✅ Data-driven       |
+| Multimodal scoring | ❌ None                | ✅ Tabular only       | ✅ Tabular only   | ✅ All modalities    |

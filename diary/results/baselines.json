@@ -1,0 +1,15 @@
+{
+  "seed": 42,
+  "dataset": "C:\\Users\\Acer\\Desktop\\main project\\apex2-worktree.worktrees\\final_worktree\\data\\fixtures\\adult_income_smoke.csv",
+  "target_column": "class",
+  "baselines": [
+    {
+      "model": "sklearn_MLP",
+      "accuracy": 0.77,
+      "f1": 0.6945150931278099,
+      "train_time_s": 1.13,
+      "n_train": 1600,
+      "n_test": 400
+    }
+  ]
+}

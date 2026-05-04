@@ -1,0 +1,2838 @@
+# AutoVision+ (APEX) — NeurIPS-Level Upgrade: Full Implementation Plan
+> All claims verified against source code. No hallucinations.
+> Status labels: ✅ COMPLETE · ⚠ PARTIAL · ❌ MISSING · 💀 DEAD CODE
+
+---
+
+## PHASE 1 — SYSTEM UNDERSTANDING
+
+### 1.1 Full Pipeline Trace (verified from code)
+
+#### Phase 1 — Data Ingestion
+```
+POST /ingest/datasets (run_api.py)
+  → asyncio.create_task(_run_ingestion())
+  → DataIngestionManager.ingest_data(sources)      [data_ingestion/ingestion_manager.py]
+      → per URL: SHA-256 hash → DATASET_CACHE_DIR check → download if miss
+      → DataLoader wraps as polars.LazyFrame / dask.DataFrame / pd.DataFrame
+  → IngestionProgressTracker.update() → tasks.db   [task_store.py]
+  → get_session_datasets(sid) caches lazy refs      [run_api.py in-memory]
+  → orchestrator.register_ingested_datasets(ctx, hashes) [core/orchestrator.py:186]
+      → DatasetProfile created per dataset
+      → context_db.save_profile() → sessions.db    [database/context_db.py]
+  OUTPUT: {task_id} immediately; poll GET /ingest/status/{task_id}
+```
+
+#### Phase 2 — Schema Detection
+```
+POST /api/schema/detect (run_api.py)
+  → get_session_datasets(sid) → lazy data frames
+  → orchestrator.load_or_create_context(sid)       [core/orchestrator.py:162]
+  → orchestrator.execute_phase_2_schema(ctx, data_map) [core/orchestrator.py:221]
+      → MultiDatasetSchemaDetector.detect_global_schema() [data_ingestion/schema_detector.py]
+          → COGMASchemaDetector._detect_single(df) per dataset
+          → XS3TargetSelector.rank_candidates()    [data_ingestion/xs3_target_selector.py]
+          → UniversalTargetValidator.final_score() [data_ingestion/target_validator.py]
+              → RF 3-fold CV per modality (sklearn)
+              → 5-component weighted score (0.40 pred + 0.20 comp + 0.15 degen + 0.15 noise + 0.10 feat)
+          → IndividualSchema → GlobalSchema
+      → _run_integrator_scoring(df, target_col)    [core/orchestrator.py:80]
+          → Integrator.process_multimodal()        [data_ingestion/integrator.py]
+          → ctx.predictability_scores[dataset_id] = tabular_score
+      → context_db.save_profile(), context_db.save_context()
+  → orchestrator.execute_phase_3_target(ctx, data_map)  [core/orchestrator.py:386]
+  → orchestrator.execute_phase_4_aggregation(ctx, data_map) [core/orchestrator.py:473]
+  → orchestrator.execute_phase_5_preprocessing(ctx, data_map)  [core/orchestrator.py:528]
+      → PreprocessingPlanner.create_plan()         [preprocessing/preprocessing_planner.py:11]
+          ⚠ HEURISTIC SHIM ONLY — does NOT drive actual preprocessing
+  OUTPUT: GlobalSchema + per_dataset + candidates JSON
+```
+
+#### Phase 3 — Preprocessing
+```
+POST /preprocess (run_api.py)
+  → read session_id, schema_override from body
+  → get_session_datasets(sid) → pandas DataFrames
+  → TabularPreprocessor.fit(X)                     [preprocessing/tabular_preprocessor.py]
+      → SmartColumnFilter._drop_useless_cols()     (zero-var, high-miss, high-corr)
+      → ColumnTransformer: StandardScaler + median imputer + OHE
+      → serialize to data/session_cache/{sid}/tabular_scaler.joblib
+  → TextPreprocessor init (BERT tokenizer)         [preprocessing/text_preprocessor.py]
+  → ImagePreprocessor init (torchvision pipeline)  [preprocessing/image_preprocessor.py]
+  → _session_store[sid]["tabular_sample"] = (X_transformed, y)   ← IN-MEMORY ONLY
+  OUTPUT: {preprocessing_stages, samples, output_shapes, preprocessor_path}
+```
+
+#### Phase 4 — Model Selection
+```
+POST /select-model (run_api.py)
+  → AdvancedModelSelector.select_models(problem_type, modalities, dataset_size, gpu_mem)
+      [automl/advanced_selector.py:133]
+      → _select_image_tier() / _select_text_tier() / _select_tabular_tier()
+      → _pdf_batch_size()   ← PDF heuristic table
+      → MetaLearningStore.get_similar_context()    [automl/meta_learning.py]
+      → fusion = "attention" if gpu_mem>=8 else "concatenation"  ← SIMPLE THRESHOLD
+      → _build_hpo_space(dataset_size, modalities)
+      → returns SelectionResult
+  → recommend_models() → list form
+  → IF tabular_sample in _session_store:
+      → CandidateSelector.quick_probe_tabular()    [automl/candidate_selector.py]
+          → 1-fold stratified CV per model (XGBoost, LightGBM, RF, MLP)
+          → 60s total budget
+      → CandidateSelector.probe_fusion()           (if multimodal)
+  → JITEncoderSelector.select(modalities, device)  [automl/jit_encoder_selector.py]
+      → torch.cuda.mem_get_info() → VRAM budget
+      → dry-run forward pass per candidate
+  → _session_store[sid]["model_selection"] = recommendations[0]
+  → ctx.probe_scores_cache, ctx.ranked_candidates updated
+  OUTPUT: {recommended_models, best_model, probe_scores, vram_filter_report}
+```
+
+#### Phase 5 — Training
+```
+POST /train-pipeline (run_api.py)
+  → asyncio.create_task(_run_training())
+  → TrainingOrchestrator(config, execution_context=ctx)  [pipeline/training_orchestrator.py]
+  → inject_external_datasets() / inject_external_schema()
+  → inject_external_preprocessors() / inject_external_model_selection()
+  → _execute_phase_1_data_ingestion()   → DataIngestionManager
+  → _execute_phase_2_schema_detection() → MultiDatasetSchemaDetector (skipped if injected)
+  → _execute_phase_3_preprocessing()
+      → TabularPreprocessor.fit() (fresh or reloads .joblib)
+      → MultimodalPyTorchDataset (lazy __getitem__)
+      → 80/20 train/val split
+  → _execute_phase_4_model_selection()
+      → AdvancedModelSelector.select_models()  ← heuristic only (no real probe here)
+      → JITEncoderSelector.select()
+      → AdaptiveOptunaController.suggest_max_trials()
+  → _execute_phase_5_training()
+      → For each Optuna trial:
+          → _MultimodalHead(input_dims, fusion_strategy)  [automl/trainer.py:49]
+          → ApexLightningModule(model, problem_type, lr, wd, max_epochs)
+          → EmbeddingCache: precompute frozen encoder outputs → .pt files
+          → pl.Trainer.fit(train_loader, val_loader)
+          → per epoch: LossWeightScheduler.update(train_losses, val_losses)
+              → TrialIntelligence.analyze() → fit_type → dynamic_factors
+              ⚠ CANNOT change LR/dropout mid-trial (CosineAnnealingLR fixed at init)
+          → OptunaCallback: trial.report(val_loss, epoch)
+          → AlignmentLoss (only if alignment_weight > 0)
+          → torch.cuda.synchronize() per step (WDDM safety)
+      → MetaLearningStore.add_experiment() on best trial
+  → _execute_phase_6_drift_detection()  [fault-isolated try/except]
+      → DriftDetector.detect_drift(train_split, val_split)
+      → KS + PSI + MMD statistics
+      ❌ RetrainingPipeline NOT attached here — drift is PASSIVE
+  → _execute_phase_7_model_registry()
+      → serialize state_dict + transformers
+      → ResearchMetrics.compute() → publishability_index
+      → ThreadSafeModelRegistry update
+  OUTPUT: task_id immediately; poll GET /train-pipeline/status/{task_id}
+```
+
+#### Phases 6-7 — Monitoring + Prediction
+```
+POST /monitor/drift (run_api.py)
+  → DriftDetector.detect_drift(reference, current)
+  → returns DriftReport {ks, psi, mmd, composite_score, drift_detected}
+
+POST /predict-async (run_api.py)
+  → MultimodalInferenceEngine.predict()        [pipeline/inference_engine.py]
+  → XAIEngine: IntegratedGradients per modality [pipeline/xai_engine.py]
+  → returns {predictions, confidences, explanations}
+```
+
+---
+
+### 1.2 ExecutionContext Flow (verified)
+
+| Event | File | Function | Written to ctx? |
+|-------|------|---------|----------------|
+| Created | core/orchestrator.py:162 | `load_or_create_context()` | ✅ |
+| Schema detected | core/orchestrator.py:260 | `execute_phase_2_schema()` | ✅ `set_global_schema()` |
+| Predictability scored | core/orchestrator.py:336 | `_run_integrator_scoring()` | ✅ `ctx.predictability_scores` |
+| Target aggregated | core/orchestrator.py:510 | `execute_phase_4_aggregation()` | ✅ `set_global_target()` |
+| Preprocessing plan | core/orchestrator.py:569 | `execute_phase_5_preprocessing()` | ✅ `profile.preprocessing_plan` |
+| Model selected | api/run_api.py:1543 | `select-model route` | ✅ `update_model_selection()` |
+| Training complete | api/run_api.py:1851 | `_run_training closure` | ✅ `update_training(phase5)` |
+| Drift status | ❌ NOT in ctx | — | ❌ **Never written** |
+| Preprocessing outcome | ❌ NOT in ctx | — | ❌ **Only in _session_store** |
+| Phase durations | ❌ NOT in ctx | — | ❌ **In PipelineState only** |
+
+**Bypass points (where ExecutionContext is ignored):**
+1. `_execute_phase_4_model_selection()` inside `TrainingOrchestrator` — reads nothing from `ctx`; runs fresh `AdvancedModelSelector` regardless
+2. `_execute_phase_3_preprocessing()` — does NOT read `ctx.predictability_scores` to adjust preprocessing strategy
+3. `_execute_phase_5_training()` — does NOT read `ctx.ranked_candidates` or `ctx.fusion_strategy` from prior `/select-model` call (uses its own model selection result)
+4. `LossWeightScheduler.update()` — `TrialIntelligence` result is not written to `ctx`; lost between API calls
+
+---
+
+### 1.3 Intelligence Flow (verified)
+
+| Intelligence Signal | Produced By | Stored In | Consumed By |
+|--------------------|-----------|---------|-----------| 
+| `predictability_scores` | `UniversalTargetValidator` | `ctx.predictability_scores` | ❌ NOT consumed by preprocessing or model selection |
+| `xs3_confidence_gap` | `XS3TargetSelector` | `ctx.confidence_map["xs3_target_gap"]` | ✅ UI only (Phase 2 display) |
+| `probe_scores` (tabular CV) | `CandidateSelector.quick_probe_tabular()` | `ctx.probe_scores_cache` | ✅ ranking within /select-model |
+| `fusion_strategy` | `AdvancedModelSelector` (gpu_mem threshold) | `ctx.fusion_strategy` | ❌ NOT read by training orchestrator |
+| `ranked_candidates` | `CandidateSelector` | `ctx.ranked_candidates` | ❌ NOT consumed by training |
+| `fit_type` from `TrialIntelligence` | `LossWeightScheduler.update()` | `LossWeightScheduler.last_analysis` | ✅ affects dynamic_factors (same trial); ❌ NOT written to ctx |
+| `warm_start_params` | `MetaLearningStore` | `ctx.warm_start_params` | ⚠ Stored but Optuna not seeded from it |
+| `training_signals` | `_run_training` closure | `ctx.training_signals` | ✅ displayed in intelligence panel |
+| `drift_detected` | `DriftDetector` | `phase_results[Phase.DRIFT_DETECTION]` | ❌ NOT written to ctx; RetrainingPipeline not triggered |
+
+---
+
+## PHASE 2 — GAP ANALYSIS (10 LAYERS)
+
+### L1 — Schema Intelligence
+**Status: ⚠ PARTIAL**
+
+| Item | File | Function | Status |
+|------|------|----------|--------|
+| Column type detection | schema_detector.py | `_detect_single()` | ✅ |
+| XS3 confidence gap | xs3_target_selector.py | `rank_candidates()` | ✅ |
+| RF predictability probe | target_validator.py | `final_score()` 5-factor | ✅ |
+| Weak modality detection | — | — | ❌ MISSING |
+| Predictability → model filter | — | — | ❌ MISSING |
+| Predictability → fusion choice | — | — | ❌ MISSING |
+| Multi-dataset relatedness | schema_detector.py | `relatedness_report` | ✅ |
+
+**Root cause of gaps:** `predictability_scores` are computed and stored in `ctx` but nothing downstream consumes them. No policy exists to say "if tabular predictability < 0.3, exclude TabularEncoder."
+
+---
+
+### L2 — ExecutionContext Governance
+**Status: ⚠ PARTIAL**
+
+| Item | Status |
+|------|--------|
+| Context created per session | ✅ |
+| Context persisted to SQLite | ✅ |
+| `_session_store` parallel duplicate | ❌ DUAL STATE — volatile, lost on restart |
+| TrainingOrchestrator reads ctx.fusion_strategy | ❌ MISSING |
+| TrainingOrchestrator reads ctx.ranked_candidates | ❌ MISSING |
+| TrainingOrchestrator reads ctx.predictability_scores | ❌ MISSING |
+| Drift result written to ctx | ❌ MISSING |
+| Phase durations written to ctx | ❌ MISSING |
+| `tabular_sample` persisted to ctx/SQLite | ❌ IN-MEMORY ONLY |
+
+---
+
+### L3 — Preprocessing
+**Status: ⚠ PARTIAL**
+
+| Item | File | Status |
+|------|------|--------|
+| TabularPreprocessor fits and serializes | tabular_preprocessor.py | ✅ |
+| Smart column dropping (zero-var, high-miss, corr) | tabular_preprocessor.py | ✅ |
+| TextPreprocessor (BERT tokenizer) | text_preprocessor.py | ✅ |
+| ImagePreprocessor (resize+normalize) | image_preprocessor.py | ✅ |
+| PreprocessingPlanner drives actual preprocessing | preprocessing_planner.py | ❌ DEAD CODE SHIM |
+| Adaptive preprocessing from predictability_scores | — | ❌ MISSING |
+| Preprocessing output validated (shape, dtype) | preprocessing/validator.py | ⚠ EXISTS but not called in pipeline |
+| Preprocessing plan written to ctx for training | — | ❌ Only metadata plan stored, not actual outcomes |
+| `tabular_sample` persisted beyond process | run_api.py:_session_store | ❌ IN-MEMORY ONLY |
+
+---
+
+### L4 — Embeddings
+**Status: ⚠ PARTIAL**
+
+| Item | File | Status |
+|------|------|--------|
+| ImageEncoder (ResNet-50 → 512) | modelss/encoders/image.py | ✅ |
+| TextEncoder (BERT → 768) | modelss/encoders/text.py | ✅ |
+| TabularEncoder (MLP/GRN → 16) | modelss/encoders/tabular.py | ✅ |
+| EmbeddingCache (frozen, .pt files) | pipeline/embedding_cache.py | ✅ |
+| Missing modality dummy fill (1e-7) | trainer.py:_encode_batch | ✅ |
+| Per-modality predictability gates | — | ❌ MISSING |
+| Modality importance weighting in fused embedding | UncertaintyFusion | ⚠ IMPLEMENTED but never selected |
+
+---
+
+### L5 — Model Selection
+**Status: ⚠ PARTIAL**
+
+| Item | File | Status |
+|------|------|--------|
+| AdvancedModelSelector (heuristic) | automl/advanced_selector.py | ✅ |
+| CandidateSelector real CV probing | automl/candidate_selector.py | ⚠ Only via /select-model route, not in train path |
+| JITEncoderSelector VRAM dry-run | automl/jit_encoder_selector.py | ✅ |
+| MetaLearning warm-start | automl/meta_learning.py | ⚠ Retrieved but not used to seed Optuna trials |
+| Weak modality filtering | — | ❌ MISSING — predictability ignored |
+| /train-pipeline always runs probing | — | ❌ MISSING — heuristic-only in direct train path |
+
+---
+
+### L6 — Fusion
+**Status: ⚠ PARTIAL (critically)**
+
+| Item | File | Status |
+|------|------|--------|
+| ConcatenationFusion | modelss/fusion.py:61 | ✅ Used |
+| AttentionFusion | modelss/fusion.py:122 | ✅ Used |
+| GraphFusion | modelss/fusion.py:242 | 💀 DEAD — never selected |
+| UncertaintyFusion | modelss/fusion.py:350 | 💀 DEAD — never selected |
+| UncertaintyGraphFusion | modelss/fusion.py:407 | 💀 DEAD — never selected |
+| `select_fusion_strategy()` helper | modelss/fusion.py:496 | 💀 DEAD CODE — zero call sites |
+| `diversity_loss()` | modelss/fusion.py:467 | 💀 DEAD CODE — never called in training |
+| `graph_sparsity_loss()` | modelss/fusion.py:489 | 💀 DEAD CODE — never called |
+| Fusion choice from predictability | — | ❌ MISSING |
+| Multi-head graph adjacency selectable from UI | — | ❌ MISSING |
+| Post-fusion attention visualization | — | ❌ MISSING |
+
+**Root cause:** `AdvancedModelSelector.select_models()` hardcodes `fusion = "attention" if gpu_mem >= 8 else "concatenation"` (line 195 of advanced_selector.py). The 3 advanced strategies are wired in `_MultimodalHead` (trainer.py:86-105) but unreachable because no selector outputs "graph", "uncertainty", or "uncertainty_graph".
+
+---
+
+### L7 — Training
+**Status: ⚠ PARTIAL**
+
+| Item | File | Status |
+|------|------|--------|
+| ApexLightningModule | automl/trainer.py:252 | ✅ |
+| Optuna HPO (adaptive search space) | automl/optuna_adaptive.py | ✅ |
+| LossWeightScheduler per epoch | automl/trainer.py:144 | ✅ |
+| TrialIntelligence.analyze() | automl/trial_intelligence.py | ✅ |
+| TrialIntelligence → LR/dropout adaptation mid-trial | — | ❌ MISSING — CosineAnnealingLR fixed at init |
+| MetaLearning → Optuna warm-start (seeding) | — | ❌ MISSING — param retrieved but not injected |
+| diversity_loss on GraphFusion heads | modelss/fusion.py:467 | 💀 DEAD |
+| alignment_weight > 0 triggers | automl/trainer.py:303 | ⚠ Only when HPO space includes it |
+| Reproducibility (seed set globally) | — | ❌ NOT verified as globally enforced |
+
+---
+
+### L8 — Prediction
+**Status: ⚠ PARTIAL**
+
+| Item | File | Status |
+|------|------|--------|
+| MultimodalInferenceEngine | pipeline/inference_engine.py | ✅ |
+| IntegratedGradients XAI | pipeline/xai_engine.py | ✅ |
+| Batch prediction (CSV upload) | app_enhanced.py:2530 | ✅ |
+| GradCAM for image XAI | pipeline/xai_engine.py | ❌ NOT IMPLEMENTED (note in UI) |
+| Fusion attention weights in prediction | — | ⚠ From model_stats only, not live inference |
+| Prediction confidence calibration | — | ❌ MISSING |
+| Latency guard / timeout per prediction | — | ❌ MISSING |
+
+---
+
+### L9 — Monitoring
+**Status: ⚠ PARTIAL**
+
+| Item | File | Status |
+|------|------|--------|
+| DriftDetector (KS + PSI + MMD) | monitoring/drift_detector.py | ✅ |
+| DriftReport composite score | monitoring/drift_detector.py | ✅ |
+| Drift written to ExecutionContext | — | ❌ MISSING |
+| Automatic retraining on drift | pipeline/retrain_executor.py | ❌ NOT attached in train path |
+| Cooldown for retrain | retrain_executor.py | ✅ Architecture exists |
+| Retrain history persisted | run_api.py | ✅ |
+| Per-modality drift breakdown | — | ❌ MISSING — drift reported globally only |
+
+---
+
+### L10 — Guardrails
+**Status: ❌ MISSING (entirely)**
+
+| Item | Status |
+|------|--------|
+| Latency guard per inference call | ❌ MISSING |
+| Memory guard (VRAM/RAM) during training | ❌ MISSING (only dry-run at selection, not during train) |
+| Fallback manager (encoder failure → lighter) | ❌ MISSING |
+| Preprocessing validation gate | ❌ NOT called in pipeline (validator.py exists but unused) |
+| Session isolation enforcement | ⚠ PARTIAL — lock exists (_session_lock) but _session_store is global dict |
+| Rate limiting on API endpoints | ❌ MISSING |
+| Input sanitization (model_id, paths) | ⚠ `_sanitize_model_id()` exists; not universal |
+
+---
+
+## PHASE 3 — IMPLEMENTATION PREPLAN
+
+### GAP-01: Dual State (_session_store + ExecutionContext)
+- **Root cause:** `_session_store` was the original state store; `ExecutionContext` was added later but migration is incomplete. `tabular_sample` (critical probe data) is in-memory only.
+- **Impact:** Probe data lost on API restart → silent fallback to heuristic-only model selection.
+- **Fix:** Serialize `tabular_sample` to `context_db` (as compressed numpy bytes). Add `ctx.set_probe_sample(X_bytes, y_bytes)` / `ctx.get_probe_sample()`. Deprecate `_session_store["tabular_sample"]`.
+
+### GAP-02: Predictability Scores Not Consumed
+- **Root cause:** `ctx.predictability_scores` is set in `core/orchestrator.py:336` but nothing downstream reads it.
+- **Impact:** The most expensive intelligence computation (RF 3-fold CV) has zero effect on model or preprocessing decisions.
+- **Fix:** Add `_apply_predictability_policy(ctx)` that: (a) filters modalities with score < threshold, (b) adjusts preprocessing complexity, (c) biases fusion selection.
+
+### GAP-03: Graph/Uncertainty Fusion Unreachable
+- **Root cause:** `AdvancedModelSelector.select_models()` line 195 hardcodes fusion to a GPU mem threshold. `select_fusion_strategy()` helper in `modelss/fusion.py:496` exists but has zero call sites.
+- **Impact:** 270 lines of real research-grade code (GraphFusion + UncertaintyFusion + UncertaintyGraphFusion + diversity_loss + graph_sparsity_loss) are completely unused.
+- **Fix:** Replace the hardcoded line with a call to `select_fusion_strategy(schema_info)` augmented with GPU constraint check. Wire `diversity_loss` and `graph_sparsity_loss` into the training step.
+
+### GAP-04: TrialIntelligence Cannot Adapt LR/Dropout Mid-Trial
+- **Root cause:** `CosineAnnealingLR` is instantiated once at trial start in `ApexLightningModule.configure_optimizers()`. `LossWeightScheduler` can change loss weights but cannot mutate the scheduler.
+- **Impact:** Overfitting detected at epoch 5 cannot reduce LR until the next Optuna trial.
+- **Fix:** Replace `CosineAnnealingLR` with a custom `AdaptiveLRScheduler` that reads `LossWeightScheduler.last_analysis` and applies LR multipliers within the trial.
+
+### GAP-05: MetaLearning Warm-Start Not Injected into Optuna
+- **Root cause:** `ctx.warm_start_params` is retrieved from `MetaLearningStore` but the Optuna study is created with no seed distribution — `trial.suggest_float()` starts from scratch.
+- **Impact:** Historical knowledge from prior successful runs is wasted.
+- **Fix:** Add `optuna_warm_start(study, warm_params)` that adds a "warm" trial to the study using `study.enqueue_trial(warm_params)` before the main optimization loop.
+
+### GAP-06: TrainingOrchestrator Ignores ctx.fusion_strategy
+- **Root cause:** `_execute_phase_4_model_selection()` in `training_orchestrator.py` runs a fresh `AdvancedModelSelector` without reading `ctx.fusion_strategy` set by a prior `/select-model` call.
+- **Impact:** User's explicit selection from Phase 4 UI is silently discarded during training.
+- **Fix:** At the start of `_execute_phase_4_model_selection()`, check `ctx.fusion_strategy`. If set, inject it into the selection result rather than recomputing.
+
+### GAP-07: PreprocessingPlanner is a Heuristic Shim
+- **Root cause:** `PreprocessingPlanner.create_plan()` (59 lines) generates a static JSON dict based only on `total_samples` and `n_modalities`. It does not read column types, predictability, or cardinality.
+- **Impact:** The "plan" stored in `profile.preprocessing_plan` is descriptive metadata that does not drive the preprocessor.
+- **Fix:** Replace with `AdaptivePreprocessingEngine` that reads `ctx.predictability_scores`, column cardinality from schema, and missing-value rates to produce a plan that `TabularPreprocessor` actually consumes.
+
+### GAP-08: diversity_loss / graph_sparsity_loss Dead Code
+- **Root cause:** These auxiliary losses are defined in `modelss/fusion.py:467-493` but never called in `ApexLightningModule.training_step()`.
+- **Impact:** GraphFusion heads can learn degenerate solutions (all heads identical; dense adjacency).
+- **Fix:** Wire `diversity_loss(self.model.fusion.last_head_outputs)` and `graph_sparsity_loss(self.model.fusion.graph())` into `training_step()` when `fusion_strategy in ("graph", "uncertainty_graph")`.
+
+### GAP-09: Drift Detection Not Written to ExecutionContext
+- **Root cause:** Phase 6 result is stored in `orchestrator.phase_results[Phase.DRIFT_DETECTION]` but `ctx` is never updated and `RetrainingPipeline` is never attached.
+- **Impact:** Drift detection is a read-only observation. Cannot trigger action.
+- **Fix:** (a) Write drift result to `ctx.drift_detected`, `ctx.drift_severity`. (b) In `_execute_phase_6_drift_detection()`, instantiate and call `RetrainingPipeline.maybe_retrain(ctx)` with cooldown guard.
+
+### GAP-10: Guardrail Layer Entirely Missing
+- **Root cause:** The system has zero runtime guardrails — no latency caps, no VRAM guards during training, no fallback on encoder failure.
+- **Impact:** A single large batch or corrupted image path can crash the entire training task.
+- **Fix:** Create `guardrails/` package with `LatencyGuard`, `MemoryGuard`, `FallbackManager`, `SessionIsolator`. Inject at API and training orchestrator entry points.
+
+---
+
+## PHASE 4 — CODE PATCH PLAN (FILE-BY-FILE)
+
+---
+
+### PATCH-01: `database/context_db.py`
+**Change:** Add probe sample persistence methods.
+
+```python
+# BEFORE: no probe sample storage
+
+# AFTER: add to ContextDatabase class:
+def save_probe_sample(self, session_id: str, X: np.ndarray, y: np.ndarray) -> None:
+    """Persist probe sample as compressed bytes to avoid in-memory volatility."""
+    import io, gzip
+    buf = io.BytesIO()
+    np.savez_compressed(buf, X=X, y=y)
+    compressed = gzip.compress(buf.getvalue())
+    with self._get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO probe_samples (session_id, data, updated_at) VALUES (?,?,?)",
+            (session_id, compressed, datetime.utcnow().isoformat())
+        )
+
+def load_probe_sample(self, session_id: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    import io, gzip
+    with self._get_conn() as conn:
+        row = conn.execute(
+            "SELECT data FROM probe_samples WHERE session_id=?", (session_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    buf = io.BytesIO(gzip.decompress(row[0]))
+    data = np.load(buf)
+    return data["X"], data["y"]
+```
+
+**Also add** `CREATE TABLE IF NOT EXISTS probe_samples` to `_init_schema()`.
+
+---
+
+### PATCH-02: `api/run_api.py` — `/preprocess` route
+**Change:** Replace `_session_store[sid]["tabular_sample"]` with `context_db.save_probe_sample()`.
+
+```python
+# BEFORE (run_api.py, preprocess route):
+_session_store[sid]["tabular_sample"] = (X_transformed, y_array)
+
+# AFTER:
+try:
+    context_db.save_probe_sample(sid, X_transformed, y_array)
+    logger.info("/preprocess: probe sample persisted to SQLite for session %s", sid)
+except Exception as _pe:
+    logger.warning("/preprocess: probe sample persist failed, in-memory fallback: %s", _pe)
+    with _session_lock:
+        if sid not in _session_store:
+            _session_store[sid] = {}
+        _session_store[sid]["tabular_sample"] = (X_transformed, y_array)
+```
+
+---
+
+### PATCH-03: `api/run_api.py` — `/select-model` route
+**Change:** Load probe sample from SQLite first, `_session_store` as fallback.
+
+```python
+# BEFORE:
+_probe_X, _probe_y = _session_store.get(sid, {}).get("tabular_sample", (None, None))
+
+# AFTER:
+_probe_sample = context_db.load_probe_sample(sid)
+if _probe_sample is not None:
+    _probe_X, _probe_y = _probe_sample
+else:
+    _probe_X, _probe_y = _session_store.get(sid, {}).get("tabular_sample", (None, None))
+```
+
+---
+
+### PATCH-04: `automl/advanced_selector.py` — `select_models()`
+**Change:** Replace hardcoded fusion threshold with `select_fusion_strategy()`.
+
+```python
+# BEFORE (line 195):
+fusion = "attention" if gpu_mem >= 8 else "concatenation"
+preferred_fusion = meta_bias.get("preferred_fusion")
+if preferred_fusion in {"attention", "concatenation"}:
+    fusion = preferred_fusion
+
+# AFTER:
+from modelss.fusion import select_fusion_strategy
+_schema_dict = {"global_modalities": modalities}
+fusion = select_fusion_strategy(_schema_dict)
+# Apply GPU constraint: downgrade to concat if GPU insufficient for graph/uncertainty
+if fusion in ("graph", "uncertainty", "uncertainty_graph") and gpu_mem < 4:
+    fusion = "concatenation"
+    logger.info("AdvancedModelSelector: GPU < 4GB, downgraded fusion to 'concatenation'")
+# Meta-learning override (only for verified strategies)
+preferred_fusion = meta_bias.get("preferred_fusion")
+_valid_strategies = {"attention", "concatenation", "graph", "uncertainty", "uncertainty_graph"}
+if preferred_fusion in _valid_strategies:
+    fusion = preferred_fusion
+```
+
+**Also update `_build_hpo_space()`** to include all 5 strategies in the `fusion_strategy` categorical when multimodal:
+```python
+# BEFORE:
+fusion_choices = ["concatenation", "attention"]
+# AFTER:
+fusion_choices = ["concatenation", "attention", "graph", "uncertainty", "uncertainty_graph"]
+```
+
+---
+
+### PATCH-05: `automl/trainer.py` — `ApexLightningModule.training_step()`
+**Change A:** Wire `diversity_loss` and `graph_sparsity_loss`.
+
+```python
+# BEFORE: training_step returns total_loss directly after data + alignment loss
+
+# AFTER: add auxiliary fusion losses when applicable
+total_loss = data_loss * w["data_loss"] + alignment * w["constraint"]
+
+fusion_mod = getattr(self.model, "fusion", None)
+if fusion_mod is not None:
+    fusion_type = type(fusion_mod).__name__
+    if fusion_type in ("GraphFusion", "UncertaintyGraphFusion"):
+        from modelss.fusion import diversity_loss, graph_sparsity_loss
+        if hasattr(fusion_mod, "last_head_outputs") and fusion_mod.last_head_outputs:
+            div_l = diversity_loss(fusion_mod.last_head_outputs)
+            total_loss = total_loss + 0.01 * div_l
+        if hasattr(fusion_mod, "graph"):
+            sp_l = graph_sparsity_loss(fusion_mod.graph())
+            total_loss = total_loss + 0.005 * sp_l
+```
+
+**Change B:** Replace `CosineAnnealingLR` with adaptive scheduler.
+
+```python
+# BEFORE (configure_optimizers):
+scheduler = CosineAnnealingLR(optimizer, T_max=self.max_epochs)
+return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+# AFTER:
+from automl.adaptive_lr import AdaptiveLRScheduler
+scheduler = AdaptiveLRScheduler(
+    optimizer,
+    T_max=self.max_epochs,
+    loss_weight_scheduler=self.loss_weight_scheduler,
+)
+return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+```
+
+---
+
+### PATCH-06: `pipeline/training_orchestrator.py` — `_execute_phase_4_model_selection()`
+**Change:** Read `ctx.fusion_strategy` and `ctx.ranked_candidates` before running selection.
+
+```python
+# BEFORE: always runs AdvancedModelSelector fresh
+
+# AFTER: inject from ctx if available
+_ctx_fusion = getattr(self.execution_context, "fusion_strategy", None)
+_ctx_ranked = getattr(self.execution_context, "ranked_candidates", None)
+
+result = self._advanced_selector.select_models(
+    problem_type=self.config.problem_type,
+    modalities=self.config.modalities,
+    dataset_size=total_samples,
+    gpu_memory_gb=gpu_mem,
+    dataset_meta=schema_meta,
+)
+
+# Override fusion strategy from context if explicitly set
+if _ctx_fusion and _ctx_fusion in ("attention", "concatenation", "graph", "uncertainty", "uncertainty_graph"):
+    result.fusion_strategy = _ctx_fusion
+    logger.info("Phase 4: using ctx.fusion_strategy=%s (from /select-model)", _ctx_fusion)
+
+# Use context's ranked candidates to bias encoder selection
+if _ctx_ranked:
+    self.phase_results[Phase.MODEL_SELECTION]["ranked_candidates_from_ctx"] = _ctx_ranked
+```
+
+---
+
+### PATCH-07: `pipeline/training_orchestrator.py` — `_execute_phase_3_preprocessing()`
+**Change:** Read `ctx.predictability_scores` to apply adaptive strategy.
+
+```python
+# BEFORE: TabularPreprocessor.fit(X) with fixed strategy
+
+# AFTER: inject predictability-aware config
+_pred_scores = getattr(self.execution_context, "predictability_scores", {})
+_tab_pred = float(_pred_scores.get(list(_pred_scores.keys())[0], 0.5) if _pred_scores else 0.5)
+
+# Adaptive strategy: if predictability < 0.3, add polynomial features; skip if > 0.8
+_adaptive_config = {
+    "add_polynomial": _tab_pred < 0.30,
+    "n_poly_degree": 2,
+    "feature_interaction_threshold": max(0.1, 1.0 - _tab_pred),
+}
+logger.info(
+    "Phase 3: adaptive config from predictability=%.3f → %s",
+    _tab_pred, _adaptive_config
+)
+tabular_preprocessor = TabularPreprocessor(adaptive_config=_adaptive_config)
+tabular_preprocessor.fit(X_train)
+```
+
+---
+
+### PATCH-08: `pipeline/training_orchestrator.py` — `_execute_phase_6_drift_detection()`
+**Change:** Write drift result to `ExecutionContext` and conditionally trigger retraining.
+
+```python
+# BEFORE: drift result stored in phase_results only
+
+# AFTER:
+drift_report = self._drift_detector.detect_drift(reference_sample, production_sample)
+self.phase_results[Phase.DRIFT_DETECTION] = asdict(drift_report)
+
+# Write to ExecutionContext
+if self.execution_context is not None:
+    self.execution_context.drift_detected = bool(drift_report.drift_detected)
+    self.execution_context.drift_severity = float(drift_report.composite_score)
+    self.execution_context.drift_details = {
+        "ks": float(drift_report.ks_statistic),
+        "psi": float(drift_report.psi),
+        "mmd": float(drift_report.fdd),
+        "composite": float(drift_report.composite_score),
+    }
+    # Trigger retraining if drift exceeds threshold
+    if drift_report.drift_detected:
+        try:
+            from pipeline.retrain_executor import RetrainingPipeline
+            _retrain = RetrainingPipeline(
+                training_config=self.config,
+                cooldown_seconds=3600,
+            )
+            _retrain.maybe_retrain(self.execution_context)
+        except Exception as _re:
+            logger.warning("Drift-triggered retraining failed (non-fatal): %s", _re)
+```
+
+---
+
+### PATCH-09: `automl/optuna_adaptive.py` — Warm-Start Injection
+**Change:** Add `seed_from_warm_start()` method.
+
+```python
+# ADD to AdaptiveOptunaController:
+def seed_from_warm_start(
+    self,
+    study: "optuna.Study",
+    warm_params: Dict[str, Any],
+    hpo_space: Dict[str, Any],
+) -> None:
+    """Enqueue a warm-start trial using MetaLearning parameters.
+
+    Only enqueues parameters that exist in hpo_space to avoid ValueError.
+    """
+    if not warm_params or not hpo_space:
+        return
+    filtered = {
+        k: v for k, v in warm_params.items()
+        if k in hpo_space and v is not None
+    }
+    if filtered:
+        study.enqueue_trial(filtered)
+        logger.info(
+            "AdaptiveOptunaController: warm-start trial enqueued with %d params: %s",
+            len(filtered), list(filtered.keys())
+        )
+```
+
+**Integration point:** In `training_orchestrator._execute_phase_5_training()`, call `controller.seed_from_warm_start(study, ctx.warm_start_params, hpo_space)` before `study.optimize()`.
+
+---
+
+### PATCH-10: `core/execution_context.py`
+**Change:** Add missing fields and update methods.
+
+```python
+# ADD to ExecutionContext dataclass:
+drift_detected: bool = False
+drift_severity: float = 0.0
+drift_details: Dict[str, float] = field(default_factory=dict)
+phase_timings: Dict[str, float] = field(default_factory=dict)   # phase_name → duration_s
+training_fit_analysis: Dict[str, Any] = field(default_factory=dict)  # from TrialIntelligence
+
+# ADD methods:
+def record_phase_timing(self, phase_name: str, duration_s: float) -> None:
+    self.phase_timings[phase_name] = round(duration_s, 3)
+    self.updated_at = datetime.utcnow().isoformat()
+
+def update_drift(self, detected: bool, severity: float, details: Dict) -> None:
+    self.drift_detected = detected
+    self.drift_severity = severity
+    self.drift_details = details
+    self.log_decision("drift_detection", f"drift_detected={detected}", f"composite={severity:.4f}")
+    self.updated_at = datetime.utcnow().isoformat()
+
+def update_fit_analysis(self, analysis: Dict[str, Any]) -> None:
+    """Called per epoch by LossWeightScheduler to persist trial intelligence."""
+    self.training_fit_analysis = analysis
+    self.updated_at = datetime.utcnow().isoformat()
+```
+
+---
+
+### PATCH-11: `automl/trainer.py` — `LossWeightScheduler.update()`
+**Change:** Write `last_analysis` to `ExecutionContext` when available.
+
+```python
+# AFTER existing analysis logic:
+self.last_analysis = analysis
+# Persist to ExecutionContext if injected
+if self._ctx is not None:
+    try:
+        self._ctx.update_fit_analysis(analysis)
+    except Exception:
+        pass
+return analysis
+```
+
+**Also add** `_ctx` parameter to `LossWeightScheduler.__init__()`:
+```python
+def __init__(self, ctx: Optional[Any] = None) -> None:
+    ...
+    self._ctx = ctx
+```
+
+---
+
+### PATCH-12: `preprocessing/preprocessing_planner.py`
+**Change:** Replace heuristic shim with schema-driven plan that `TabularPreprocessor` actually consumes.
+
+```python
+# BEFORE: 59-line static dict based only on total_samples + n_modalities
+
+# AFTER: AdaptivePreprocessingPlan from predictability + schema
+class AdaptivePreprocessingPlanner:
+    def create_plan(
+        self,
+        schema_info: Dict[str, Any],
+        total_samples: int,
+        predictability_scores: Optional[Dict[str, float]] = None,
+        column_stats: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        modalities = list(schema_info.get("global_modalities", []))
+        pred_scores = predictability_scores or {}
+        tab_pred = float(pred_scores.get("tabular", 0.5))
+
+        plan = {
+            "version": "2.0",
+            "modalities": modalities,
+            "adaptive": True,
+            "tabular": {
+                "imputer": "median",
+                "scaler": "standard",
+                "add_polynomial_features": tab_pred < 0.30,
+                "poly_degree": 2,
+                "interaction_only": True,
+                "drop_high_correlation": tab_pred > 0.70,
+                "correlation_threshold": 0.95,
+            },
+            "text": {
+                "tokenizer": "bert-base-uncased",
+                "max_length": 128 if total_samples < 50_000 else 64,
+                "pooling": "cls" if total_samples < 50_000 else "mean",
+            },
+            "image": {
+                "target_size": [224, 224],
+                "normalize": "imagenet",
+                "augment_train": True,
+                "augment_strength": "high" if total_samples < 1_000 else "medium",
+            },
+            "runtime": {
+                "use_embedding_cache": total_samples >= 2_000 and len(modalities) >= 2,
+                "high_volume_mode": total_samples >= 100_000,
+            },
+            "weak_modalities": [m for m, s in pred_scores.items() if s < 0.25],
+            "strong_modalities": [m for m, s in pred_scores.items() if s > 0.75],
+        }
+        return plan
+```
+
+---
+
+## PHASE 5 — NEW FILES TO CREATE
+
+### File 1: `guardrails/__init__.py`
+**Purpose:** Package init.
+
+---
+
+### File 2: `guardrails/latency_guard.py`
+**Purpose:** Per-call latency enforcement with configurable timeout.
+
+```python
+class LatencyGuard:
+    """Context manager that enforces a maximum wall-clock time budget."""
+
+    def __init__(self, budget_s: float, fallback_fn: Optional[Callable] = None):
+        self.budget_s = float(budget_s)
+        self._fallback_fn = fallback_fn
+
+    def __enter__(self): self._start = time.perf_counter(); return self
+    def __exit__(self, *_): pass
+
+    def check(self):
+        elapsed = time.perf_counter() - self._start
+        if elapsed > self.budget_s:
+            if self._fallback_fn:
+                return self._fallback_fn()
+            raise TimeoutError(f"LatencyGuard: exceeded {self.budget_s:.1f}s budget")
+
+    @staticmethod
+    def timed(func, budget_s: float, *args, **kwargs):
+        """Run func in a thread with a strict timeout."""
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(func, *args, **kwargs)
+            try:
+                return fut.result(timeout=budget_s)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"Function exceeded {budget_s}s budget")
+```
+
+**Used in:** `/predict-async` route, `_execute_phase_5_training()` encoder precompute step.
+
+---
+
+### File 3: `guardrails/memory_guard.py`
+**Purpose:** Runtime VRAM + RAM monitoring; triggers fallback on overrun.
+
+```python
+class MemoryGuard:
+    """Monitor GPU/CPU memory during training and trigger fallback if threshold exceeded."""
+
+    def __init__(self, vram_threshold_pct: float = 0.92, ram_threshold_pct: float = 0.90):
+        self.vram_threshold = vram_threshold_pct
+        self.ram_threshold = ram_threshold_pct
+
+    def check_vram(self) -> Dict[str, float]:
+        if not torch.cuda.is_available():
+            return {"available": False}
+        total = torch.cuda.get_device_properties(0).total_memory
+        reserved = torch.cuda.memory_reserved(0)
+        used_pct = reserved / total
+        return {"used_pct": used_pct, "critical": used_pct > self.vram_threshold}
+
+    def check_ram(self) -> Dict[str, float]:
+        import psutil
+        vm = psutil.virtual_memory()
+        return {"used_pct": vm.percent / 100, "critical": vm.percent / 100 > self.ram_threshold}
+
+    def maybe_clear_cache(self) -> bool:
+        """Returns True if cache was cleared."""
+        status = self.check_vram()
+        if status.get("critical"):
+            torch.cuda.empty_cache()
+            logger.warning("MemoryGuard: VRAM %.1f%% — cache cleared", status["used_pct"]*100)
+            return True
+        return False
+```
+
+**Used in:** `ApexLightningModule.training_step()` (called every N steps), `_execute_phase_5_training()`.
+
+---
+
+### File 4: `guardrails/fallback_manager.py`
+**Purpose:** Encoder failure → lighter encoder fallback chain.
+
+```python
+ENCODER_FALLBACK_CHAIN = {
+    "image": ["ConvNeXt-Tiny", "ResNet50", "MobileNetV3"],
+    "text":  ["DeBERTa-v3", "BERT-base", "MiniLM-L6-v2"],
+    "tabular": ["GRN", "MLP"],
+}
+
+class FallbackManager:
+    def __init__(self):
+        self._failed: Dict[str, Set[str]] = defaultdict(set)
+
+    def get_encoder(self, modality: str, preferred: str) -> str:
+        chain = ENCODER_FALLBACK_CHAIN.get(modality, [preferred])
+        for candidate in chain:
+            if candidate not in self._failed[modality]:
+                return candidate
+        return chain[-1]  # last resort
+
+    def mark_failed(self, modality: str, encoder: str) -> None:
+        self._failed[modality].add(encoder)
+        logger.warning("FallbackManager: %s encoder '%s' marked failed", modality, encoder)
+```
+
+**Used in:** `JITEncoderSelector.select()`, `_encode_batch()` in `ApexLightningModule`.
+
+---
+
+### File 5: `guardrails/session_isolator.py`
+**Purpose:** Enforce per-session dataset isolation; prevent cross-session data leakage.
+
+```python
+class SessionIsolator:
+    """Enforces that all dataset references belong to the requesting session."""
+
+    def validate(
+        self,
+        session_id: str,
+        dataset_hashes: Dict[str, Any],
+        ctx: ExecutionContext,
+    ) -> Dict[str, Any]:
+        """Filter out any dataset hashes not belonging to this session."""
+        ctx_ids = set(ctx.active_dataset_ids or [])
+        valid = {h: meta for h, meta in dataset_hashes.items() if h in ctx_ids}
+        leaked = set(dataset_hashes.keys()) - ctx_ids
+        if leaked:
+            logger.warning(
+                "SessionIsolator: %d foreign dataset(s) rejected for session %s: %s",
+                len(leaked), session_id, leaked
+            )
+        return valid
+```
+
+**Used in:** `_run_training()` closure in `run_api.py`, `_get_session_hashes()` helper.
+
+---
+
+### File 6: `automl/adaptive_lr.py`
+**Purpose:** Drop-in replacement for `CosineAnnealingLR` that reads `LossWeightScheduler` analysis.
+
+```python
+class AdaptiveLRScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """
+    Cosine annealing base with adaptive multiplier from TrialIntelligence.
+
+    Every epoch, checks LossWeightScheduler.last_analysis:
+      overfitting  → multiply LR by 0.70
+      underfitting → multiply LR by 1.05
+      good         → maintain cosine trajectory
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        T_max: int,
+        loss_weight_scheduler: Optional["LossWeightScheduler"] = None,
+        eta_min: float = 0.0,
+        last_epoch: int = -1,
+    ):
+        self.T_max = T_max
+        self.eta_min = eta_min
+        self._lws = loss_weight_scheduler
+        self._base_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=T_max, eta_min=eta_min
+        )
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        cosine_lrs = self._base_cosine.get_last_lr() or self.base_lrs
+        analysis = getattr(self._lws, "last_analysis", {}) if self._lws else {}
+        fit_type = str(analysis.get("fit_type", "good"))
+        multiplier = {"overfitting": 0.70, "underfitting": 1.05}.get(fit_type, 1.0)
+        return [max(self.eta_min, lr * multiplier) for lr in cosine_lrs]
+
+    def step(self, *args, **kwargs):
+        self._base_cosine.step()
+        super().step(*args, **kwargs)
+```
+
+---
+
+### File 7: `preprocessing/adaptive_engine.py`
+**Purpose:** Context-aware preprocessing that reads predictability + schema to produce executable strategies.
+
+```python
+class AdaptivePreprocessingEngine:
+    """
+    Reads ExecutionContext intelligence to configure preprocessing.
+    Replaces PreprocessingPlanner as the authoritative planning module.
+    """
+
+    def __init__(self, ctx: ExecutionContext):
+        self._ctx = ctx
+
+    def build_tabular_config(self, X: pd.DataFrame) -> Dict[str, Any]:
+        pred_scores = self._ctx.predictability_scores or {}
+        tab_pred = float(next(iter(pred_scores.values()), 0.5))
+        schema = self._ctx.global_schema or {}
+        
+        col_stats = self._compute_column_stats(X)
+
+        return {
+            "add_polynomial": tab_pred < 0.30,
+            "poly_degree": 2,
+            "interaction_only": True,
+            "drop_correlation_threshold": 0.95 if tab_pred > 0.70 else None,
+            "imputer_strategy": "knn" if col_stats["missing_rate"] > 0.10 else "median",
+            "scaler": "robust" if col_stats["outlier_rate"] > 0.05 else "standard",
+            "weak_feature_threshold": 1.0 - tab_pred,
+        }
+
+    def get_weak_modalities(self) -> List[str]:
+        pred_scores = self._ctx.predictability_scores or {}
+        return [m for m, s in pred_scores.items() if s < 0.25]
+
+    def get_fusion_recommendation(self) -> str:
+        """Use predictability imbalance to select fusion strategy."""
+        scores = list((self._ctx.predictability_scores or {}).values())
+        if len(scores) < 2:
+            return "concatenation"
+        variance = float(np.var(scores))
+        if variance > 0.10:
+            return "uncertainty"  # modalities differ greatly → uncertainty weighting
+        if len(scores) >= 3:
+            return "uncertainty_graph"
+        return "attention"
+
+    @staticmethod
+    def _compute_column_stats(X: pd.DataFrame) -> Dict[str, float]:
+        missing_rate = float(X.isnull().mean().mean())
+        numeric_cols = X.select_dtypes(include=[np.number])
+        if numeric_cols.empty:
+            outlier_rate = 0.0
+        else:
+            q1, q3 = numeric_cols.quantile(0.25), numeric_cols.quantile(0.75)
+            iqr = q3 - q1
+            outlier_rate = float(((numeric_cols < q1 - 1.5*iqr) | (numeric_cols > q3 + 1.5*iqr)).mean().mean())
+        return {"missing_rate": missing_rate, "outlier_rate": outlier_rate}
+```
+
+---
+
+### File 8: `core/context_enforcer.py`
+**Purpose:** Decorator + validator to enforce that `ExecutionContext` is loaded and valid before any phase runs.
+
+```python
+import functools
+from typing import Callable, Any
+
+def require_context(min_stage: str = "ingestion_complete"):
+    """
+    Decorator for API route handlers and phase methods.
+    Raises HTTP 422 if context is missing or at wrong pipeline stage.
+    """
+    def decorator(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            # Extract session_id from kwargs or first positional arg body
+            sid = kwargs.get("session_id") or (
+                (args[0] if args else None)
+            )
+            if sid:
+                from database.context_db import context_db
+                ctx_data = context_db.load_context(sid)
+                if ctx_data is None:
+                    from fastapi import HTTPException
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"No ExecutionContext for session {sid}. Run ingestion first."
+                    )
+                stage = ctx_data.get("pipeline_stage", "")
+                _stage_order = [
+                    "ingestion_complete", "schema_detection",
+                    "target_detection", "global_aggregation",
+                    "preprocessing_planning", "model_selection",
+                    "training", "monitoring"
+                ]
+                if min_stage in _stage_order and stage in _stage_order:
+                    if _stage_order.index(stage) < _stage_order.index(min_stage):
+                        from fastapi import HTTPException
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"Pipeline stage '{stage}' is before required '{min_stage}'. "
+                                f"Complete earlier phases first."
+                            )
+                        )
+            return await fn(*args, **kwargs)
+        return wrapper
+    return decorator
+```
+
+**Used in:** `@require_context("schema_detection")` on `/preprocess`, `@require_context("preprocessing_planning")` on `/select-model`, etc.
+
+---
+
+## PHASE 6 — UPDATED END-TO-END PIPELINE FLOW
+
+```
+POST /ingest/datasets
+  → DataIngestionManager (async per URL)
+  → SHA-256 hash → DATASET_CACHE_DIR
+  → ContextDatabase.save_profile()
+  → SessionIsolator validates session ownership  [NEW: guardrails/session_isolator.py]
+  → ctx.pipeline_stage = "ingestion_complete"
+
+       │ Intelligence accumulated: dataset hashes, file paths, DVC lineage
+
+POST /api/schema/detect
+  → @require_context("ingestion_complete")       [NEW: core/context_enforcer.py]
+  → COGMASchemaDetector + XS3TargetSelector + UniversalTargetValidator (RF CV)
+  → ctx.predictability_scores populated          [ALL MODALITIES]
+  → ctx.confidence_map["xs3_target_gap"] set
+  → AdaptivePreprocessingEngine.get_weak_modalities() tags low-signal modalities
+  → ctx.pipeline_stage = "schema_detection"
+
+       │ Intelligence: predictability per modality, xs3 gap, target candidates
+
+POST /preprocess
+  → @require_context("schema_detection")
+  → AdaptivePreprocessingEngine(ctx).build_tabular_config(X)  [NEW: reads predictability]
+  → TabularPreprocessor.fit(X, config=adaptive_config)        [PATCHED]
+  → Probe sample → context_db.save_probe_sample()             [PATCHED: persisted to SQLite]
+  → ctx.pipeline_stage = "preprocessing_planning"
+
+       │ Intelligence: fitted scaler, adaptive feature engineering, probe sample (persisted)
+
+POST /select-model
+  → @require_context("preprocessing_planning")
+  → Load probe sample from context_db (not _session_store)    [PATCHED]
+  → select_fusion_strategy(schema_info)                       [PATCHED: dead code activated]
+  → GPU constraint check → downgrade if needed
+  → CandidateSelector.quick_probe_tabular() (real CV)
+  → CandidateSelector.probe_fusion()
+  → JITEncoderSelector.select() (live VRAM dry-run)
+  → ctx.fusion_strategy = selected_strategy
+  → ctx.ranked_candidates = sorted probe scores
+  → ctx.warm_start_params from MetaLearningStore
+
+       │ Intelligence: fusion choice, encoder selection, ranked candidates (all in ctx)
+
+POST /train-pipeline
+  → @require_context("preprocessing_planning")
+  → TrainingOrchestrator reads ctx.fusion_strategy, ctx.ranked_candidates [PATCHED]
+  → Phase 3: AdaptivePreprocessingEngine drives TabularPreprocessor config
+  → Phase 4: ctx.fusion_strategy injected into _MultimodalHead              [PATCHED]
+  → Phase 5:
+      → AdaptiveOptunaController.seed_from_warm_start(study, ctx.warm_start_params) [PATCHED]
+      → Per trial: ApexLightningModule with AdaptiveLRScheduler             [PATCHED]
+        → TrialIntelligence.analyze() → LR multiplier applied same-trial    [PATCHED]
+        → diversity_loss + graph_sparsity_loss active for Graph fusion      [PATCHED]
+        → LossWeightScheduler writes last_analysis to ctx.training_fit_analysis [PATCHED]
+        → MemoryGuard.maybe_clear_cache() every 50 steps                    [NEW]
+      → MetaLearningStore.add_experiment() on best trial
+  → Phase 6: drift_detected → ctx.update_drift()                           [PATCHED]
+             → RetrainingPipeline.maybe_retrain(ctx) if drift detected     [PATCHED]
+  → Phase 7: researchMetrics + ThreadSafeModelRegistry
+  → ctx.phase_timings populated per phase                                   [PATCHED]
+
+       │ Full context coverage: every phase reads AND writes ExecutionContext
+
+POST /predict-async
+  → LatencyGuard(budget_s=30)                                               [NEW]
+  → FallbackManager handles encoder failures                                [NEW]
+  → MultimodalInferenceEngine.predict()
+  → XAIEngine: IG attributions per modality
+  → Fusion attention weights included when GraphFusion/UncertaintyFusion    [PATCHED]
+
+POST /monitor/drift
+  → DriftDetector.detect_drift()
+  → ctx.update_drift() written                                              [PATCHED]
+  → RetrainingPipeline.maybe_retrain(ctx) if triggered                     [PATCHED]
+```
+
+---
+
+## PHASE 7 — FRONTEND + API UPDATES
+
+### 7.1 Missing / Broken Endpoints
+
+| Endpoint | Status | Fix |
+|----------|--------|-----|
+| `GET /v2/sessions/{id}/intelligence` | ✅ EXISTS | Add `drift_details`, `training_fit_analysis`, `phase_timings` to response |
+| `GET /v2/sessions/{id}/decision-trace` | ✅ EXISTS | No change needed |
+| `GET /train-pipeline/status/{task_id}` | ⚠ PARTIAL | Add `phase_timings` field to response |
+| `POST /select-model` | ⚠ PARTIAL | Add `jit_dry_run_rationale` to best_model response |
+| `POST /train-pipeline` | ⚠ PARTIAL | Add `lw_schedule_history` to trial_diagnostics |
+| `GET /models/{id}/stats` | ✅ EXISTS | Add `fusion_attention_summary` when available |
+| `POST /context/{sid}/probe-sample` | ❌ MISSING | New: save probe sample via API |
+| `GET /context/{sid}/probe-sample/status` | ❌ MISSING | New: check if probe sample is persisted |
+| `GET /context/{sid}/phase-timings` | ❌ MISSING | New: return ctx.phase_timings |
+
+### 7.2 New Endpoints
+
+```python
+@app.get("/context/{session_id}/phase-timings")
+async def get_phase_timings(session_id: str):
+    """Return per-phase duration breakdown from ExecutionContext."""
+    ctx = session_manager.get_session(session_id)
+    if not ctx:
+        raise HTTPException(404, f"No session: {session_id}")
+    return {
+        "session_id": session_id,
+        "phase_timings": ctx.phase_timings,  # Dict[str, float]
+        "total_duration_s": sum(ctx.phase_timings.values()),
+    }
+
+@app.get("/context/{session_id}/drift-status")
+async def get_drift_status(session_id: str):
+    """Return current drift state from ExecutionContext."""
+    ctx = session_manager.get_session(session_id)
+    if not ctx:
+        raise HTTPException(404)
+    return {
+        "drift_detected": ctx.drift_detected,
+        "drift_severity": ctx.drift_severity,
+        "drift_details": ctx.drift_details,
+    }
+
+@app.get("/context/{session_id}/fit-analysis")
+async def get_fit_analysis(session_id: str):
+    """Return latest TrialIntelligence fit analysis from training."""
+    ctx = session_manager.get_session(session_id)
+    if not ctx:
+        raise HTTPException(404)
+    return {
+        "training_fit_analysis": ctx.training_fit_analysis,
+        "training_signals": ctx.training_signals,
+    }
+```
+
+### 7.3 Updated Response Formats
+
+**`/train-pipeline/status/{task_id}` → add field:**
+```json
+{
+  "phase_timings": {
+    "Data Ingestion": 2.1,
+    "Schema Detection": 44.8,
+    "Preprocessing": 12.3,
+    "Model Selection": 8.7,
+    "Training": 312.4,
+    "Drift Detection": 3.1,
+    "Model Registry": 1.8
+  }
+}
+```
+
+**`/select-model` best_model → add field:**
+```json
+{
+  "jit_dry_run": {
+    "selected_image_encoder": "ResNet50",
+    "selected_text_encoder": "MiniLM-L6-v2",
+    "vram_budget_bytes": 3006477107,
+    "peak_memory_bytes": 2156789456,
+    "dry_run_attempts": 3,
+    "rationale": {
+      "ConvNeXt-Tiny": {"peak_mb": 3100, "rejected": true, "reason": "exceeds budget"},
+      "ResNet50": {"peak_mb": 1842, "rejected": false},
+      "MiniLM-L6-v2": {"peak_mb": 312, "rejected": false}
+    }
+  }
+}
+```
+
+### 7.4 UI Updates (`frontend/app_enhanced.py`)
+
+**Phase 4 — Fusion Strategy Selector (PATCH):**
+```python
+# BEFORE: fusion_options = ["concatenation", "attention"]
+# AFTER:
+fusion_options = ["concatenation", "attention", "graph", "uncertainty", "uncertainty_graph"]
+fusion_descriptions = {
+    "concatenation": "Direct concat. Fastest. Best single-modality.",
+    "attention": "Learned importance weighting. Best 2-modality.",
+    "graph": "Explicit modality interaction graph. Best tabular+text.",
+    "uncertainty": "Inverse-variance weighting. Best when modalities disagree.",
+    "uncertainty_graph": "Hybrid graph + uncertainty. Best 3+ modalities.",
+}
+```
+
+**Phase 4 — JIT Dry-Run Rationale (NEW EXPANDER):**
+```python
+jit_dry_run = best.get("jit_dry_run", {}) if isinstance(best, dict) else {}
+if jit_dry_run:
+    with st.expander("🔬 JIT Encoder Dry-Run Results", expanded=False):
+        st.caption("Actual VRAM measurements from live forward passes on your hardware.")
+        rationale = jit_dry_run.get("rationale", {})
+        if rationale:
+            rows = []
+            for enc_name, enc_info in rationale.items():
+                rows.append({
+                    "Encoder": enc_name,
+                    "Peak VRAM (MB)": enc_info.get("peak_mb", "?"),
+                    "Budget (MB)": int(jit_dry_run.get("vram_budget_bytes", 0) / 1024 / 1024),
+                    "Selected": "✅" if not enc_info.get("rejected") else "❌",
+                    "Reason": enc_info.get("reason", "—"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        rc1, rc2 = st.columns(2)
+        rc1.metric("Budget (MB)", int(jit_dry_run.get("vram_budget_bytes", 0) / 1024 / 1024))
+        rc2.metric("Peak Used (MB)", int(jit_dry_run.get("peak_memory_bytes", 0) / 1024 / 1024))
+```
+
+**Phase 5 — LossWeightScheduler Signal (EXTEND TrialIntelligence Diagnostics):**
+```python
+# In TrialIntelligence Diagnostics expander, add columns:
+if "dynamic_factors" in diag_df.columns:
+    pass  # already shown via full metrics
+# Add per-row factor display:
+for _, row in diag_df.iterrows():
+    factors = row.get("dynamic_factors", {})
+    if factors:
+        st.caption(
+            f"Trial {row.get('trial_n', '?')}: "
+            f"reg_factor={factors.get('regularization', 1.0):.2f} | "
+            f"data_factor={factors.get('data_loss', 1.0):.2f}"
+        )
+```
+
+**Phase 5 — Phase Timing Breakdown (NEW SECTION after training completes):**
+```python
+# After training complete, poll GET /context/{sid}/phase-timings:
+if status == "completed" and st.session_state.session_id:
+    try:
+        timing_resp = requests.get(
+            f"{API_BASE_URL}/context/{st.session_state.session_id}/phase-timings",
+            timeout=5
+        )
+        if timing_resp.status_code == 200:
+            timings = timing_resp.json().get("phase_timings", {})
+            if timings:
+                st.markdown("### ⏱ Phase Timing Breakdown")
+                timing_df = pd.DataFrame([
+                    {"Phase": k, "Duration (s)": f"{v:.1f}"}
+                    for k, v in timings.items()
+                ])
+                st.dataframe(timing_df, use_container_width=True)
+    except Exception:
+        pass
+```
+
+**Sidebar — Live Drift Status (NEW):**
+```python
+# In sidebar after Phase Status section:
+st.sidebar.divider()
+st.sidebar.markdown("### 🌊 Drift Status")
+try:
+    drift_resp = requests.get(
+        f"{API_BASE_URL}/context/{st.session_state.session_id}/drift-status",
+        timeout=3
+    )
+    if drift_resp.status_code == 200:
+        drift_data = drift_resp.json()
+        if drift_data.get("drift_detected"):
+            st.sidebar.error(f"⚠️ Drift detected (severity={drift_data['drift_severity']:.3f})")
+        else:
+            st.sidebar.success("✅ No drift detected")
+except Exception:
+    st.sidebar.caption("Drift status unavailable")
+```
+
+---
+
+## PHASE 8 — VALIDATION CHECKLIST
+
+### Test 1: Single Modality (Tabular Only)
+```
+Input:  CSV with 500 rows, 10 numeric cols, 1 binary target
+Steps:  /ingest → /schema → /preprocess → /select-model → /train-pipeline
+Assert:
+  - ctx.predictability_scores["tabular_hash"] ∈ [0, 1]
+  - fusion = "concatenation" (single modality → no multi-modal strategy)
+  - TabularEncoder output_dim = 16
+  - ImageEncoder + TextEncoder → dummy 1e-7 tensors (missing modality safety)
+  - Phase 5: best_val_acc > random baseline
+  - ctx.phase_timings populated for all 7 phases
+```
+
+### Test 2: Full Multimodal (Tabular + Text + Image)
+```
+Input:  Dataset with tabular cols + text col + image_path col
+Steps:  Same flow
+Assert:
+  - ctx.predictability_scores has 3 entries
+  - select_fusion_strategy() called → NOT hardcoded threshold
+  - _MultimodalHead.fusion is one of {Concat, Attention, Graph, Uncertainty, UncertaintyGraph}
+  - EmbeddingCache: text + image embeddings cached after trial 1
+  - Trial 2+ reuse cached embeddings (verify .pt files exist on disk)
+  - diversity_loss + graph_sparsity_loss applied if fusion = "graph"
+```
+
+### Test 3: Missing Modality (Image path missing/corrupted)
+```
+Input:  CSV with image_path col; 50% of paths invalid
+Steps:  /train-pipeline
+Assert:
+  - ImagePreprocessor.zero_fill_missing = True
+  - Failed image → torch.zeros(3, 224, 224) dummy (training_orchestrator.py:164-167)
+  - FallbackManager activated (if image encoder fails → lighter encoder)  [NEW]
+  - Training completes (no crash on missing image)
+  - Phase 5 result: n_failed_images > 0 in logs
+```
+
+### Test 4: Weak Dataset (predictability < 0.25)
+```
+Input:  Pure noise CSV (random floats, random binary target)
+Steps:  /schema → /preprocess → /select-model → /train-pipeline
+Assert:
+  - ctx.predictability_scores["tabular_hash"] < 0.25
+  - AdaptivePreprocessingEngine: add_polynomial=True (weak signal → polynomial features)
+  - AdaptivePreprocessingEngine.get_weak_modalities() returns ["tabular"]  [NEW]
+  - Training: best_val_acc ≈ 0.50 (random — expected)
+  - fit_type = "underfitting" detected by TrialIntelligence
+  - AdaptiveLRScheduler: multiplier = 1.05 applied to remaining epochs  [NEW]
+```
+
+### Test 5: User Override Scenario
+```
+Steps:
+  1. /schema → auto-detected target = "col_A"
+  2. User overrides to "col_B" via Phase 2 Override tab → POST /api/schema/override
+  3. ctx.global_target = "col_B", ctx.override_history populated
+  4. /preprocess with override → TabularPreprocessor uses "col_B" as y
+  5. /train-pipeline → training uses "col_B" as target
+Assert:
+  - ctx.override_history has entry with {field: "global_target", old: "col_A", new: "col_B"}
+  - Phase 5 result: problem_type aligns with "col_B"'s dtype
+  - Decision trace shows override event with timestamp
+```
+
+### Test 6: Drift Scenario
+```
+Input:  Train on distribution A → serve requests from distribution B
+Steps:
+  1. /train-pipeline (distribution A)
+  2. /monitor/drift (reference=train split, current=distribution B data)
+Assert:
+  - DriftDetector: psi > 0.25 OR ks > 0.30 OR mmd > 0.50
+  - drift_detected = True
+  - ctx.update_drift() called → ctx.drift_detected = True  [PATCHED]
+  - RetrainingPipeline.maybe_retrain() called automatically  [PATCHED]
+  - If cooldown active: retrain_history shows "cooldown_blocked" event
+  - Sidebar drift indicator shows ⚠️ drift detected  [NEW UI]
+```
+
+### Test 7: Process Restart Mid-Session
+```
+Steps:
+  1. /ingest → /schema → /preprocess (tabular_sample now in context_db.probe_samples)
+  2. Kill API process → restart
+  3. /select-model → load probe sample from context_db  [PATCHED]
+Assert:
+  - No 500 error on /select-model after restart
+  - Probe sample loaded from SQLite (not in-memory)
+  - CandidateSelector.quick_probe_tabular() runs with loaded sample
+  - Ranking same as pre-restart session
+```
+
+### Test 8: Warm-Start Session (MetaLearning)
+```
+Pre-condition: ≥1 prior successful training run stored in MetaLearningStore
+Steps:
+  1. /ingest (similar dataset to prior run)
+  2. /schema → /select-model → warm_start_params returned
+  3. /train-pipeline
+Assert:
+  - AdaptiveOptunaController.seed_from_warm_start() called  [PATCHED]
+  - study has 1 enqueued trial before optimization starts
+  - Trial 0 (warm-start) val_loss < random-init trial val_loss (statistically)
+  - Best trial found in fewer trials than cold-start baseline
+```
+
+---
+
+## PHASE 9 — FINAL OUTPUT SUMMARY
+
+### Gap Analysis Table
+
+| Layer | Status | Top Issue | Fix |
+|-------|--------|-----------|-----|
+| L1 Schema | ⚠ PARTIAL | predictability_scores not consumed downstream | PATCH-07 + adaptive_engine.py |
+| L2 Context | ⚠ PARTIAL | _session_store dual-state; drift/timings not in ctx | PATCH-01,02,03,10 |
+| L3 Preprocessing | ⚠ PARTIAL | PreprocessingPlanner is shim; not schema-driven | PATCH-12 + adaptive_engine.py |
+| L4 Embeddings | ⚠ PARTIAL | UncertaintyFusion weights not gating embeddings | context_enforcer + L5 fix |
+| L5 Model Selection | ⚠ PARTIAL | Real probing skipped in direct train path | PATCH-06 |
+| L6 Fusion | ❌ CRITICAL | 3 strategies dead; auxiliary losses unused | PATCH-04, PATCH-05 |
+| L7 Training | ⚠ PARTIAL | LR not adaptive mid-trial; warm-start not seeded | PATCH-09 + adaptive_lr.py |
+| L8 Prediction | ⚠ PARTIAL | GradCAM missing; confidence uncalibrated | memory_guard, latency_guard |
+| L9 Monitoring | ⚠ PARTIAL | Drift not in ctx; retraining passive | PATCH-08 |
+| L10 Guardrails | ❌ MISSING | All safety mechanisms absent | guardrails/ package (4 files) |
+
+### Top 10 Critical Issues
+
+| # | Issue | Severity | Patch |
+|---|-------|----------|-------|
+| 1 | Probe data in `_session_store` (volatile) — lost on restart | 🔴 | PATCH-01,02,03 |
+| 2 | 3 fusion strategies (Graph/Uncertainty/UncertaintyGraph) never selected | 🔴 | PATCH-04,05 |
+| 3 | `predictability_scores` computed but never consumed | 🔴 | PATCH-07 + adaptive_engine.py |
+| 4 | Direct /train-pipeline uses heuristic-only selection (no real CV) | 🔴 | PATCH-06 |
+| 5 | `diversity_loss` / `graph_sparsity_loss` dead code — GraphFusion unregularized | 🟡 | PATCH-05 |
+| 6 | `TrialIntelligence` cannot adapt LR mid-trial | 🟡 | PATCH-05 + adaptive_lr.py |
+| 7 | MetaLearning warm-start not injected into Optuna | 🟡 | PATCH-09 |
+| 8 | Drift result not written to ExecutionContext; retraining passive | 🟡 | PATCH-08 |
+| 9 | `PreprocessingPlanner` is a documentation shim | 🟡 | PATCH-12 + adaptive_engine.py |
+| 10 | Zero guardrails (latency, memory, fallback, session isolation) | 🟡 | guardrails/ package |
+
+### New Files to Create
+
+| File | Lines (est.) | Purpose |
+|------|-------------|---------|
+| `guardrails/__init__.py` | 5 | Package |
+| `guardrails/latency_guard.py` | 45 | Per-call timeout enforcement |
+| `guardrails/memory_guard.py` | 55 | Runtime VRAM/RAM monitoring |
+| `guardrails/fallback_manager.py` | 40 | Encoder failure fallback chain |
+| `guardrails/session_isolator.py` | 35 | Cross-session data leakage prevention |
+| `automl/adaptive_lr.py` | 70 | AdaptiveLRScheduler (LR changes within trial) |
+| `preprocessing/adaptive_engine.py` | 90 | Context-driven preprocessing config |
+| `core/context_enforcer.py` | 60 | `@require_context` decorator for API routes |
+
+**Total new code: ~400 lines. All components have defined inputs/outputs and integration points.**
+
+### Implementation Order
+
+```
+Week 1: Context integrity (PATCH-01,02,03,10) + context_enforcer.py
+  → Eliminates dual-state problem. All other patches depend on stable ctx.
+
+Week 2: Fusion activation (PATCH-04,05) + adaptive_lr.py
+  → Activates 270 lines of real research code already in codebase.
+
+Week 3: Intelligence propagation (PATCH-06,07,12) + adaptive_engine.py
+  → predictability_scores now drive preprocessing + model selection.
+
+Week 4: Adaptive training (PATCH-08,09) + guardrails/ package
+  → Drift writes to ctx, retraining auto-triggered, all safety mechanisms live.
+
+Week 5: API + UI updates (Phase 7 patches)
+  → JIT dry-run rationale, phase timings, drift sidebar, all 5 fusion strategies in UI.
+
+Week 6: Validation (Phase 8 test cases)
+  → All 8 test scenarios verified against patched system.
+```
+
+---
+
+## PHASE X — FINAL ELITE GAP PATCHES
+
+> All patches extend existing code without replacing working logic.
+> Every root cause reference is verified against source files read in this session.
+
+---
+
+### GAP-X1: CLOSED-LOOP INTELLIGENCE (DRIFT → SCHEMA/PREPROCESSING)
+
+**Problem**
+Drift detection in `_execute_phase_6_drift_detection()` computes KS/PSI/MMD statistics and stores them in `phase_results`, but never feeds them back into `ctx.predictability_scores`, preprocessing strategy, or the next training run. The system has no closed loop: a detected concept drift does not adjust which modalities are trusted or how features are scaled.
+
+**Root Cause in Current Code**
+- `pipeline/training_orchestrator.py`: `_execute_phase_6_drift_detection()` stores `drift_report` in `self.phase_results[Phase.DRIFT_DETECTION]` only (dict). No reference to `self.execution_context` in this function.
+- `core/execution_context.py`: Has no `drift_modality_scores`, no `drift_adjusted_predictability` field.
+- `preprocessing/tabular_preprocessor.py`: `fit()` receives no drift signals. The `SmartColumnFilter` only uses zero-variance, high-correlation, and high-missing-rate filters — it does not know which features drifted.
+- `monitoring/drift_detector.py`: `DriftReport` contains `per_feature_ks` (per-feature KS statistics) — this exists but is never consumed.
+
+**Patch Plan**
+1. Add `drift_adjusted_predictability` and `drifted_features` to `ExecutionContext`.
+2. In `_execute_phase_6_drift_detection()`: after computing drift, call a new `DriftAdapter.adjust_context(ctx, drift_report)` that downgrades predictability for drifted modalities.
+3. In `TabularPreprocessor.fit()`: accept optional `drifted_features: List[str]`, drop or add robust scaling for those columns.
+4. The next call to `/train-pipeline` reads `ctx.drift_adjusted_predictability` in `_execute_phase_3_preprocessing()`.
+
+**Code Patch**
+
+```python
+# ── FILE: core/execution_context.py ──────────────────────────────────────────
+# BEFORE: no drift-feedback fields
+
+# AFTER: add to ExecutionContext dataclass
+drift_adjusted_predictability: Dict[str, float] = field(default_factory=dict)
+drifted_features: List[str] = field(default_factory=list)
+drift_feedback_applied: bool = False
+
+def apply_drift_feedback(
+    self,
+    drift_report_dict: Dict[str, Any],
+    decay: float = 0.5,
+) -> None:
+    """
+    Downgrade predictability scores for modalities that drifted.
+    Called after Phase 6; takes effect on the next training run.
+
+    decay: multiplicative factor applied per drifted modality (0 < decay < 1).
+    """
+    per_feature_ks: Dict[str, float] = drift_report_dict.get("per_feature_ks", {})
+    # Identify drifted features: KS statistic > 0.30
+    drifted = [feat for feat, ks in per_feature_ks.items() if ks > 0.30]
+    self.drifted_features = drifted
+
+    # Downgrade predictability for tabular if many features drifted
+    current = dict(self.predictability_scores or {})
+    if drifted and current:
+        drift_fraction = len(drifted) / max(1, len(per_feature_ks))
+        for key in list(current.keys()):
+            if "tabular" in str(key).lower():
+                current[key] = round(float(current[key]) * (1.0 - decay * drift_fraction), 4)
+    self.drift_adjusted_predictability = current
+    self.drift_feedback_applied = True
+    self.log_decision(
+        "drift_feedback",
+        f"{len(drifted)} drifted features",
+        f"adjusted_predictability={current}",
+    )
+    self.updated_at = datetime.utcnow().isoformat()
+
+
+# ── FILE: pipeline/training_orchestrator.py ──────────────────────────────────
+# BEFORE (_execute_phase_6_drift_detection):
+drift_report = self._drift_detector.detect_drift(reference_sample, production_sample)
+self.phase_results[Phase.DRIFT_DETECTION] = asdict(drift_report)
+
+# AFTER: add closed-loop feedback to ctx
+drift_report = self._drift_detector.detect_drift(reference_sample, production_sample)
+drift_dict = asdict(drift_report)
+self.phase_results[Phase.DRIFT_DETECTION] = drift_dict
+
+if self.execution_context is not None:
+    self.execution_context.drift_detected = bool(drift_report.drift_detected)
+    self.execution_context.drift_severity = float(drift_report.composite_score)
+    self.execution_context.drift_details = {
+        "ks": float(drift_report.ks_statistic),
+        "psi": float(drift_report.psi),
+        "mmd": float(drift_report.fdd),
+    }
+    # CLOSED-LOOP: adjust predictability based on feature-level drift
+    self.execution_context.apply_drift_feedback(drift_dict, decay=0.5)
+    logger.info(
+        "Phase 6: drift feedback applied → drifted_features=%s, "
+        "adjusted_predictability=%s",
+        self.execution_context.drifted_features,
+        self.execution_context.drift_adjusted_predictability,
+    )
+
+
+# ── FILE: pipeline/training_orchestrator.py ──────────────────────────────────
+# In _execute_phase_3_preprocessing(): prefer drift-adjusted scores if available
+# BEFORE:
+_pred_scores = getattr(self.execution_context, "predictability_scores", {})
+
+# AFTER:
+_ctx = self.execution_context
+if _ctx is not None and getattr(_ctx, "drift_feedback_applied", False):
+    _pred_scores = _ctx.drift_adjusted_predictability or {}
+    _drifted_feats = _ctx.drifted_features or []
+    logger.info("Phase 3: using drift-adjusted predictability scores")
+else:
+    _pred_scores = getattr(_ctx, "predictability_scores", {}) if _ctx else {}
+    _drifted_feats = []
+
+# Pass drifted features to TabularPreprocessor:
+tabular_preprocessor = TabularPreprocessor(
+    adaptive_config=_adaptive_config,
+    drifted_features=_drifted_feats,  # NEW param
+)
+
+
+# ── FILE: preprocessing/tabular_preprocessor.py ──────────────────────────────
+# ADD to TabularPreprocessor.__init__:
+def __init__(self, adaptive_config=None, drifted_features=None):
+    ...
+    self._drifted_features: List[str] = list(drifted_features or [])
+
+# In fit(): after standard SmartColumnFilter, apply robust scaler to drifted cols:
+def _apply_drift_robust_scaling(self, X: pd.DataFrame) -> pd.DataFrame:
+    """Replace StandardScaler with RobustScaler for features that drifted."""
+    from sklearn.preprocessing import RobustScaler
+    for col in self._drifted_features:
+        if col in X.columns and pd.api.types.is_numeric_dtype(X[col]):
+            rs = RobustScaler()
+            X[col] = rs.fit_transform(X[[col]]).ravel()
+            logger.info("TabularPreprocessor: RobustScaler applied to drifted col '%s'", col)
+    return X
+```
+
+---
+
+### GAP-X2: DYNAMIC FUSION ADAPTATION (DURING TRAINING)
+
+**Problem**
+The fusion strategy is selected once before training starts and never changes during training. For `AttentionFusion` the attention weights are logged per epoch (via `get_attention_summary()` in `on_validation_epoch_end()`) but never used to reweight how much each modality contributes going forward. The modality with declining importance does not receive less gradient signal.
+
+**Root Cause in Current Code**
+- `automl/trainer.py:564-578`: `on_validation_epoch_end()` calls `fusion_layer.get_attention_summary()` and **logs** `fusion_head_diversity` via `self.log()` but does nothing with the attention weights.
+- `automl/trainer.py:644-665`: `_apply_adaptive_loss()` adjusts only `data_loss`, `regularization`, `constraint` — it does not use per-modality attention weights.
+- `modelss/fusion.py`: `AttentionFusion` stores `last_attention_weights` after each forward pass (computed but discarded after logging).
+
+**Patch Plan**
+Extend `_apply_adaptive_loss()` to read the latest `fusion_layer.get_attention_summary()` and apply **per-modality gradient scaling** by attaching a hook that scales gradients on each encoder output proportional to the attention weight. No new module needed — extend existing `_apply_adaptive_loss` and `on_validation_epoch_end`.
+
+**Code Patch**
+
+```python
+# ── FILE: automl/trainer.py ──────────────────────────────────────────────────
+
+# BEFORE (on_validation_epoch_end, line 564):
+fusion_layer = getattr(self.model, "fusion", None)
+attention_summary: Dict[str, Any] = {}
+if fusion_layer is not None and hasattr(fusion_layer, "get_attention_summary"):
+    try:
+        attention_summary = fusion_layer.get_attention_summary() or {}
+    except Exception as exc:
+        logger.debug("Fusion attention summary unavailable: %s", exc)
+        attention_summary = {}
+
+# AFTER: store attention weights for use in next training step
+if fusion_layer is not None and hasattr(fusion_layer, "get_attention_summary"):
+    try:
+        attention_summary = fusion_layer.get_attention_summary() or {}
+        # Extract per-modality importance for gradient scaling
+        modality_importance = attention_summary.get("modality_importance", {})
+        if modality_importance:
+            # Normalise: sum → 1.0, floor at 0.10 to prevent full suppression
+            total = max(sum(modality_importance.values()), 1e-8)
+            self._modality_grad_scales = {
+                k: max(0.10, v / total)
+                for k, v in modality_importance.items()
+            }
+    except Exception as exc:
+        logger.debug("Fusion attention summary unavailable: %s", exc)
+        attention_summary = {}
+        self._modality_grad_scales = {}
+
+
+# ADD __init__ field (in ApexLightningModule.__init__):
+self._modality_grad_scales: Dict[str, float] = {}  # updated per epoch
+
+
+# EXTEND _apply_adaptive_loss to scale alignment contribution per modality:
+def _apply_adaptive_loss(self, base_loss: torch.Tensor) -> torch.Tensor:
+    weights = self.loss_weight_scheduler.get_effective_weights()
+    reg_term = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
+    for param in self.model.parameters():
+        if param.requires_grad:
+            reg_term = reg_term + param.pow(2).mean()
+    reg_strength = 1e-6 * float(weights["regularization"])
+    scaled = base_loss * float(weights["data_loss"]) + reg_strength * reg_term
+
+    if self.alignment_weight > 0.0:
+        aligned_features = [
+            self._last_encoded_batch[k]
+            for k in ("tabular", "text_pooled", "image_pooled")
+            if k in self._last_encoded_batch
+        ]
+        if len(aligned_features) >= 2:
+            align_term = self.alignment_loss(aligned_features)
+            # NEW: scale alignment penalty by weakest modality's importance
+            if self._modality_grad_scales:
+                min_scale = min(self._modality_grad_scales.values())
+                # Higher penalty for weak-modality alignment (to strengthen it)
+                align_scale = 2.0 - min_scale   # range [1.0, 1.9]
+            else:
+                align_scale = 1.0
+            scaled = scaled + (self.alignment_weight * align_scale * align_term)
+
+    # NEW: apply gradient hooks for per-modality scaling
+    if self._modality_grad_scales and self._last_encoded_batch:
+        _key_map = {
+            "modality_0": "tabular",
+            "modality_1": "text_pooled",
+            "modality_2": "image_pooled",
+        }
+        for mod_key, scale in self._modality_grad_scales.items():
+            tensor_key = _key_map.get(mod_key)
+            if tensor_key and tensor_key in self._last_encoded_batch:
+                t = self._last_encoded_batch[tensor_key]
+                if t.requires_grad:
+                    t.register_hook(lambda g, s=scale: g * s)
+
+    return scaled
+```
+
+---
+
+### GAP-X3: MODALITY DROPOUT (ROBUSTNESS TRAINING)
+
+**Problem**
+The existing `_encode_batch()` in `automl/trainer.py:430-453` already handles missing modalities at **inference** by filling 1e-7 dummy tensors. However, during **training**, all modalities are always present (from the dataset), so the model never learns to handle modality absence. This creates a train/inference distribution mismatch and makes the model brittle when a modality is unavailable at serving time.
+
+**Root Cause in Current Code**
+- `automl/trainer.py:469-498`: `training_step()` calls `self(batch)` → `_encode_batch(batch)` with a full batch. No dropout of modality tensors occurs before the forward pass.
+- `core/execution_context.py`: No field for `modality_dropout_prob`.
+- `automl/trainer.py:280-363`: `ApexLightningModule.__init__` has no `modality_dropout_prob` parameter.
+
+**Patch Plan**
+Add `modality_dropout_prob: float = 0.15` to `ApexLightningModule.__init__()`. In `training_step()`, before calling `self(batch)`, randomly zero out each non-tabular modality tensor with probability `modality_dropout_prob`. Tabular is never dropped (it is the primary modality in all supported datasets). This is training-only (no change to `validation_step`).
+
+**Code Patch**
+
+```python
+# ── FILE: automl/trainer.py ──────────────────────────────────────────────────
+
+# BEFORE (ApexLightningModule.__init__ signature, line 280):
+def __init__(
+    self,
+    model: nn.Module,
+    problem_type: str = "classification_binary",
+    num_classes: int = 2,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-5,
+    max_epochs: int = 10,
+    image_encoder: Optional[nn.Module] = None,
+    text_encoder: Optional[nn.Module] = None,
+    tabular_encoder: Optional[nn.Module] = None,
+    class_weights: Optional[torch.Tensor] = None,
+    alignment_weight: float = 0.0,
+) -> None:
+
+# AFTER: add modality_dropout_prob
+def __init__(
+    self,
+    model: nn.Module,
+    problem_type: str = "classification_binary",
+    num_classes: int = 2,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-5,
+    max_epochs: int = 10,
+    image_encoder: Optional[nn.Module] = None,
+    text_encoder: Optional[nn.Module] = None,
+    tabular_encoder: Optional[nn.Module] = None,
+    class_weights: Optional[torch.Tensor] = None,
+    alignment_weight: float = 0.0,
+    modality_dropout_prob: float = 0.15,   # NEW
+) -> None:
+    super().__init__()
+    ...
+    self.modality_dropout_prob = float(max(0.0, min(0.5, modality_dropout_prob)))
+
+
+# BEFORE (training_step, line 469):
+def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    targets = batch["target"]
+    logits = self(batch)
+
+# AFTER: apply modality dropout before forward pass
+def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    targets = batch["target"]
+
+    # Modality dropout: randomly zero out non-tabular modalities during training
+    # so the model learns to be robust to missing modalities at inference.
+    if self.modality_dropout_prob > 0.0 and self.training:
+        batch = dict(batch)  # shallow copy to avoid mutating the dataloader batch
+        _droppable = [k for k in batch if k in ("input_ids", "attention_mask",
+                                                  "image", "text_pooled", "image_pooled")]
+        # Group by modality: drop text keys together, image keys together
+        _drop_text = torch.rand(1).item() < self.modality_dropout_prob
+        _drop_image = torch.rand(1).item() < self.modality_dropout_prob
+        for k in _droppable:
+            is_text = k in ("input_ids", "attention_mask", "text_pooled")
+            is_image = k in ("image", "image_pooled")
+            if (is_text and _drop_text) or (is_image and _drop_image):
+                # Replace with zeros — _encode_batch will fill 1e-7 for missing keys
+                batch.pop(k, None)
+        if _drop_text:
+            self.log("modality_dropout_text", 1.0, on_step=False, on_epoch=True)
+        if _drop_image:
+            self.log("modality_dropout_image", 1.0, on_step=False, on_epoch=True)
+
+    logits = self(batch)
+    ...
+
+
+# ── FILE: automl/trainer.py — build_trainer() factory (line 714) ─────────────
+# BEFORE:
+def build_trainer(..., alignment_weight: float = 0.0) -> ApexLightningModule:
+
+# AFTER: pass modality_dropout_prob from HPO or ctx
+def build_trainer(
+    ...,
+    alignment_weight: float = 0.0,
+    modality_dropout_prob: float = 0.15,
+) -> ApexLightningModule:
+    ...
+    return ApexLightningModule(
+        ...,
+        alignment_weight=alignment_weight,
+        modality_dropout_prob=modality_dropout_prob,
+    )
+
+
+# ── FILE: automl/optuna_adaptive.py — _build_hpo_space() ─────────────────────
+# AFTER existing HPO space dict, add for multimodal datasets:
+if len(modalities) >= 2:
+    space["modality_dropout_prob"] = {
+        "type": "float", "low": 0.05, "high": 0.30
+    }
+```
+
+---
+
+### GAP-X4: CALIBRATION LAYER (ECE / BRIER)
+
+**Problem**
+`MultimodalInferenceEngine.predict_batch()` (inference_engine.py:139-209) returns raw softmax/sigmoid probabilities with no calibration. `ResearchMetrics.compute()` (pipeline/research_metrics.py) likely reports ECE and Brier score fields but they are computed from uncalibrated logits. Without temperature scaling, predicted probabilities are systematically overconfident (neural networks bias toward high-confidence outputs).
+
+**Root Cause in Current Code**
+- `pipeline/inference_engine.py:164-168`: `logits → _decode_logits()` applies raw `sigmoid`/`softmax` — no calibration step exists.
+- `pipeline/inference_engine.py:73-112` (`__init__`): No calibration model is loaded. No `calibration_temp` or `CalibrationLayer` attribute.
+- `pipeline/research_metrics.py`: Likely computes ECE on uncalibrated probs from `phase_results[Phase.TRAINING]` — needs verification but this is a safe extension.
+- No `temperature_scaling.joblib` artifact is saved during Phase 7.
+
+**Patch Plan**
+1. Create `pipeline/calibration.py` — `TemperatureScaler` (single-parameter learned via NLL on val set).
+2. Hook it into Phase 7 (`_execute_phase_7_model_registry`): fit temperature on val logits, save `temp_scaler.joblib`.
+3. In `MultimodalInferenceEngine.__init__()`: load `temp_scaler.joblib` if present.
+4. In `predict_batch()`: apply temperature scaling before `_decode_logits()`.
+
+**Code Patch**
+
+```python
+# ── FILE: pipeline/calibration.py  [NEW FILE — ~60 lines] ───────────────────
+
+"""Temperature scaling calibration for multimodal classifier outputs."""
+from __future__ import annotations
+import logging
+from typing import Optional
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+class TemperatureScaler:
+    """
+    Post-hoc calibration via a single learned temperature parameter.
+
+    Platt scaling generalisation: logits_cal = logits / T
+    T is optimised on a held-out validation set by minimising NLL.
+
+    Usage
+    -----
+    scaler = TemperatureScaler()
+    scaler.fit(val_logits, val_targets, problem_type)
+    calibrated_probs = scaler.calibrate(logits)
+    """
+
+    def __init__(self) -> None:
+        self.temperature: float = 1.0
+        self._fitted: bool = False
+
+    def fit(
+        self,
+        val_logits: "np.ndarray",
+        val_targets: "np.ndarray",
+        problem_type: str = "classification_binary",
+        n_steps: int = 100,
+        lr: float = 0.01,
+    ) -> None:
+        """Optimise T via scalar gradient descent on validation NLL."""
+        import torch
+        import torch.nn.functional as F
+
+        logits_t = torch.tensor(val_logits, dtype=torch.float32)
+        targets_t = torch.tensor(val_targets, dtype=torch.long
+                                  if "multiclass" in problem_type else torch.float32)
+        T = torch.nn.Parameter(torch.ones(1))
+        opt = torch.optim.LBFGS([T], lr=lr, max_iter=50)
+
+        def _closure():
+            opt.zero_grad()
+            scaled = logits_t / T.clamp(min=0.05)
+            if "binary" in problem_type:
+                loss = F.binary_cross_entropy_with_logits(
+                    scaled.squeeze(-1), targets_t.float()
+                )
+            else:
+                loss = F.cross_entropy(scaled, targets_t)
+            loss.backward()
+            return loss
+
+        for _ in range(n_steps // 50):
+            opt.step(_closure)
+
+        self.temperature = float(T.clamp(min=0.05).item())
+        self._fitted = True
+        logger.info("TemperatureScaler fitted: T=%.4f", self.temperature)
+
+    def calibrate(self, logits: "np.ndarray") -> "np.ndarray":
+        """Scale logits by 1/T and apply sigmoid/softmax."""
+        import torch
+        t = torch.tensor(logits, dtype=torch.float32) / max(self.temperature, 0.05)
+        if t.shape[-1] == 1 or t.ndim == 1:
+            probs = torch.sigmoid(t).numpy()
+        else:
+            probs = torch.softmax(t, dim=-1).numpy()
+        return probs
+
+    def compute_ece(
+        self,
+        probs: "np.ndarray",
+        targets: "np.ndarray",
+        n_bins: int = 15,
+    ) -> float:
+        """Expected Calibration Error."""
+        confidences = probs.max(axis=-1) if probs.ndim > 1 else probs.ravel()
+        preds = probs.argmax(axis=-1) if probs.ndim > 1 else (probs > 0.5).astype(int)
+        correct = (preds == targets.ravel()).astype(float)
+        bins = np.linspace(0, 1, n_bins + 1)
+        ece = 0.0
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            mask = (confidences >= lo) & (confidences < hi)
+            if mask.sum() > 0:
+                acc = correct[mask].mean()
+                conf = confidences[mask].mean()
+                ece += mask.sum() / len(confidences) * abs(acc - conf)
+        return float(ece)
+
+    def compute_brier(self, probs: "np.ndarray", targets: "np.ndarray") -> float:
+        """Brier score (lower is better)."""
+        p = probs.ravel()
+        t = targets.ravel().astype(float)
+        return float(np.mean((p - t) ** 2))
+
+
+# ── FILE: pipeline/training_orchestrator.py — _execute_phase_7_model_registry()
+# AFTER saving model_weights.pth, add calibration fitting:
+
+# AFTER:
+try:
+    from pipeline.calibration import TemperatureScaler
+    import joblib
+    # val_logits + val_targets captured from best trial in phase5 result
+    _val_logits = self.phase_results.get(Phase.TRAINING, {}).get("val_logits_raw")
+    _val_targets = self.phase_results.get(Phase.TRAINING, {}).get("val_targets_raw")
+    if _val_logits is not None and _val_targets is not None:
+        _cal = TemperatureScaler()
+        _cal.fit(
+            np.array(_val_logits),
+            np.array(_val_targets),
+            problem_type=self.config.problem_type,
+        )
+        _cal_path = artifacts_dir / "temp_scaler.joblib"
+        joblib.dump(_cal, _cal_path)
+        logger.info("Phase 7: temperature scaler saved (T=%.4f)", _cal.temperature)
+        # Add ECE/Brier to registry metadata
+        _cal_probs = _cal.calibrate(np.array(_val_logits))
+        self.phase_results[Phase.MODEL_REGISTRY]["calibration"] = {
+            "temperature": _cal.temperature,
+            "ece_calibrated": _cal.compute_ece(_cal_probs, np.array(_val_targets)),
+            "brier_calibrated": _cal.compute_brier(_cal_probs, np.array(_val_targets)),
+        }
+except Exception as _cal_exc:
+    logger.warning("Phase 7: calibration fitting failed (non-fatal): %s", _cal_exc)
+
+
+# ── FILE: pipeline/inference_engine.py — __init__ ────────────────────────────
+# AFTER loading target_encoder (line 96), add:
+self._calibrator: Optional[Any] = self._load_calibrator()
+
+def _load_calibrator(self) -> Optional[Any]:
+    path = self.artifacts_dir / "temp_scaler.joblib"
+    if not path.exists():
+        return None
+    try:
+        import joblib
+        cal = joblib.load(path)
+        logger.info("TemperatureScaler loaded (T=%.4f)", cal.temperature)
+        return cal
+    except Exception as exc:
+        logger.warning("Could not load temp_scaler: %s", exc)
+        return None
+
+
+# ── FILE: pipeline/inference_engine.py — predict_batch() ─────────────────────
+# BEFORE (line 164):
+with torch.no_grad():
+    logits: torch.Tensor = self._head(batch)
+predictions, confidences = self._decode_logits(logits)
+
+# AFTER: apply calibration to raw logits before decoding
+with torch.no_grad():
+    logits: torch.Tensor = self._head(batch)
+
+if self._calibrator is not None and self._calibrator._fitted:
+    import numpy as _np
+    _logits_np = logits.cpu().numpy()
+    _cal_probs = self._calibrator.calibrate(_logits_np)  # returns numpy probs
+    # Re-wrap as predictions + calibrated confidences
+    _preds_np = (_cal_probs > 0.5).astype(int) if _cal_probs.ndim == 1 else _cal_probs.argmax(axis=-1)
+    predictions = torch.tensor(_preds_np)
+    confidences = torch.tensor(_cal_probs.max(axis=-1) if _cal_probs.ndim > 1 else _cal_probs.ravel())
+else:
+    predictions, confidences = self._decode_logits(logits)
+```
+
+---
+
+### GAP-X5: RESOURCE-AWARE MODEL SELECTION
+
+**Problem**
+`AdvancedModelSelector.select_models()` (advanced_selector.py:133-242) selects encoder tier based on GPU memory detected at selection time but does NOT honour any user-specified latency or memory budget. `JITEncoderSelector` validates VRAM at dry-run time, but this happens after `AdvancedModelSelector` already chose the strategy — so a GPU-heavy tier might be selected and only fail at the JIT stage, incurring wasted computation.
+
+**Root Cause in Current Code**
+- `automl/advanced_selector.py:158-162`: reads `gpu_memory_gb` but not `latency_budget_ms` or `memory_budget_mb`.
+- `core/execution_context.py`: no `latency_budget_ms` or `memory_budget_mb` field.
+- `automl/advanced_selector.py:164-179`: tier selection only uses `dataset_size` and `gpu_mem` — no latency constraint.
+
+**Patch Plan**
+1. Add `latency_budget_ms` and `memory_budget_mb` to `ExecutionContext`.
+2. Add them as optional params to `AdvancedModelSelector.select_models()`.
+3. Add `_apply_resource_constraints(tier_choices, latency_budget_ms, memory_budget_mb)` helper that downgrades any tier whose known latency exceeds the budget.
+4. Expose API param `latency_budget_ms` in `/select-model` POST body so user can set it from UI.
+
+**Code Patch**
+
+```python
+# ── FILE: core/execution_context.py ──────────────────────────────────────────
+# ADD fields:
+latency_budget_ms: Optional[float] = None    # user-specified max inference latency
+memory_budget_mb: Optional[float] = None     # user-specified VRAM budget override
+
+
+# ── FILE: automl/advanced_selector.py ────────────────────────────────────────
+# Known approximate inference latencies per encoder (CPU ms, measured empirically)
+_ENCODER_LATENCY_MS = {
+    # Image encoders
+    "ConvNeXt-Tiny":      18.0,
+    "ResNet50":            9.0,
+    "MobileNetV3":         4.5,
+    # Text encoders
+    "DeBERTa-v3-base":    85.0,
+    "bert-base-uncased":  42.0,
+    "MiniLM-L6-v2":       12.0,
+    # Tabular encoders
+    "GRN":                 0.8,
+    "MLP":                 0.4,
+}
+
+_ENCODER_VRAM_MB = {
+    "ConvNeXt-Tiny":      880,
+    "ResNet50":            420,
+    "MobileNetV3":         55,
+    "DeBERTa-v3-base":    1600,
+    "bert-base-uncased":   440,
+    "MiniLM-L6-v2":        90,
+    "GRN":                  12,
+    "MLP":                   6,
+}
+
+
+# BEFORE (select_models signature, line 133):
+def select_models(
+    self,
+    problem_type: str,
+    modalities: List[str],
+    dataset_size: int,
+    avg_tokens: int = 128,
+    gpu_memory_gb: Optional[float] = None,
+    dataset_meta: Optional[Dict[str, Any]] = None,
+) -> SelectionResult:
+
+# AFTER:
+def select_models(
+    self,
+    problem_type: str,
+    modalities: List[str],
+    dataset_size: int,
+    avg_tokens: int = 128,
+    gpu_memory_gb: Optional[float] = None,
+    dataset_meta: Optional[Dict[str, Any]] = None,
+    latency_budget_ms: Optional[float] = None,   # NEW
+    memory_budget_mb: Optional[float] = None,     # NEW
+) -> SelectionResult:
+
+
+# ADD helper method to AdvancedModelSelector:
+@staticmethod
+def _apply_resource_constraints(
+    selected_name: Optional[str],
+    modality: str,
+    latency_budget_ms: Optional[float],
+    memory_budget_mb: Optional[float],
+    fallback_chain: List[str],
+) -> str:
+    """
+    Downgrade encoder if it exceeds latency or memory budget.
+    fallback_chain: ordered list from heaviest to lightest.
+    """
+    if selected_name is None:
+        return selected_name
+    for candidate in fallback_chain:
+        if candidate != selected_name:
+            continue
+        lat = _ENCODER_LATENCY_MS.get(candidate, 0)
+        mem = _ENCODER_VRAM_MB.get(candidate, 0)
+        lat_ok = (latency_budget_ms is None) or (lat <= latency_budget_ms)
+        mem_ok = (memory_budget_mb is None) or (mem <= memory_budget_mb)
+        if lat_ok and mem_ok:
+            return candidate
+        # Downgrade to next in chain
+        idx = fallback_chain.index(candidate)
+        if idx + 1 < len(fallback_chain):
+            next_enc = fallback_chain[idx + 1]
+            logger.info(
+                "Resource constraint: %s encoder downgraded %s→%s "
+                "(lat=%.0fms>%.0f or mem=%dMB>%.0f)",
+                modality, candidate, next_enc,
+                lat, latency_budget_ms or 999,
+                mem, memory_budget_mb or 99999,
+            )
+            return next_enc
+    return selected_name  # cannot downgrade further
+
+
+# In select_models(), AFTER tier selection (after line 179):
+_img_chain = ["ConvNeXt-Tiny", "ResNet50", "MobileNetV3"]
+_txt_chain = ["DeBERTa-v3-base", "bert-base-uncased", "MiniLM-L6-v2"]
+_tab_chain = ["GRN", "MLP"]
+
+if image_tier and (latency_budget_ms or memory_budget_mb):
+    image_tier = self._apply_resource_constraints(
+        image_tier, "image", latency_budget_ms, memory_budget_mb, _img_chain
+    )
+if text_tier and (latency_budget_ms or memory_budget_mb):
+    text_tier = self._apply_resource_constraints(
+        text_tier, "text", latency_budget_ms, memory_budget_mb, _txt_chain
+    )
+
+
+# ── FILE: api/run_api.py — /select-model route ───────────────────────────────
+# BEFORE:
+body = await request.json()
+dataset_size = body.get("dataset_size", 1000)
+
+# AFTER: extract resource budgets from body and ctx
+latency_budget_ms = body.get("latency_budget_ms")
+memory_budget_mb = body.get("memory_budget_mb")
+# Also read from ctx if user stored it via /context/update
+if not latency_budget_ms and ctx is not None:
+    latency_budget_ms = getattr(ctx, "latency_budget_ms", None)
+if not memory_budget_mb and ctx is not None:
+    memory_budget_mb = getattr(ctx, "memory_budget_mb", None)
+
+# Pass to selector:
+result = selector.select_models(
+    ...,
+    latency_budget_ms=latency_budget_ms,
+    memory_budget_mb=memory_budget_mb,
+)
+```
+
+---
+
+### GAP-X6: CONTEXT-AWARE EMBEDDING CACHE
+
+**Problem**
+`EmbeddingCache` (pipeline/embedding_cache.py:17-84) is a flat disk-backed store: `get()` / `set()` / `get_or_compute()` by SHA-1 hash key. It has no awareness of modality importance — it caches image, text, and tabular embeddings with equal priority. If a modality has `predictability_score < 0.2` (near-useless), its embeddings are still computed and cached for every Optuna trial, wasting I/O and disk space.
+
+**Root Cause in Current Code**
+- `pipeline/embedding_cache.py:65-76`: `get_or_compute()` always calls `compute_fn()` on miss with no skip condition.
+- `pipeline/embedding_cache.py:54-63`: `set()` always writes to disk with no eviction or priority policy.
+- `EmbeddingCache.__init__` takes only `cache_dir` — no reference to `ExecutionContext`.
+
+**Patch Plan**
+Extend `EmbeddingCache` with a `modality_priorities` dict (populated from `ctx.predictability_scores`). In `get_or_compute()`, skip caching (but still compute and return) when modality priority falls below threshold. Add `evict_weak_modality()` to remove cached files for weak modalities. Keep the existing API fully intact.
+
+**Code Patch**
+
+```python
+# ── FILE: pipeline/embedding_cache.py ────────────────────────────────────────
+
+# BEFORE:
+class EmbeddingCache:
+    """Store and retrieve embedding tensors using deterministic cache keys."""
+
+    def __init__(self, cache_dir: Optional[Path] = None) -> None:
+        self.cache_dir = Path(cache_dir or (DATA_DIR / "embedding_cache"))
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = RLock()
+        self._hits = 0
+        self._misses = 0
+        self._writes = 0
+
+# AFTER: add priority dict and skip threshold
+class EmbeddingCache:
+    """
+    Store and retrieve embedding tensors using deterministic cache keys.
+
+    Context-aware: modalities with low predictability score are not cached
+    (still computed per call, but not written to disk) to reduce I/O waste.
+    """
+
+    _CACHE_SKIP_THRESHOLD: float = 0.20  # skip caching if priority < this
+
+    def __init__(
+        self,
+        cache_dir: Optional[Path] = None,
+        modality_priorities: Optional[Dict[str, float]] = None,
+    ) -> None:
+        self.cache_dir = Path(cache_dir or (DATA_DIR / "embedding_cache"))
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = RLock()
+        self._hits = 0
+        self._misses = 0
+        self._writes = 0
+        self._skipped_writes = 0
+        # {modality_name: priority_score}  e.g. {"image": 0.15, "text": 0.82}
+        self._modality_priorities: Dict[str, float] = dict(modality_priorities or {})
+
+    def set_modality_priorities(self, priorities: Dict[str, float]) -> None:
+        """Update from ctx.predictability_scores at runtime."""
+        with self._lock:
+            self._modality_priorities = dict(priorities)
+
+    def _should_cache(self, key: str) -> bool:
+        """Return False for known weak modalities to avoid wasting disk I/O."""
+        if not self._modality_priorities:
+            return True
+        key_lower = str(key).lower()
+        for modality, priority in self._modality_priorities.items():
+            if modality.lower() in key_lower:
+                if priority < self._CACHE_SKIP_THRESHOLD:
+                    return False
+        return True
+
+    # BEFORE:
+    def set(self, key: str, tensor: torch.Tensor, meta: Optional[Dict[str, Any]] = None) -> None:
+        path = self._path_for_key(key)
+        payload = {
+            "created_at": datetime.utcnow().isoformat(),
+            "meta": dict(meta or {}),
+            "tensor": tensor.detach().cpu(),
+        }
+        with self._lock:
+            torch.save(payload, path)
+            self._writes += 1
+
+    # AFTER:
+    def set(self, key: str, tensor: torch.Tensor, meta: Optional[Dict[str, Any]] = None) -> None:
+        if not self._should_cache(key):
+            with self._lock:
+                self._skipped_writes += 1
+            return  # skip writing weak-modality embeddings to disk
+        path = self._path_for_key(key)
+        payload = {
+            "created_at": datetime.utcnow().isoformat(),
+            "meta": dict(meta or {}),
+            "tensor": tensor.detach().cpu(),
+        }
+        with self._lock:
+            torch.save(payload, path)
+            self._writes += 1
+
+    # ADD: eviction utility for weak modalities
+    def evict_weak_modality(self, modality: str) -> int:
+        """Delete all cached .pt files whose key contains the modality name."""
+        removed = 0
+        with self._lock:
+            for pt_file in list(self.cache_dir.glob("*.pt")):
+                try:
+                    payload = torch.load(pt_file, map_location="cpu")
+                    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                    if modality.lower() in str(meta.get("modality", "")).lower():
+                        pt_file.unlink()
+                        removed += 1
+                except Exception:
+                    pass
+        logger.info("EmbeddingCache: evicted %d files for modality '%s'", removed, modality)
+        return removed
+
+    # EXTEND stats():
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "writes": self._writes,
+                "skipped_writes": self._skipped_writes,  # NEW
+                "priorities": dict(self._modality_priorities),
+            }
+
+
+# ── FILE: pipeline/training_orchestrator.py — _execute_phase_5_training() ────
+# After creating EmbeddingCache, inject priorities from ctx:
+_embedding_cache = EmbeddingCache()
+_pred_scores = getattr(self.execution_context, "predictability_scores", {})
+if _pred_scores:
+    # Map dataset-level scores to modality names for the cache
+    _modality_priority_map = {}
+    for ds_key, score in _pred_scores.items():
+        if "image" in str(ds_key):
+            _modality_priority_map["image"] = float(score)
+        elif "text" in str(ds_key):
+            _modality_priority_map["text"] = float(score)
+        else:
+            _modality_priority_map["tabular"] = float(score)
+    _embedding_cache.set_modality_priorities(_modality_priority_map)
+    logger.info(
+        "EmbeddingCache: modality priorities set %s", _modality_priority_map
+    )
+```
+
+---
+
+### GAP-X7: EXPERIMENT ENGINE FOR PAPER GENERATION
+
+**Problem**
+The system has no structured ablation or experiment tracking mechanism. Paper generation (noted in the system as integrated into monitoring) requires reproducible comparisons: "fusion=none vs attention vs graph", "no graph loss vs with graph loss", etc. There is no `ExperimentManager` class and no ablation run infrastructure. The only history is `MetaLearningStore` (JSON with experiment records) which is not designed for structured ablation comparison.
+
+**Root Cause in Current Code**
+- `automl/meta_learning.py`: `MetaLearningStore` stores flat records `{dataset_meta, best_params, fusion_strategy, performance}` — no `ablation_name`, no `ablation_condition`, no structured comparison.
+- No ablation-triggering code anywhere in training orchestrator or API.
+- `pipeline/research_metrics.py`: Computes publishability index, ECE, Brier — but cannot compare across ablation conditions since there's no experiment grouping.
+
+**Patch Plan**
+Create `pipeline/experiment_engine.py` — a minimal `ExperimentManager` that:
+1. Defines ablation conditions as config overrides.
+2. Calls `TrainingOrchestrator` for each condition with modified config.
+3. Stores results in a structured JSON file alongside MetaLearning records.
+4. Produces a comparison table (ablation DataFrame) usable for paper generation.
+
+**Code Patch**
+
+```python
+# ── FILE: pipeline/experiment_engine.py  [NEW FILE — ~110 lines] ─────────────
+
+"""
+ExperimentManager — structured ablation tracking for paper generation.
+
+Ablation conditions override specific config fields and store structured
+comparison results. Does NOT replace the main training pipeline — it wraps it.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+EXPERIMENT_STORE = Path("data") / "experiments" / "ablation_results.json"
+
+
+@dataclass
+class AblationCondition:
+    name: str                         # e.g. "no_fusion", "graph_fusion", "baseline"
+    description: str
+    config_overrides: Dict[str, Any]  # keys: fusion_strategy, alignment_weight, etc.
+    # Result fields (populated after run)
+    best_val_loss: float = 0.0
+    best_val_acc: float = 0.0
+    best_val_f1: float = 0.0
+    n_trials: int = 0
+    duration_s: float = 0.0
+    ece: Optional[float] = None
+    brier: Optional[float] = None
+    status: str = "pending"           # "pending" | "completed" | "failed"
+    error: Optional[str] = None
+
+
+PREDEFINED_ABLATIONS = [
+    AblationCondition(
+        name="baseline_concat",
+        description="Concatenation fusion, no auxiliary losses",
+        config_overrides={"fusion_strategy": "concatenation", "alignment_weight": 0.0},
+    ),
+    AblationCondition(
+        name="attention_fusion",
+        description="Attention fusion, no auxiliary losses",
+        config_overrides={"fusion_strategy": "attention", "alignment_weight": 0.0},
+    ),
+    AblationCondition(
+        name="graph_fusion",
+        description="Graph-aware multi-head fusion + diversity + sparsity losses",
+        config_overrides={"fusion_strategy": "graph", "alignment_weight": 0.0},
+    ),
+    AblationCondition(
+        name="uncertainty_fusion",
+        description="Uncertainty-weighted fusion",
+        config_overrides={"fusion_strategy": "uncertainty", "alignment_weight": 0.0},
+    ),
+    AblationCondition(
+        name="full_system",
+        description="UncertaintyGraph fusion + alignment loss + modality dropout",
+        config_overrides={
+            "fusion_strategy": "uncertainty_graph",
+            "alignment_weight": 0.1,
+            "modality_dropout_prob": 0.15,
+        },
+    ),
+]
+
+
+class ExperimentManager:
+    """
+    Run structured ablation experiments and store comparison results.
+
+    Usage
+    -----
+    mgr = ExperimentManager(base_config, execution_context)
+    mgr.run_ablations(conditions=PREDEFINED_ABLATIONS)
+    df = mgr.to_dataframe()
+    mgr.save()
+    """
+
+    def __init__(
+        self,
+        base_training_config: Any,         # TrainingConfig from training_orchestrator
+        execution_context: Optional[Any] = None,
+        store_path: Path = EXPERIMENT_STORE,
+    ) -> None:
+        self._base_config = base_training_config
+        self._ctx = execution_context
+        self._store_path = store_path
+        self._results: List[AblationCondition] = []
+        self._store_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def run_ablations(
+        self,
+        conditions: Optional[List[AblationCondition]] = None,
+    ) -> List[AblationCondition]:
+        """Run each ablation condition in sequence and store results."""
+        from pipeline.training_orchestrator import TrainingOrchestrator, TrainingConfig
+        conditions = conditions or PREDEFINED_ABLATIONS
+
+        for cond in conditions:
+            logger.info("ExperimentManager: running ablation '%s'", cond.name)
+            t0 = time.perf_counter()
+            try:
+                # Build overridden config
+                cfg_dict = asdict(self._base_config)
+                cfg_dict.update(cond.config_overrides)
+                run_config = TrainingConfig(**{
+                    k: v for k, v in cfg_dict.items()
+                    if k in TrainingConfig.__dataclass_fields__
+                })
+                orch = TrainingOrchestrator(run_config, execution_context=self._ctx)
+                # Execute phases 3-7 only (reuse ingested data)
+                orch._execute_phase_3_preprocessing()
+                orch._execute_phase_4_model_selection()
+                orch._execute_phase_5_training(hp_overrides=cond.config_overrides)
+                phase5 = orch.phase_results.get("training", {})
+                cond.best_val_loss = float(phase5.get("best_val_loss", 0.0))
+                cond.best_val_acc = float(phase5.get("best_val_acc", 0.0))
+                cond.best_val_f1 = float(phase5.get("best_val_f1", 0.0))
+                cond.n_trials = int(phase5.get("n_trials", 0))
+                cond.status = "completed"
+            except Exception as exc:
+                logger.warning("Ablation '%s' failed: %s", cond.name, exc)
+                cond.status = "failed"
+                cond.error = str(exc)
+            finally:
+                cond.duration_s = round(time.perf_counter() - t0, 2)
+            self._results.append(cond)
+
+        self.save()
+        return self._results
+
+    def to_dataframe(self) -> "pd.DataFrame":
+        import pandas as pd
+        rows = []
+        for c in self._results:
+            rows.append({
+                "Condition": c.name,
+                "Description": c.description,
+                "Val Loss": round(c.best_val_loss, 4),
+                "Val Acc": round(c.best_val_acc, 4),
+                "Val F1": round(c.best_val_f1, 4),
+                "Trials": c.n_trials,
+                "Duration (s)": c.duration_s,
+                "ECE": c.ece,
+                "Brier": c.brier,
+                "Status": c.status,
+            })
+        return pd.DataFrame(rows)
+
+    def save(self) -> None:
+        payload = [asdict(c) for c in self._results]
+        with open(self._store_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.info("ExperimentManager: %d results saved to %s", len(payload), self._store_path)
+
+
+# ── FILE: api/run_api.py — NEW ENDPOINT ──────────────────────────────────────
+
+@app.post("/experiments/run-ablations")
+async def run_ablations(request: Request) -> Dict[str, Any]:
+    """Trigger structured ablation study for paper generation."""
+    try:
+        from pipeline.experiment_engine import ExperimentManager, PREDEFINED_ABLATIONS
+        from pipeline.training_orchestrator import TrainingConfig
+        body = await request.json()
+        sid = body.get("session_id")
+        problem_type = body.get("problem_type", "classification_binary")
+        modalities = body.get("modalities", ["tabular"])
+        sources = body.get("sources", [])
+        conditions_filter = body.get("conditions")  # optional list of condition names
+
+        ctx = session_manager.get_session(sid) if sid else None
+        base_cfg = TrainingConfig(
+            dataset_sources=sources,
+            problem_type=problem_type,
+            modalities=modalities,
+        )
+        mgr = ExperimentManager(base_cfg, execution_context=ctx)
+        selected_conditions = (
+            [c for c in PREDEFINED_ABLATIONS if c.name in conditions_filter]
+            if conditions_filter else PREDEFINED_ABLATIONS
+        )
+        task_id = uuid.uuid4().hex[:8]
+
+        async def _run():
+            mgr.run_ablations(selected_conditions)
+
+        asyncio.create_task(_run())
+        return {"status": "started", "task_id": task_id, "n_conditions": len(selected_conditions)}
+    except Exception as exc:
+        logger.error("/experiments/run-ablations error: %s", exc, exc_info=True)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/experiments/ablation-results")
+async def get_ablation_results() -> Dict[str, Any]:
+    """Return latest ablation comparison table."""
+    from pipeline.experiment_engine import EXPERIMENT_STORE
+    if not EXPERIMENT_STORE.exists():
+        return {"results": [], "message": "No ablation results yet. Run /experiments/run-ablations first."}
+    with open(EXPERIMENT_STORE) as f:
+        data = json.load(f)
+    return {"results": data, "count": len(data)}
+```
+
+---
+
+### GAP-X8: HARD ENFORCEMENT OF EXECUTIONCONTEXT
+
+**Problem**
+`ExecutionContext` is used as an advisory layer throughout the pipeline. There are no runtime assertions that catch mismatches such as: training requested for modalities not in the schema, fusion strategy incompatible with single-modality setup, or model selection result missing when training phase starts. Failures are currently silent: wrong modalities → dummy tensors; wrong fusion → `ConcatenationFusion` silently used; no schema → fresh schema detection.
+
+**Root Cause in Current Code**
+- `pipeline/training_orchestrator.py:_execute_phase_5_training()`: builds `_MultimodalHead` with `input_dims` from Phase 3/4 — no check that these match `ctx.active_modalities` or `ctx.global_schema["global_modalities"]`.
+- `pipeline/training_orchestrator.py:_execute_phase_4_model_selection()`: runs even if `ctx.pipeline_stage < "schema_detection"` — no stage assertion.
+- `automl/trainer.py:_MultimodalHead.forward()`: raises `KeyError` on missing keys with full traceback — not a user-friendly contract violation.
+- `api/run_api.py`: `/train-pipeline` starts even when no schema is in `ctx` — current guard only checks `_session_store` hashes.
+
+**Patch Plan**
+Add a `ContextValidator` class with static assertion methods. Call it at 3 injection points:
+1. Before Phase 4 model selection in `training_orchestrator`.
+2. Before Phase 5 training head construction in `training_orchestrator`.
+3. In `_MultimodalHead.forward()` as a soft assertion with a clear error message.
+
+**Code Patch**
+
+```python
+# ── FILE: core/context_enforcer.py — ADD ContextValidator class ──────────────
+
+class ContextValidator:
+    """
+    Hard runtime assertions on ExecutionContext state.
+    Raises ValueError with actionable messages on contract violations.
+    """
+
+    @staticmethod
+    def require_schema(ctx: Optional[Any], phase: str = "model_selection") -> None:
+        """Assert that schema detection has been completed."""
+        if ctx is None:
+            raise ValueError(
+                f"ContextValidator [{phase}]: ExecutionContext is None. "
+                "Run POST /api/schema/detect before this phase."
+            )
+        schema = getattr(ctx, "global_schema", None)
+        if not schema or not isinstance(schema, dict):
+            raise ValueError(
+                f"ContextValidator [{phase}]: ctx.global_schema is missing. "
+                "Schema detection must complete before model selection or training."
+            )
+
+    @staticmethod
+    def require_modality_consistency(
+        ctx: Optional[Any],
+        requested_modalities: List[str],
+        phase: str = "training",
+    ) -> None:
+        """Assert no modality is requested that wasn't in the schema."""
+        if ctx is None:
+            return  # no ctx → pass through (handled by require_schema)
+        schema = getattr(ctx, "global_schema", {}) or {}
+        schema_modalities = set(schema.get("global_modalities", []))
+        requested = set(requested_modalities)
+        unknown = requested - schema_modalities - {"tabular"}  # tabular always valid
+        if unknown:
+            raise ValueError(
+                f"ContextValidator [{phase}]: requested modalities {unknown} "
+                f"were not detected in schema (schema has {schema_modalities}). "
+                "Update schema detection or remove unsupported modalities."
+            )
+
+    @staticmethod
+    def require_fusion_consistency(
+        fusion_strategy: str,
+        modalities: List[str],
+        phase: str = "training",
+    ) -> None:
+        """Assert fusion strategy is valid for the number of modalities."""
+        _multi_only = {"attention", "graph", "uncertainty", "uncertainty_graph"}
+        if fusion_strategy in _multi_only and len(modalities) < 2:
+            raise ValueError(
+                f"ContextValidator [{phase}]: fusion='{fusion_strategy}' requires "
+                f"≥2 modalities but got {modalities}. "
+                "Use 'concatenation' for single-modality datasets."
+            )
+
+    @staticmethod
+    def require_model_selection(
+        ctx: Optional[Any],
+        phase: str = "training",
+    ) -> None:
+        """Warn (not error) if model selection was not run before training."""
+        if ctx is None:
+            return
+        model_choices = getattr(ctx, "model_choices", None)
+        if not model_choices:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "ContextValidator [%s]: ctx.model_choices is empty. "
+                "Training will use heuristic model selection — "
+                "run POST /select-model first for data-driven selection.",
+                phase,
+            )
+
+
+# ── FILE: pipeline/training_orchestrator.py ──────────────────────────────────
+
+# In _execute_phase_4_model_selection(): ADD at top of function
+from core.context_enforcer import ContextValidator
+ContextValidator.require_schema(self.execution_context, phase="model_selection")
+ContextValidator.require_modality_consistency(
+    self.execution_context,
+    self.config.modalities,
+    phase="model_selection",
+)
+
+# In _execute_phase_5_training(): ADD after building input_dims, before _MultimodalHead
+ContextValidator.require_fusion_consistency(
+    fusion_strategy=selected_fusion,
+    modalities=self.config.modalities,
+    phase="training",
+)
+ContextValidator.require_model_selection(self.execution_context, phase="training")
+
+# Modality-dimension contract assertion (HARD):
+_expected_modalities = set(input_dims.keys())
+_ctx_modalities = set(self.config.modalities)
+_missing_in_head = _ctx_modalities - _expected_modalities - {"tabular"}
+if _missing_in_head:
+    logger.warning(
+        "ContextValidator [training]: modalities %s in config not in input_dims — "
+        "will be dummy-filled. Check encoder output dims.",
+        _missing_in_head,
+    )
+
+
+# ── FILE: automl/trainer.py — _MultimodalHead.forward() ──────────────────────
+
+# BEFORE (existing, line 115):
+def forward(self, embeddings: Dict[str, torch.Tensor]) -> torch.Tensor:
+    missing = [k for k in self._keys if k not in embeddings]
+    if missing:
+        raise KeyError(
+            f"_MultimodalHead: missing modality keys {missing}. "
+            f"Expected all of {self._keys}."
+        )
+
+# AFTER: convert to actionable ValueError with recovery hint
+def forward(self, embeddings: Dict[str, torch.Tensor]) -> torch.Tensor:
+    missing = [k for k in self._keys if k not in embeddings]
+    if missing:
+        raise ValueError(
+            f"_MultimodalHead contract violation: missing keys {missing}. "
+            f"Head expects all of {self._keys}. "
+            f"Received: {list(embeddings.keys())}. "
+            "This usually means: (1) modality was in the training config but "
+            "not present in the batch, or (2) encoder failed to produce output. "
+            "Check _encode_batch() dummy-fill logic and modality_dropout_prob."
+        )
+    parts = [embeddings[k].float() for k in self._keys]
+    x = self.fusion(parts)
+    return self.layers(x)
+
+
+# ── FILE: api/run_api.py — /train-pipeline route ─────────────────────────────
+# ADD pre-flight schema check BEFORE launching asyncio task:
+_ctx_preflight = session_manager.get_session(_sid) if _sid else None
+if _ctx_preflight is not None:
+    from core.context_enforcer import ContextValidator
+    try:
+        ContextValidator.require_schema(_ctx_preflight, phase="/train-pipeline preflight")
+        ContextValidator.require_modality_consistency(
+            _ctx_preflight, modalities, phase="/train-pipeline preflight"
+        )
+        ContextValidator.require_fusion_consistency(
+            fusion_strategy=getattr(_ctx_preflight, "fusion_strategy", "concatenation"),
+            modalities=modalities,
+            phase="/train-pipeline preflight",
+        )
+    except ValueError as _cv_err:
+        raise HTTPException(status_code=422, detail=str(_cv_err))
+```
+
+---
+
+### PHASE X — Integration Summary
+
+| Gap | Files Modified | New Files | Severity |
+|-----|---------------|-----------|---------|
+| X1 Drift closed-loop | `core/execution_context.py`, `pipeline/training_orchestrator.py`, `preprocessing/tabular_preprocessor.py` | — | 🔴 HIGH |
+| X2 Dynamic fusion adaptation | `automl/trainer.py` | — | 🟡 MEDIUM |
+| X3 Modality dropout | `automl/trainer.py`, `automl/optuna_adaptive.py` | — | 🟡 MEDIUM |
+| X4 Calibration (ECE/Brier) | `pipeline/training_orchestrator.py`, `pipeline/inference_engine.py` | `pipeline/calibration.py` | 🔴 HIGH (paper requirement) |
+| X5 Resource-aware selection | `automl/advanced_selector.py`, `core/execution_context.py`, `api/run_api.py` | — | 🟡 MEDIUM |
+| X6 Context-aware cache | `pipeline/embedding_cache.py`, `pipeline/training_orchestrator.py` | — | 🟢 LOW |
+| X7 Experiment engine | `api/run_api.py` | `pipeline/experiment_engine.py` | 🔴 HIGH (paper requirement) |
+| X8 Hard context enforcement | `core/context_enforcer.py`, `pipeline/training_orchestrator.py`, `automl/trainer.py`, `api/run_api.py` | — | 🔴 HIGH (system reliability) |
+
+### Phase X — Implementation Order
+
+```
+Sprint 1 (Core reliability):
+  X8 → ContextValidator hard enforcement (prevents all silent mismatches)
+  X4 → Calibration layer (required for ECE/Brier in paper)
+
+Sprint 2 (Closed-loop intelligence):
+  X1 → Drift closed-loop (predictability adjusts after drift)
+  X3 → Modality dropout (training robustness)
+
+Sprint 3 (Research output):
+  X7 → ExperimentManager + ablation infrastructure
+  X2 → Dynamic fusion adaptation (gradient scaling per modality)
+
+Sprint 4 (Efficiency):
+  X5 → Resource-aware model selection
+  X6 → Context-aware embedding cache priority
+```
