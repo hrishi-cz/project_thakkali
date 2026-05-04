@@ -75,9 +75,9 @@ def model_info(model_id: str) -> str:
     return f"{API_BASE_URL}/model-info/{model_id}"
 
 
-def predict(model_id: str) -> str:
-    """Build ``/predict/{model_id}`` URL."""
-    return f"{API_BASE_URL}/predict/{model_id}"
+def predict() -> str:
+    """Build ``/predict`` URL.  Pass ``model_id`` in the request body, not the URL."""
+    return f"{API_BASE_URL}/predict"
 
 
 def registered_models(sid: str) -> str:
@@ -99,9 +99,14 @@ def context_phase_timings(sid: str) -> str:
     return f"{API_BASE_URL}/context/{sid}/phase-timings"
 
 
-def context_probe_sample(sid: str) -> str:
-    """Build ``/context/{sid}/probe-sample`` URL."""
+def context_probe_sample_save(sid: str) -> str:
+    """Build ``/context/{sid}/probe-sample`` URL (POST — persists a probe sample)."""
     return f"{API_BASE_URL}/context/{sid}/probe-sample"
+
+
+def context_probe_sample_status(sid: str) -> str:
+    """Build ``/context/{sid}/probe-sample/status`` URL (GET — check if sample exists)."""
+    return f"{API_BASE_URL}/context/{sid}/probe-sample/status"
 
 
 def decision_trace(sid: str) -> str:
@@ -159,6 +164,55 @@ CACHE_CLEAR = f"{API_BASE_URL}/cache/clear"
 CONFIG = f"{API_BASE_URL}/config"
 PREDICT_ASYNC = f"{API_BASE_URL}/predict-async"
 
+# ---------------------------------------------------------------------------
+# Previously missing static endpoints (added to fix audit gaps)
+# ---------------------------------------------------------------------------
+SESSIONS              = f"{API_BASE_URL}/v2/sessions"
+MONITOR               = f"{API_BASE_URL}/monitor"
+MONITOR_DRIFT         = f"{API_BASE_URL}/monitor/drift"
+SCHEMA_DETECT         = f"{API_BASE_URL}/api/schema/detect"
+SCHEMA_OVERRIDE       = f"{API_BASE_URL}/api/schema/override"
+PREPROCESS            = f"{API_BASE_URL}/preprocess"
+SELECT_MODEL          = f"{API_BASE_URL}/select-model"
+EMBEDDING_CACHE_STATS = f"{API_BASE_URL}/embedding-cache/stats"
+META_LEARNING_INSIGHTS= f"{API_BASE_URL}/meta-learning/insights"
+
+
+# Previously missing dynamic builders (added to fix audit gaps)
+def ingest_status(task_id: str) -> str:
+    """Build ``/ingest/status/{task_id}`` URL."""
+    return f"{API_BASE_URL}/ingest/status/{task_id}"
+
+
+def task_status(task_id: str) -> str:
+    """Build ``/task/{task_id}`` URL (polls async task results)."""
+    return f"{API_BASE_URL}/task/{task_id}"
+
+
+def encoder_overrides(sid: str) -> str:
+    """Build ``/v2/sessions/{sid}/encoder-overrides`` URL."""
+    return f"{API_BASE_URL}/v2/sessions/{sid}/encoder-overrides"
+
+
+def override_fusion(sid: str) -> str:
+    """Build ``/v2/sessions/{sid}/override-fusion`` URL."""
+    return f"{API_BASE_URL}/v2/sessions/{sid}/override-fusion"
+
+
+def override_global_target(sid: str) -> str:
+    """Build ``/v2/sessions/{sid}/override-global-target`` URL."""
+    return f"{API_BASE_URL}/v2/sessions/{sid}/override-global-target"
+
+
+def active_model(sid: str) -> str:
+    """Build ``/v2/sessions/{sid}/active-model`` URL."""
+    return f"{API_BASE_URL}/v2/sessions/{sid}/active-model"
+
+
+def choose_primary_dataset(sid: str) -> str:
+    """Build ``/v2/sessions/{sid}/choose-primary-dataset`` URL."""
+    return f"{API_BASE_URL}/v2/sessions/{sid}/choose-primary-dataset"
+
 
 # ---------------------------------------------------------------------------
 # Convenience namespace (use as ep.intelligence(sid) etc.)
@@ -166,40 +220,58 @@ PREDICT_ASYNC = f"{API_BASE_URL}/predict-async"
 
 class _Endpoints:
     """Namespace for all endpoint helpers, importable as ``from frontend._endpoints import ep``."""
-    API_BASE_URL = API_BASE_URL
-    HEALTH = HEALTH
-    ROOT = ROOT
-    TRAIN_PIPELINE = TRAIN_PIPELINE
-    MODEL_REGISTRY = MODEL_REGISTRY
-    RUN_ABLATIONS = RUN_ABLATIONS
-    ABLATION_RESULTS = ABLATION_RESULTS
-    RETRAIN_HISTORY = RETRAIN_HISTORY
-    CACHE_STATS = CACHE_STATS
-    CACHE_METADATA = CACHE_METADATA
-    CACHE_CLEAR = CACHE_CLEAR
-    CONFIG = CONFIG
-    PREDICT_ASYNC = PREDICT_ASYNC
+    API_BASE_URL           = API_BASE_URL
+    HEALTH                 = HEALTH
+    ROOT                   = ROOT
+    TRAIN_PIPELINE         = TRAIN_PIPELINE
+    MODEL_REGISTRY         = MODEL_REGISTRY
+    RUN_ABLATIONS          = RUN_ABLATIONS
+    ABLATION_RESULTS       = ABLATION_RESULTS
+    RETRAIN_HISTORY        = RETRAIN_HISTORY
+    CACHE_STATS            = CACHE_STATS
+    CACHE_METADATA         = CACHE_METADATA
+    CACHE_CLEAR            = CACHE_CLEAR
+    CONFIG                 = CONFIG
+    PREDICT_ASYNC          = PREDICT_ASYNC
+    # Previously missing statics
+    SESSIONS               = SESSIONS
+    MONITOR                = MONITOR
+    MONITOR_DRIFT          = MONITOR_DRIFT
+    SCHEMA_DETECT          = SCHEMA_DETECT
+    SCHEMA_OVERRIDE        = SCHEMA_OVERRIDE
+    PREPROCESS             = PREPROCESS
+    SELECT_MODEL           = SELECT_MODEL
+    EMBEDDING_CACHE_STATS  = EMBEDDING_CACHE_STATS
+    META_LEARNING_INSIGHTS = META_LEARNING_INSIGHTS
 
-    session = staticmethod(session)
-    intelligence = staticmethod(intelligence)
-    datasets = staticmethod(datasets)
-    context_drift = staticmethod(context_drift)
-    context_fit_analysis = staticmethod(context_fit_analysis)
-    context_phase_timings = staticmethod(context_phase_timings)
-    context_probe_sample = staticmethod(context_probe_sample)
-    train_status = staticmethod(train_status)
-    model_info = staticmethod(model_info)
-    model_stats = staticmethod(model_stats)
-    predict = staticmethod(predict)
-    registered_models = staticmethod(registered_models)
-    decision_trace = staticmethod(decision_trace)
-    global_target = staticmethod(global_target)
-    global_schema = staticmethod(global_schema)
-    dataset_target_candidates = staticmethod(dataset_target_candidates)
-    dataset_lock_target = staticmethod(dataset_lock_target)
-    dataset_unlock_target = staticmethod(dataset_unlock_target)
-    dataset_override_schema = staticmethod(dataset_override_schema)
+    session                      = staticmethod(session)
+    intelligence                 = staticmethod(intelligence)
+    datasets                     = staticmethod(datasets)
+    context_drift                = staticmethod(context_drift)
+    context_fit_analysis         = staticmethod(context_fit_analysis)
+    context_phase_timings        = staticmethod(context_phase_timings)
+    context_probe_sample_save    = staticmethod(context_probe_sample_save)
+    context_probe_sample_status  = staticmethod(context_probe_sample_status)
+    train_status                 = staticmethod(train_status)
+    ingest_status                = staticmethod(ingest_status)
+    task_status                  = staticmethod(task_status)
+    model_info                   = staticmethod(model_info)
+    model_stats                  = staticmethod(model_stats)
+    predict                      = staticmethod(predict)
+    registered_models            = staticmethod(registered_models)
+    decision_trace               = staticmethod(decision_trace)
+    global_target                = staticmethod(global_target)
+    global_schema                = staticmethod(global_schema)
+    dataset_target_candidates    = staticmethod(dataset_target_candidates)
+    dataset_lock_target          = staticmethod(dataset_lock_target)
+    dataset_unlock_target        = staticmethod(dataset_unlock_target)
+    dataset_override_schema      = staticmethod(dataset_override_schema)
     override_target_per_modality = staticmethod(override_target_per_modality)
+    encoder_overrides            = staticmethod(encoder_overrides)
+    override_fusion              = staticmethod(override_fusion)
+    override_global_target       = staticmethod(override_global_target)
+    active_model                 = staticmethod(active_model)
+    choose_primary_dataset       = staticmethod(choose_primary_dataset)
 
 
 ep = _Endpoints()

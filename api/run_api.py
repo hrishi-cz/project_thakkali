@@ -5,6 +5,15 @@ import os
 # warnings when torch.use_deterministic_algorithms(True) is active on CUDA >= 10.2.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+import warnings
+# Suppress authlib migration notice — third-party library noise, not our code.
+# authlib.jose → joserfc migration is tracked; remove this filter after upgrade.
+warnings.filterwarnings(
+    "ignore",
+    message="authlib.jose module is deprecated",
+    category=DeprecationWarning,
+)
+
 import asyncio
 import io
 import json

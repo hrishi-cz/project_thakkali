@@ -242,6 +242,11 @@ API_BASE_URL = (
     or "http://localhost:8001"
 )
 
+try:
+    from frontend._endpoints import ep
+except ImportError:
+    from _endpoints import ep
+
 # -- Visualization Helpers -------------------------------------------------
 def _kv_table(data, title=''):
     """Render dict as a styled key-value dataframe instead of raw JSON."""
@@ -359,7 +364,7 @@ def api_call(method: str, path: str, timeout: int = 15, silent: bool = False, **
 def _cached_model_registry() -> list:
     """Cached fetch of /model-registry."""
     try:
-        resp = requests.get(f"{API_BASE_URL}/model-registry", timeout=15)
+        resp = requests.get(ep.MODEL_REGISTRY, timeout=15)
         if resp.ok:
             data = resp.json()
             return data if isinstance(data, list) else data.get("models", [])
@@ -525,7 +530,7 @@ _GLOSSARY: Dict[str, str] = {
 def check_api_connection():
     """Check if API is available (cached for 10 s)."""
     try:
-        response = requests.get(f"{API_BASE_URL}/health", timeout=2)
+        response = requests.get(ep.HEALTH, timeout=2)
         return response.status_code == 200
     except Exception:
         return False
@@ -534,7 +539,7 @@ def check_api_connection():
 def get_api_status():
     """Get full API status (cached for 10 s)."""
     try:
-        response = requests.get(f"{API_BASE_URL}/", timeout=2)
+        response = requests.get(ep.ROOT, timeout=2)
         return response.json() if response.status_code == 200 else None
     except Exception:
         return None
@@ -553,6 +558,7 @@ class FrontendSession:
     """
     session_id: str = ""  # set to uuid below
     workflow_stage: int = 1
+    _recovery_attempted: bool = False  # ensures recovery runs once per browser session
     dataset_uploaded: bool = False
     schema_detected: bool = False
     detected_schema: Optional[Dict] = None
@@ -607,12 +613,20 @@ _init_session_state()
 def _try_recover_session_state() -> None:
     """Recover frontend flags from API when session state is empty (e.g. after page refresh).
 
-    Runs when schema_detected is False. Tries the current session_id first; if that
-    session doesn't exist in the API (new UUID after refresh), falls back to the most
-    recent active session. Restores dataset_uploaded, schema_detected, detected_schema,
-    model_selected, and workflow_stage so the user lands on the correct phase.
+    Direct match (current session_id found in API): fully restores all state flags
+    and advances workflow_stage based on verified recovered state.
+
+    Fallback (current UUID not in API): ONLY adopts the session_id so API calls
+    use the correct session — does NOT restore dataset_uploaded, schema_detected,
+    or advance workflow_stage. User sees Phase 1 (fresh start behaviour).
+
+    Runs ONCE per browser session via _recovery_attempted flag.
     """
+    # Guard: only attempt recovery once per browser session
+    if st.session_state.get("_recovery_attempted"):
+        return
     if st.session_state.get("schema_detected"):
+        st.session_state._recovery_attempted = True
         return  # already populated — nothing to recover
 
     _STAGE_ORDER = [
@@ -621,57 +635,76 @@ def _try_recover_session_state() -> None:
         "model_selection", "training", "monitoring",
     ]
 
-    def _recover_from_ctx(_sid: str, _ctx: dict) -> None:
+    def _recover_from_ctx(_sid: str, _ctx: dict, full_restore: bool = True) -> None:
+        """Apply recovered context to session state.
+
+        Parameters
+        ----------
+        full_restore : bool
+            True  → set dataset_uploaded / schema_detected / advance workflow_stage.
+            False → only adopt session_id; leave all other state at defaults.
+                    Used when falling back to a different session (not the user's
+                    current UUID) to prevent auto-advancing to Phase 2 on fresh start.
+        """
         _stage = str(_ctx.get("pipeline_stage", "") or "")
         _stage_idx = _STAGE_ORDER.index(_stage) if _stage in _STAGE_ORDER else -1
 
-        if _stage_idx >= _STAGE_ORDER.index("ingestion_complete"):
-            st.session_state.dataset_uploaded = True
-            if st.session_state.get("ingested_row_count") is None:
-                st.session_state.ingested_row_count = 1000
+        if full_restore:
+            if _stage_idx >= _STAGE_ORDER.index("ingestion_complete"):
+                st.session_state.dataset_uploaded = True
+                # Fetch real row count from context; avoid fabricating a number
+                if st.session_state.get("ingested_row_count") is None:
+                    _ctx_rows = (
+                        _ctx.get("total_rows")
+                        or _ctx.get("ingested_rows")
+                        or _ctx.get("row_count")
+                    )
+                    st.session_state.ingested_row_count = int(_ctx_rows) if _ctx_rows else None
 
-        if _stage_idx >= _STAGE_ORDER.index("schema_detection"):
-            try:
-                _sr = requests.get(
-                    f"{API_BASE_URL}/v2/sessions/{_sid}/global-schema", timeout=2
-                )
-                if _sr.ok:
-                    _schema = _sr.json()
-                    if _schema and _schema.get("global_problem_type"):
-                        st.session_state.detected_schema = _schema
-                        st.session_state.schema_detected = True
-            except Exception:
-                pass
+            if _stage_idx >= _STAGE_ORDER.index("schema_detection"):
+                try:
+                    _sr = requests.get(
+                        f"{API_BASE_URL}/v2/sessions/{_sid}/global-schema", timeout=2
+                    )
+                    if _sr.ok:
+                        _schema = _sr.json()
+                        # BUG FIX: global_problem_type is nested inside global_schema key
+                        _gs = _schema.get("global_schema") or {}
+                        if _gs and _gs.get("global_problem_type"):
+                            st.session_state.detected_schema = _gs
+                            st.session_state.schema_detected = True
+                except Exception:
+                    pass
 
-        if _stage_idx >= _STAGE_ORDER.index("model_selection"):
-            if not st.session_state.get("model_selected"):
-                st.session_state.model_selected = False  # let Phase 4 re-fetch
+            # Advance stage ONLY based on verified recovered flags, NOT API claim
+            _can_advance_to = 1
+            if st.session_state.get("dataset_uploaded"):
+                _can_advance_to = 2
+            if st.session_state.get("schema_detected"):
+                _can_advance_to = 3
+                if _stage_idx >= _STAGE_ORDER.index("preprocessing_planning"):
+                    _can_advance_to = 4
 
-        # Advance workflow_stage to match API stage
-        if _stage_idx >= _STAGE_ORDER.index("preprocessing_planning"):
-            if st.session_state.workflow_stage < 4:
-                st.session_state.workflow_stage = 4
-        elif _stage_idx >= _STAGE_ORDER.index("schema_detection"):
-            if st.session_state.workflow_stage < 3:
-                st.session_state.workflow_stage = 3
-        elif _stage_idx >= _STAGE_ORDER.index("ingestion_complete"):
-            if st.session_state.workflow_stage < 2:
-                st.session_state.workflow_stage = 2
+            if st.session_state.workflow_stage < _can_advance_to:
+                st.session_state.workflow_stage = _can_advance_to
 
-        # Adopt the recovered session_id so subsequent API calls use the right session
+        # Always adopt the session_id so subsequent API calls use the right session
         st.session_state.session_id = _sid
 
     try:
         _sid = st.session_state.get("session_id") or ""
 
-        # Try current session_id first
+        # --- Direct match: full state restore ---
         if _sid:
             _r = requests.get(f"{API_BASE_URL}/v2/sessions/{_sid}", timeout=2)
             if _r.ok:
-                _recover_from_ctx(_sid, _r.json())
+                _recover_from_ctx(_sid, _r.json(), full_restore=True)
                 return
 
-        # session_id not found (new UUID after page refresh) — find most recent active session
+        # --- Fallback: adopt session_id only, stay at Phase 1 ---
+        # ROOT CAUSE FIX: the old code called _recover_from_ctx with full_restore=True
+        # here, which set dataset_uploaded=True and pushed workflow_stage to 2 on
+        # every fresh page load. Now we ONLY adopt the session_id.
         _list_r = requests.get(
             f"{API_BASE_URL}/v2/sessions",
             params={"status": "active", "limit": 5},
@@ -680,18 +713,17 @@ def _try_recover_session_state() -> None:
         if _list_r.ok:
             _sessions = _list_r.json().get("sessions") or []
             if _sessions:
-                # Use most recent session (API returns newest-first)
                 _best = _sessions[0]
-                _best_sid = _best.get("session_id") or _best.get("id") or ""
+                _best_sid = _best.get("session_id") or ""
                 if _best_sid:
                     _ctx_r = requests.get(
                         f"{API_BASE_URL}/v2/sessions/{_best_sid}", timeout=2
                     )
                     if _ctx_r.ok:
-                        _recover_from_ctx(_best_sid, _ctx_r.json())
+                        # full_restore=False: only adopt session_id, Phase 1 preserved
+                        _recover_from_ctx(_best_sid, _ctx_r.json(), full_restore=False)
             else:
-                # Fix A: API has no active sessions (restart cleared all).
-                # Don't leave user stuck on Phase N with no way forward.
+                # No active sessions at all — reset to Phase 1 if stuck higher
                 if st.session_state.workflow_stage > 1:
                     st.session_state.workflow_stage = 1
         else:
@@ -700,6 +732,9 @@ def _try_recover_session_state() -> None:
 
     except Exception:
         pass  # API unreachable — leave state as-is
+    finally:
+        # Mark attempted even on failure — prevents bounce-back on navigation clicks
+        st.session_state._recovery_attempted = True
 
 
 _try_recover_session_state()
@@ -784,14 +819,17 @@ def render_workflow_dashboard():
     else:
         try:
             drift_resp = requests.get(
-                f"{API_BASE_URL}/context/{st.session_state.session_id}/drift-status",
+                ep.context_drift(st.session_state.session_id),
                 timeout=3,
             )
             if drift_resp.status_code == 200:
                 drift_data = drift_resp.json()
                 if drift_data.get("drift_detected"):
                     st.sidebar.error(
-                        f"Drift detected (severity={float(drift_data.get('drift_severity', 0.0)):.3f})"
+                        f"Drift detected (severity={
+                            float(drift_data.get('drift_severity')
+                            or (drift_data.get('monitor') or {}).get('severity')
+                            or 0.0):.3f})"
                     )
                 else:
                     st.sidebar.success("No drift detected")
@@ -808,7 +846,7 @@ def render_workflow_dashboard():
     else:
         try:
             gt_resp = requests.get(
-                f"{API_BASE_URL}/v2/sessions/{st.session_state.session_id}/global-target",
+                ep.global_target(st.session_state.session_id),
                 timeout=3,
             )
             if gt_resp.status_code == 200:
@@ -832,7 +870,7 @@ def render_workflow_dashboard():
     else:
         try:
             fa_resp = requests.get(
-                f"{API_BASE_URL}/context/{st.session_state.session_id}/fit-analysis",
+                ep.context_fit_analysis(st.session_state.session_id),
                 timeout=3,
             )
             if fa_resp.status_code == 200:
@@ -1445,7 +1483,7 @@ def render_workflow_dashboard():
                     if st.button(_retrain_label, type="primary", key="auto_retrain_trigger"):
                         try:
                             _retrain_resp = requests.post(
-                                f"{API_BASE_URL}/train-pipeline",
+                                ep.TRAIN_PIPELINE,
                                 json={
                                     "session_id": st.session_state.session_id,
                                     "retraining_depth": depth,
@@ -1860,7 +1898,7 @@ def render_phase_1_data_ingestion():
     # ----- Active ingestion task: poll for progress -----
     if task_id is not None:
         try:
-            resp = requests.get(f"{API_BASE_URL}/ingest/status/{task_id}", timeout=5)
+            resp = requests.get(ep.ingest_status(task_id), timeout=5)
             if resp.status_code == 404:
                 st.warning("Ingestion task not found. It may have expired.")
                 st.session_state.ingestion_task_id = None
@@ -2179,7 +2217,7 @@ def render_phase_2_schema_detection():
 
                     # B2 FIX: forward session_id so backend uses the correct session store
                     response = requests.post(
-                        f"{API_BASE_URL}/api/schema/detect",
+                        ep.SCHEMA_DETECT,
                         json={"session_id": st.session_state.session_id},
                         timeout=120
                     )
@@ -2456,7 +2494,7 @@ def render_phase_2_schema_detection():
                 if g12_target_col and g12_target_col not in ("(type manually)", ""):
                     try:
                         _g12_resp = requests.post(
-                            f"{API_BASE_URL}/v2/sessions/{st.session_state.session_id}/override-target-per-modality",
+                            ep.override_target_per_modality(st.session_state.session_id),
                             json={
                                 "modality": g12_modality,
                                 "target_column": g12_target_col,
@@ -2580,7 +2618,7 @@ def render_phase_2_schema_detection():
                     if _sid_g12:
                         try:
                             _fov_resp = requests.post(
-                                f"{API_BASE_URL}/v2/sessions/{_sid_g12}/override-fusion",
+                                ep.override_fusion(_sid_g12),
                                 json={"strategy": _chosen_fusion, "reason": "UI fusion override"},
                                 timeout=10,
                             )
@@ -2635,7 +2673,7 @@ def render_phase_2_schema_detection():
                     if _sid_g12 and _chosen_primary and _chosen_primary != "(no datasets detected)":
                         try:
                             _prim_resp = requests.post(
-                                f"{API_BASE_URL}/v2/sessions/{_sid_g12}/choose-primary-dataset",
+                                ep.choose_primary_dataset(_sid_g12),
                                 json={"dataset_id": _chosen_primary},
                                 timeout=10,
                             )
@@ -2722,7 +2760,7 @@ def render_phase_3_preprocessing():
                 try:
                     # B2 FIX: send session_id + schema_override so backend skips re-detect
                     response = requests.post(
-                        f"{API_BASE_URL}/preprocess",
+                        ep.PREPROCESS,
                         json={
                             "session_id": st.session_state.session_id,
                             "schema_override": schema_data if schema_data else None,
@@ -3027,7 +3065,7 @@ def render_phase_3_preprocessing():
                     st.image(
                         _b64_fe.b64decode(_preview_raw_b64),
                         caption=_raw_label,
-                        use_container_width=True,
+                        width='stretch',
                     )
                 with img_after_col:
                     st.markdown("**After** *(augmented, pre-normalize)*")
@@ -3036,7 +3074,7 @@ def render_phase_3_preprocessing():
                         caption="Flip + ColorJitter + Rotation"
                         + (" + Perspective" if _aug == "strong" else "")
                         + (" + Sharpening" if _sharp else ""),
-                        use_container_width=True,
+                        width='stretch',
                     )
                     st.caption(
                         "Shown before ToTensor/Normalize — "
@@ -3050,7 +3088,7 @@ def render_phase_3_preprocessing():
                             from PIL import Image as _PILImage
                             _pil_img = _PILImage.open(_first_valid).convert("RGB")
                             _w, _h = _pil_img.size
-                            st.image(_pil_img, caption=f"Raw: {_w}×{_h}px · RGB", use_container_width=True)
+                            st.image(_pil_img, caption=f"Raw: {_w}×{_h}px · RGB", width='stretch')
                         except Exception as _img_load_exc:
                             st.info(f"Preview unavailable: {_img_load_exc}")
                     elif _missing == _total_checked:
@@ -3952,7 +3990,7 @@ def render_phase_5_training():
                     payload["hp_overrides"] = st.session_state.hp_overrides
                 try:
                     resp = requests.post(
-                        f"{API_BASE_URL}/train-pipeline",
+                        ep.TRAIN_PIPELINE,
                         json=payload,
                         timeout=30,
                     )
@@ -4557,7 +4595,7 @@ def render_phase_5_training():
                 }
                 try:
                     resp = requests.post(
-                        f"{API_BASE_URL}/train-pipeline",
+                        ep.TRAIN_PIPELINE,
                         json=retrain_payload,
                         timeout=30,
                     )
@@ -4737,7 +4775,7 @@ def _render_trial_timeline(trial_events: List[Dict]) -> None:
         )
         .properties(height=90)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width='stretch')
 
 
 def _render_message(msg: Dict) -> None:
@@ -4918,7 +4956,7 @@ def _render_loss_chart(epoch_metrics: List[Dict], trial_events: Optional[List[Di
         charts.append(aux_chart)
 
     combined = alt.vconcat(*charts, spacing=8) if len(charts) > 1 else charts[0]
-    st.altair_chart(combined, use_container_width=True)
+    st.altair_chart(combined, width='stretch')
 
 
 def render_phase_6_monitoring():
@@ -5037,7 +5075,7 @@ def render_phase_6_monitoring():
                 try:
                     schema_data = st.session_state.detected_schema or {}
                     resp = requests.post(
-                        f"{API_BASE_URL}/monitor/drift",
+                        ep.MONITOR_DRIFT,
                         json={
                             "session_id": st.session_state.session_id,  # B2 FIX
                             "problem_type": schema_data.get("global_problem_type", "classification_binary"),
@@ -5117,7 +5155,7 @@ def render_phase_6_monitoring():
                 try:
                     schema_data = st.session_state.detected_schema or {}
                     resp = requests.post(
-                        f"{API_BASE_URL}/monitor",
+                        ep.MONITOR,
                         json={
                             "session_id": st.session_state.session_id,
                             "problem_type": schema_data.get("global_problem_type", "classification_binary"),
@@ -5169,7 +5207,7 @@ def render_phase_6_monitoring():
         st.markdown("### Model Registry")
         if st.button("Refresh Registry", width="stretch", key="registry_btn"):
             try:
-                resp = requests.get(f"{API_BASE_URL}/model-registry", timeout=30)
+                resp = requests.get(ep.MODEL_REGISTRY, timeout=30)
                 if resp.status_code == 200:
                     st.session_state.registry_result = resp.json()
                 else:
@@ -5246,7 +5284,7 @@ def render_phase_6_monitoring():
                         if r.status_code == 200:
                             st.success(f"✅ Renamed '{sel_model}' → '{new_name.strip()}'")
                             # Refresh registry
-                            refresh = requests.get(f"{API_BASE_URL}/model-registry", timeout=10)
+                            refresh = requests.get(ep.MODEL_REGISTRY, timeout=10)
                             if refresh.status_code == 200:
                                 st.session_state.registry_result = refresh.json()
                             st.rerun()
@@ -5294,7 +5332,7 @@ def render_phase_6_monitoring():
                 ):
                     try:
                         params = {"limit": 1, "session_id": st.session_state.session_id}
-                        resp = requests.get(f"{API_BASE_URL}/retrain-history", params=params, timeout=20)
+                        resp = requests.get(ep.RETRAIN_HISTORY, params=params, timeout=20)
                         if resp.status_code == 200:
                             st.session_state.registry_latest_retrain_result = resp.json()
                         else:
@@ -5342,7 +5380,7 @@ def render_phase_6_monitoring():
                 params["session_id"] = st.session_state.session_id
                 if dataset_filter.strip():
                     params["dataset_id"] = dataset_filter.strip()
-                resp = requests.get(f"{API_BASE_URL}/retrain-history", params=params, timeout=20)
+                resp = requests.get(ep.RETRAIN_HISTORY, params=params, timeout=20)
                 if resp.status_code == 200:
                     st.session_state.retrain_history_result = resp.json()
                 else:
@@ -5919,7 +5957,7 @@ def render_phase_7_prediction() -> None:
         with _pg_col2:
             st.markdown("**Registry summary**")
             try:
-                _pg_reg = requests.get(f"{API_BASE_URL}/model-registry", timeout=10)
+                _pg_reg = requests.get(ep.MODEL_REGISTRY, timeout=10)
                 if _pg_reg.status_code == 200:
                     _pg_reg_data = _pg_reg.json()
                     _pg_count = _pg_reg_data.get("count", 0)
@@ -5937,7 +5975,7 @@ def render_phase_7_prediction() -> None:
     registry_model_ids: List[str] = []
     registry_models_full: List[Dict] = []
     try:
-        reg_resp = requests.get(f"{API_BASE_URL}/model-registry", timeout=15)
+        reg_resp = requests.get(ep.MODEL_REGISTRY, timeout=15)
         if reg_resp.status_code == 200:
             reg_data = reg_resp.json()
             registry_models_full = list(reg_data.get("models", []))
@@ -6850,7 +6888,20 @@ else:
                 )
                 if _close_resp.ok:
                     st.sidebar.success("Session closed.")
-                    st.session_state.session_id = None
+                    # BUG-4 FIX: reset to a new UUID instead of None.
+                    # Setting session_id=None causes TypeError on the next render
+                    # when code does session_id[:20] or passes it to f-strings.
+                    import uuid as _uuid
+                    st.session_state.session_id = _uuid.uuid4().hex[:12]
+                    # Reset pipeline state so user starts fresh
+                    for _k, _default in [
+                        ("dataset_uploaded", False), ("schema_detected", False),
+                        ("detected_schema", None), ("training_task_id", None),
+                        ("training_result", None), ("trained_model_id", None),
+                        ("ingested_row_count", None),
+                    ]:
+                        st.session_state[_k] = _default
+                    st.session_state.workflow_stage = 1
                     st.rerun()
         else:
             st.sidebar.caption(f"Session: `{st.session_state.session_id[:20]}...`")

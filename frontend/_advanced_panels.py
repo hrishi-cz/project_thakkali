@@ -85,7 +85,7 @@ def render_decision_trace(sid: str) -> None:
         decisions = data.get("decisions", data.get("trace", []))
         if isinstance(decisions, list) and decisions:
             df = pd.DataFrame(decisions)
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width='stretch')
 
             # CSV export button
             csv_buf = io.StringIO()
@@ -141,27 +141,36 @@ def render_fit_analysis(sid: str) -> None:
             st.info("No fit analysis available. Complete training first.")
             return
 
-        fit_type = data.get("fit_type", data.get("diagnosis", "unknown"))
-        color = {"overfit": "🔴", "underfit": "🟡", "good_fit": "🟢"}.get(
+        # BUG-2 FIX: backend wraps result in "training_fit_analysis", not top-level
+        fit_analysis = data.get("training_fit_analysis") or data
+        fit_type = fit_analysis.get("fit_type", fit_analysis.get("diagnosis", "unknown"))
+        color = {"overfit": "🔴", "underfit": "🟡", "good_fit": "🟢", "good": "🟢"}.get(
             str(fit_type).lower().replace(" ", "_"), "⚪"
         )
         st.markdown(f"### {color} Diagnosis: **{fit_type}**")
 
-        if data.get("train_loss") is not None and data.get("val_loss") is not None:
+        train_loss = fit_analysis.get("train_loss")
+        val_loss = fit_analysis.get("val_loss")
+        if train_loss is not None and val_loss is not None:
             col1, col2 = st.columns(2)
-            col1.metric("Train Loss", f"{float(data['train_loss']):.4f}")
-            col2.metric("Val Loss", f"{float(data['val_loss']):.4f}")
+            col1.metric("Train Loss", f"{float(train_loss):.4f}")
+            col2.metric("Val Loss", f"{float(val_loss):.4f}")
 
-        gap = data.get("generalization_gap")
+        gap = fit_analysis.get("generalization_gap")
         if isinstance(gap, (int, float)):
             st.metric("Generalization Gap", f"{float(gap):.4f}")
 
-        recommendation = data.get("recommendation", data.get("advice", ""))
+        recommendation = fit_analysis.get("recommendation", fit_analysis.get("advice", ""))
         if recommendation:
             st.info(f"💡 **Recommendation:** {recommendation}")
 
-        if data.get("details"):
-            st.json(data["details"])
+        # Surface training_signals if populated
+        signals = data.get("training_signals") or {}
+        if signals:
+            with st.expander("Training Signals", expanded=False):
+                st.json(signals)
+        elif fit_analysis.get("details"):
+            st.json(fit_analysis["details"])
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +250,7 @@ def render_feature_intelligence(sid: str) -> None:
                 for k, v in signals.items()
             ]
             if signal_rows:
-                st.dataframe(pd.DataFrame(signal_rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(signal_rows), width='stretch')
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +269,9 @@ def render_ranked_candidates(sid: str) -> None:
             for modality, cands in candidates.items():
                 if isinstance(cands, list) and cands:
                     st.markdown(f"**{modality.title()} Candidates**")
-                    st.dataframe(pd.DataFrame(cands), use_container_width=True)
+                    st.dataframe(pd.DataFrame(cands), width='stretch')
         elif isinstance(candidates, list):
-            st.dataframe(pd.DataFrame(candidates), use_container_width=True)
+            st.dataframe(pd.DataFrame(candidates), width='stretch')
 
 
 # ---------------------------------------------------------------------------
@@ -270,19 +279,29 @@ def render_ranked_candidates(sid: str) -> None:
 # ---------------------------------------------------------------------------
 def render_cache_management() -> None:
     """Render embedding cache stats and management controls."""
-    with st.expander("💾 Embedding Cache", expanded=False):
-        data = _safe_get(ep.CACHE_STATS, "cache stats")
-        if data:
+    with st.expander("💾 Cache Management", expanded=False):
+        # MISMATCH-2 FIX: /embedding-cache/stats has the correct keys;
+        # /cache/stats is the preprocessor artifact cache with different keys.
+        emb_data = _safe_get(ep.EMBEDDING_CACHE_STATS, "embedding cache stats")
+        if emb_data:
             col1, col2, col3 = st.columns(3)
-            col1.metric("Cache Entries", data.get("total_entries", data.get("size", "?")))
-            col2.metric("Hit Rate", f"{float(data.get('hit_rate', 0)) * 100:.1f}%")
-            col3.metric("Memory (MB)", data.get("memory_mb", "?"))
+            col1.metric("Cache Files", emb_data.get("cache_file_count", emb_data.get("total_files", "?")))
+            col2.metric("Cache Size (MB)", emb_data.get("cache_size_mb", emb_data.get("total_size_mb", "?")))
+            col3.metric("Latest Model", str(emb_data.get("latest_model_id", "—"))[:30])
+
+        pp_data = _safe_get(ep.CACHE_STATS, "preprocessor cache")
+        if pp_data and isinstance(pp_data, dict):
+            st.caption(
+                f"Preprocessor cache — files: {pp_data.get('total_files', '?')} "
+                f"| size: {pp_data.get('total_size_mb', '?')} MB"
+            )
 
         meta = _safe_get(ep.CACHE_METADATA, "cache metadata")
         if meta and isinstance(meta, dict):
-            st.json(meta)
+            with st.expander("Cache Metadata", expanded=False):
+                st.json(meta)
 
-        if st.button("🗑️ Clear Embedding Cache", key="clear_cache_btn"):
+        if st.button("🗑️ Clear Preprocessor Cache", key="clear_cache_btn"):
             result = _safe_post(ep.CACHE_CLEAR, {}, "cache clear")
             if result:
                 st.success("Cache cleared successfully")
@@ -300,7 +319,7 @@ def render_ablation_runner() -> None:
         if data:
             results = data.get("results", data)
             if isinstance(results, list):
-                st.dataframe(pd.DataFrame(results), use_container_width=True)
+                st.dataframe(pd.DataFrame(results), width='stretch')
             elif isinstance(results, dict):
                 for name, val in results.items():
                     st.write(f"**{name}:** {val}")
@@ -329,11 +348,19 @@ def render_retrain_history() -> None:
             st.info("No retraining events recorded.")
             return
 
-        history = data.get("history", data.get("events", []))
-        if isinstance(history, list) and history:
-            st.dataframe(pd.DataFrame(history), use_container_width=True)
+        # MISMATCH-4 FIX: backend returns a list directly, not {"history": [...]}
+        if isinstance(data, list):
+            history = data
+        elif isinstance(data, dict):
+            history = data.get("history", data.get("events", []))
         else:
-            st.json(data)
+            history = []
+
+        if isinstance(history, list) and history:
+            st.dataframe(pd.DataFrame(history), width='stretch')
+            st.caption(f"{len(history)} retraining event(s) recorded")
+        else:
+            st.info("No retraining events recorded.")
 
 
 # ---------------------------------------------------------------------------
@@ -517,12 +544,29 @@ def render_global_target(sid: str) -> None:
         if not data or not isinstance(data, dict):
             st.info("No global target set.")
             return
-        target = data.get("global_target")
-        if not isinstance(target, dict):
-            # API returned flat structure — treat the whole response as the target
-            target = data
-        st.write(f"**Current target column:** `{target.get('target_column', '?')}`")
-        st.write(f"**Problem type:** `{target.get('problem_type', '?')}`")
+
+        # BUG-3 FIX: backend returns global_target as a STRING (column name),
+        # not a dict. Previous code mis-detected it as a dict -> always showed "?".
+        col_name = data.get("global_target") or "—"
+        confidence = float(data.get("confidence") or 0)
+        xs3_gap = float(data.get("xs3_confidence_gap") or 0)
+        candidates = data.get("candidates") or []
+
+        st.write(f"**Current target column:** `{col_name}`")
+        c1, c2 = st.columns(2)
+        c1.metric("Confidence", f"{confidence:.0%}")
+        c2.metric("XS3 Gap", f"{xs3_gap:.3f}",
+                  help="Confidence gap between top-2 candidates. >0.2 = unambiguous.")
+
+        if candidates:
+            st.caption(f"{len(candidates)} candidate(s) scored")
+            try:
+                cand_df = pd.DataFrame(candidates)
+                show_cols = [c for c in ["name", "score", "reason"] if c in cand_df.columns]
+                st.dataframe(cand_df[show_cols] if show_cols else cand_df,
+                             width='stretch')
+            except Exception:
+                st.json(candidates)
 
 
 # ---------------------------------------------------------------------------
