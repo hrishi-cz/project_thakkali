@@ -53,3 +53,13 @@ tmpclaude-*-cwd
 .env
 *.env
 .env.*
+
+# Internal / dev-only (never push to public)
+CLAUDE.md
+claude/
+.claude/
+diary/
+archive/
+graphify-out/
+.mcp.json
+.pre-commit-config.yaml
