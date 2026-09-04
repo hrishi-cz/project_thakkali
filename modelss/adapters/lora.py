@@ -19,7 +19,8 @@ ICLR 2022.  https://arxiv.org/abs/2106.09685
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, Optional, Sequence, Tuple
+import re as _re
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch  # noqa: F401 — needed for type hint in property
 
@@ -37,6 +38,51 @@ _DEFAULT_TARGETS: Tuple[str, ...] = (
     "out_proj",                # nn.MultiheadAttention output projection
     "linear1",                 # PyTorch TransformerEncoderLayer FFN layer 1
 )
+
+# Ordered regex patterns covering HuggingFace transformer block naming conventions:
+#   BERT/DeBERTa/RoBERTa/XLM/DINOv2 : encoder.layer.N
+#   DistilBERT                        : transformer.layer.N
+#   CLIP ViT (HuggingFace)            : vision_model.encoder.layers.N
+#   CLIP ViT (raw OpenAI)             : transformer.resblocks.N
+#   GPT-2 / GPT-J                     : transformer.h.N
+#   Swin / generic ViT blocks         : layers.N  or  blocks.N
+_BLOCK_PATTERNS: Tuple[str, ...] = (
+    r'(?:^|\.)(?:encoder\.layer|encoder\.layers|transformer\.layer'
+    r'|vision_model\.encoder\.layers)\.(\d+)\.',
+    r'(?:^|\.)transformer\.resblocks\.(\d+)\.',
+    r'(?:^|\.)transformer\.h\.(\d+)\.',
+    r'(?:^|\.)(?:layers|blocks)\.(\d+)\.',
+)
+
+
+def _block_idx_from_path(full_path: str) -> int:
+    """Extract transformer block index from a dotted module path. Returns -1 if not found."""
+    for pat in _BLOCK_PATTERNS:
+        m = _re.search(pat, full_path)
+        if m:
+            return int(m.group(1))
+    return -1
+
+
+def _collect_lora_candidates(
+    module: nn.Module,
+    target_modules: Sequence[str],
+    prefix: str = "",
+) -> List[Tuple[nn.Module, str, str, nn.Linear]]:
+    """
+    DFS collect (parent, attr_name, full_path, child_linear) for all matching nn.Linear layers.
+
+    Only layers whose *immediate* attribute name contains one of the target_modules
+    strings are collected — consistent with the original apply_lora behaviour.
+    """
+    result: List[Tuple[nn.Module, str, str, nn.Linear]] = []
+    for name, child in module.named_children():
+        full = f"{prefix}.{name}" if prefix else name
+        if isinstance(child, nn.Linear) and any(t in name for t in target_modules):
+            result.append((module, name, full, child))
+        else:
+            result.extend(_collect_lora_candidates(child, target_modules, prefix=full))
+    return result
 
 
 class LoRALinear(nn.Module):
@@ -117,13 +163,10 @@ def apply_lora(
     r: int = 8,
     alpha: float = 16.0,
     target_modules: Sequence[str] = _DEFAULT_TARGETS,
+    last_n_layers: int = 0,
 ) -> nn.Module:
     """
-    Recursively replace matching ``nn.Linear`` layers in *module* with
-    ``LoRALinear`` wrappers and freeze the original weights.
-
-    Only layers whose name **contains** one of the ``target_modules`` strings
-    are replaced.  The module is modified **in-place**.
+    Inject LoRA adapters into matching ``nn.Linear`` layers in *module*.
 
     Parameters
     ----------
@@ -135,23 +178,65 @@ def apply_lora(
         LoRA scaling.
     target_modules : sequence of str
         Name fragments to match.  Defaults to common attention projection names.
+    last_n_layers : int
+        When > 0, restrict LoRA injection to the last N transformer blocks only.
+        Block indices are detected from the module path via ``_BLOCK_PATTERNS``.
+        Falls back to the last ``last_n_layers * 4`` candidates by DFS order when
+        no block indices can be parsed (unusual architectures).
+        When 0 (default), all matching layers across the full module are patched.
 
     Returns
     -------
     nn.Module
-        The same *module* with LoRA adapters injected.
+        The same *module* with LoRA adapters injected in-place.
     """
-    n_replaced = 0
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and any(t in name for t in target_modules):
-            # Freeze original weights
-            child.weight.requires_grad_(False)
-            if child.bias is not None:
-                child.bias.requires_grad_(False)
-            setattr(module, name, LoRALinear(child, r=r, alpha=alpha))
-            n_replaced += 1
+    candidates = _collect_lora_candidates(module, target_modules)
+
+    if not candidates:
+        # CNN-family encoders (ResNet, EfficientNet, ConvNeXt) have no Q/V attention
+        # projections — LoRA is not applicable; return unchanged.
+        logger.info(
+            "apply_lora: no target layers found in %s — LoRA not applicable (CNN/no-attention encoder)",
+            type(module).__name__,
+        )
+        return module
+
+    if last_n_layers > 0:
+        block_indices = [_block_idx_from_path(c[2]) for c in candidates]
+        valid_blocks = [b for b in block_indices if b >= 0]
+
+        if valid_blocks:
+            max_block = max(valid_blocks)
+            threshold = max_block - last_n_layers + 1
+            selected_blocks = sorted(set(b for b in valid_blocks if b >= threshold))
+            filtered = [
+                c for c, b in zip(candidates, block_indices)
+                if b < 0 or b >= threshold
+            ]
+            logger.info(
+                "apply_lora: LoRA injected into blocks %s (%d layers total)",
+                selected_blocks, len(filtered),
+            )
         else:
-            apply_lora(child, r=r, alpha=alpha, target_modules=target_modules)
+            # No block indices found (unusual architecture) — positional fallback:
+            # take the last last_n_layers * 4 candidates in DFS order.
+            n_take = min(len(candidates), last_n_layers * 4)
+            filtered = candidates[-n_take:]
+            logger.info(
+                "apply_lora: positional fallback — last %d of %d candidates "
+                "(no block indices found in module paths)",
+                len(filtered), len(candidates),
+            )
+    else:
+        filtered = candidates
+
+    n_replaced = 0
+    for parent, attr_name, _full, child in filtered:
+        child.weight.requires_grad_(False)
+        if child.bias is not None:
+            child.bias.requires_grad_(False)
+        setattr(parent, attr_name, LoRALinear(child, r=r, alpha=alpha))
+        n_replaced += 1
 
     if n_replaced:
         logger.debug("apply_lora: replaced %d Linear layers in %s", n_replaced, type(module).__name__)

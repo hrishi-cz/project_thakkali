@@ -37,7 +37,7 @@ st.markdown("""
   --amber:#f59e0b;--aglow:rgba(245,158,11,.12);
   --teal:#14b8a6;--tglow:rgba(20,184,166,.12);
   --red:#ef4444;
-  --t1:#f8fafc;--t2:#a1a1c2;--t3:#5a5a8a;
+  --t1:#f8fafc;--t2:#a1a1c2;--t3:#7878a8;
   --r-sm:8px;--r-md:12px;--r-lg:16px;--r-xl:24px;
 }
 html,body,[class*="css"],[data-testid="stAppViewContainer"]{
@@ -95,7 +95,7 @@ h3{font-size:1.05rem!important;font-weight:600!important;color:var(--t2)!importa
   display:flex;align-items:center;justify-content:center;
   font-weight:700;font-size:.9rem;
   background:var(--card);border:2px solid var(--border);color:var(--t3);
-  transition:all .25s ease;
+  transition:box-shadow .25s ease,background .25s ease,border-color .25s ease,color .25s ease;
 }
 .av-step.done .av-circle{background:var(--tglow);border-color:var(--teal);color:var(--teal);}
 .av-step.active .av-circle{
@@ -163,7 +163,7 @@ h3{font-size:1.05rem!important;font-weight:600!important;color:var(--t2)!importa
 [data-testid="stProgress"]>div>div{background:linear-gradient(90deg,var(--violet),var(--violet2))!important;border-radius:4px!important;}
 
 /* MODEL CANDIDATE CARD */
-.model-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);padding:16px 20px;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;transition:all .2s;}
+.model-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);padding:16px 20px;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;transition:box-shadow .2s,border-color .2s,transform .2s;}
 .model-card.selected{border-color:var(--violet);background:var(--vglow);}
 .model-card:hover{border-color:var(--bright);}
 .model-card-name{font-weight:700;color:var(--t1);font-size:.9rem;}
@@ -225,6 +225,12 @@ hr{border-color:var(--border)!important;margin:20px 0!important;}
 ::-webkit-scrollbar-thumb:hover{background:var(--violet);}
 [data-testid="stMain"]{animation:fadeIn .4s ease-out;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
+
+/* MODALITY COLOR CLASSES (replaces inline hardcoded colors) */
+.mod-tabular{color:var(--violet);font-weight:600}
+.mod-text{color:var(--teal);font-weight:600}
+.mod-image{color:var(--amber);font-weight:600}
+.mod-other{color:var(--t3);font-weight:500}
 </style>
 """, unsafe_allow_html=True)
 
@@ -266,7 +272,7 @@ def _model_card(name, score, detail, selected):
     pct = int(min(100, score * 100))
     cls = 'selected' if selected else ''
     star = chr(10022) + ' ' if selected else ''
-    clr = '#a78bfa' if selected else '#5a5a8a'
+    clr = '#a78bfa' if selected else '#7878a8'
     st.markdown(
         f'<div class="model-card {cls}">'
         f'<div><div class="model-card-name">{star}{name}</div>'
@@ -684,9 +690,40 @@ def _try_recover_session_state() -> None:
                 _can_advance_to = 3
                 if _stage_idx >= _STAGE_ORDER.index("preprocessing_planning"):
                     _can_advance_to = 4
+                if _stage_idx >= _STAGE_ORDER.index("model_selection"):
+                    st.session_state.model_selected = True
+                    _can_advance_to = 5
+                if _stage_idx >= _STAGE_ORDER.index("training"):
+                    st.session_state.model_selected = True
+                    _can_advance_to = 5  # land on Training panel so user can resume
+                if _stage_idx >= _STAGE_ORDER.index("monitoring"):
+                    _can_advance_to = 6
 
             if st.session_state.workflow_stage < _can_advance_to:
                 st.session_state.workflow_stage = _can_advance_to
+
+            # Restore training state if pipeline reached training stage
+            if _stage_idx >= _STAGE_ORDER.index("training"):
+                _trained_mid = _ctx.get("trained_model_id") or _ctx.get("best_model_id")
+                if _trained_mid and not st.session_state.get("trained_model_id"):
+                    st.session_state.trained_model_id = str(_trained_mid)
+                    st.session_state.model_selected = True
+                    st.session_state.training_result = _ctx.get("training_result") or {
+                        "model_id": str(_trained_mid),
+                        "metrics": _ctx.get("training_signals", {}),
+                    }
+
+            # Restore text/image columns from detected schema
+            if st.session_state.get("detected_schema"):
+                _t_cols: list = []
+                _i_cols: list = []
+                for _ds in st.session_state.detected_schema.get("per_dataset", []):
+                    _t_cols += _ds.get("detected_columns", {}).get("text", [])
+                    _i_cols += _ds.get("detected_columns", {}).get("image", [])
+                if _t_cols and not st.session_state.get("text_columns"):
+                    st.session_state.text_columns = list(dict.fromkeys(c for c in _t_cols if c))
+                if _i_cols and not st.session_state.get("image_columns"):
+                    st.session_state.image_columns = list(dict.fromkeys(c for c in _i_cols if c))
 
         # Always adopt the session_id so subsequent API calls use the right session
         st.session_state.session_id = _sid
@@ -695,11 +732,22 @@ def _try_recover_session_state() -> None:
         _sid = st.session_state.get("session_id") or ""
 
         # --- Direct match: full state restore ---
-        if _sid:
+        # Validate canonical format (session_<12 hex>). Malformed IDs (e.g. stripped
+        # prefix, legacy UUID-only strings) would hit a guaranteed 404 — skip them.
+        if _sid and _sid.startswith("session_") and len(_sid) > 8:
             _r = requests.get(f"{API_BASE_URL}/v2/sessions/{_sid}", timeout=2)
             if _r.ok:
                 _recover_from_ctx(_sid, _r.json(), full_restore=True)
                 return
+            if _r.status_code == 404:
+                # Session no longer exists (DB cleared, server restarted without data).
+                # Clear stale ID so the fallback list-sessions path runs cleanly.
+                st.session_state.pop("session_id", None)
+                _sid = ""
+        elif _sid:
+            # Malformed ID — discard silently without hitting the API.
+            st.session_state.pop("session_id", None)
+            _sid = ""
 
         # --- Fallback: adopt session_id only, stay at Phase 1 ---
         # ROOT CAUSE FIX: the old code called _recover_from_ctx with full_restore=True
@@ -730,8 +778,10 @@ def _try_recover_session_state() -> None:
             if st.session_state.workflow_stage > 1:
                 st.session_state.workflow_stage = 1
 
-    except Exception:
-        pass  # API unreachable — leave state as-is
+    except Exception as _rec_exc:
+        import logging as _logging
+        _logging.getLogger(__name__).debug("Session recovery failed (non-fatal): %s", _rec_exc)
+        # API unreachable or context malformed — leave state as-is
     finally:
         # Mark attempted even on failure — prevents bounce-back on navigation clicks
         st.session_state._recovery_attempted = True
@@ -749,14 +799,14 @@ def render_workflow_dashboard():
       <div class="av-tag">⚡ Research-Grade Multimodal AutoML Platform</div>
       <div class="av-title">AutoVision</div>
       <div class="av-sub">Schema-Aware &nbsp;·&nbsp; Adaptive Fusion &nbsp;·&nbsp; Calibrated &nbsp;·&nbsp; Explainable Intelligence</div>
-      <div class="av-sub" style="margin-top:14px;font-size:.85rem;letter-spacing:.08em;color:#6b7280;">
-        <span style="color:#a78bfa;font-weight:600">Tabular</span>
+      <div class="av-sub" style="margin-top:14px;font-size:.85rem;letter-spacing:.08em;">
+        <span class="mod-tabular">Tabular</span>
         &nbsp;&nbsp;·&nbsp;&nbsp;
-        <span style="color:#14b8a6;font-weight:600">Text</span>
+        <span class="mod-text">Text</span>
         &nbsp;&nbsp;·&nbsp;&nbsp;
-        <span style="color:#f59e0b;font-weight:600">Image</span>
+        <span class="mod-image">Image</span>
         &nbsp;&nbsp;·&nbsp;&nbsp;
-        <span style="color:#6b7280;font-weight:500">Multimodal</span>
+        <span class="mod-other">Multimodal</span>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1460,7 +1510,7 @@ def render_workflow_dashboard():
     with st.expander("Drift & Retraining Monitor", expanded=False):
         try:
             resp = requests.get(
-                f"{API_BASE_URL}/v2/sessions/{st.session_state.session_id}/intelligence/drift",
+                ep.intelligence(st.session_state.session_id, "drift"),
                 timeout=5,
             )
             if resp.status_code == 200:
@@ -1528,6 +1578,17 @@ def render_workflow_dashboard():
                     col1, col2 = st.columns(2)
                     col1.metric("Detected", "Yes" if con.get("detected") else "No")
                     col2.metric("KS p-value", f"{con.get('p_value', 1.0):.4f}")
+
+                _intel_api_drift = api_call("GET", ep.intelligence(st.session_state.session_id, "drift")) or {}
+                _con_drift = _intel_api_drift.get("concept_drift", {})
+                if _con_drift:
+                    _con_c1, _con_c2, _con_c3 = st.columns(3)
+                    _con_c1.metric("Concept Drift", "🔴 Detected" if _con_drift.get("detected") else "🟢 None")
+                    _con_c2.metric("KS Stat", f"{_con_drift.get('ks_stat', 0.0):.4f}")
+                    _con_c3.metric("p-value", f"{_con_drift.get('p_value', 1.0):.4f}",
+                                   help="p < 0.05 = statistically significant concept drift.")
+                    st.caption(f"Based on {_con_drift.get('n_batches', 0)} observation batches. "
+                               "Concept drift = relationship between inputs and outputs has changed.")
 
                 # Embedding drift
                 emb = data.get("embedding_drift") or {}
@@ -1637,7 +1698,10 @@ def render_workflow_dashboard():
                     st.caption(f"  ↳ {comp}: {reason}")
 
             st.markdown("#### 🔗 Fusion")
-            fstrat = best.get("fusion_strategy", "N/A")
+            # Prefer actual HPO-winning fusion over pre-training schema plan.
+            # ms_res["best_model"]["fusion_strategy"] is set at model-selection time
+            # (Phase 4) and may differ from the fusion Optuna actually optimised.
+            fstrat = metrics.get("fusion_strategy") or best.get("fusion_strategy", "N/A")
             st.write(f"- **Strategy:** {fstrat}")
             model_mods = list(filter(None, [
                 best.get("tabular_encoder") and "tabular",
@@ -1884,6 +1948,47 @@ def render_phase_1_data_ingestion():
     """Phase 1: Data Ingestion with Caching and live progress polling."""
     st.header("Phase 1️⃣ - Data Ingestion & Caching")
 
+    # ── Onboarding welcome (first-time users only) ────────────────────────
+    if (
+        st.session_state.workflow_stage == 1
+        and not st.session_state.get("dataset_uploaded")
+        and not st.session_state.get("_recovery_attempted")
+        and not st.session_state.get("_onboarding_dismissed")
+    ):
+        with st.expander("👋 Welcome to AutoVision — Getting Started", expanded=True):
+            st.markdown("""
+| Phase | Action | Est. time |
+|---|---|---|
+| 1 Ingest | Paste dataset URL or local path | 30s |
+| 2 Schema | Review auto-detected columns & problem type | 1–2 min |
+| 3 Preprocess | Click Start — fully automatic | 1–3 min |
+| 4 Select | Click Select Models — automatic | 30s |
+| 5 Train | Click Start Training (GPU recommended) | 5–30 min |
+| 6 Monitor | Review drift & calibration | 1 min |
+| 7 Predict | Upload sample, get prediction + explanation | 1 min |
+
+**Try a built-in example dataset:**
+""")
+            _ob_c1, _ob_c2, _ob_c3 = st.columns(3)
+            _demo_titanic = "data/fixtures/titanic/titanic.csv"
+            _demo_hm = "data/fixtures/hateful_memes/hateful_memes_sample.csv"
+            _demo_imdb = "data/fixtures/imdb_sample/imdb_sample.csv"
+            if _ob_c1.button("📊 Titanic", key="_demo_titanic",
+                             disabled=not os.path.exists(_demo_titanic)):
+                st.session_state["_prefill_urls"] = _demo_titanic
+                st.rerun()
+            if _ob_c2.button("🎭 Hateful Memes", key="_demo_hm",
+                             disabled=not os.path.exists(_demo_hm)):
+                st.session_state["_prefill_urls"] = _demo_hm
+                st.rerun()
+            if _ob_c3.button("📝 IMDb", key="_demo_imdb",
+                             disabled=not os.path.exists(_demo_imdb)):
+                st.session_state["_prefill_urls"] = _demo_imdb
+                st.rerun()
+            if st.button("Skip — I'm familiar with the workflow", key="_dismiss_onboarding"):
+                st.session_state["_onboarding_dismissed"] = True
+                st.rerun()
+
     st.markdown("""
     **Workflow:**
     1. Provide dataset sources (Kaggle URLs, HTTP links, or local paths)
@@ -2020,8 +2125,10 @@ def render_phase_1_data_ingestion():
 
     # ----- No active task: show input form -----
     st.markdown("### 📥 Dataset Sources")
+    _prefill_url = st.session_state.pop("_prefill_urls", "")
     dataset_sources = st.text_area(
         "Enter one or more dataset sources (Kaggle URL, HTTP link, or local path), one per line:",
+        value=_prefill_url,
         placeholder="https://kaggle.com/datasets/...\nhttps://example.com/data.csv\n/path/to/dataset.csv",
         height=120
     )
@@ -2085,12 +2192,18 @@ def render_phase_1_data_ingestion():
 
                     if cache_info['items']:
                         with st.expander(f"📁 Cached Files ({len(cache_info['items'])})"):
+                            _cache_rows = []
                             for item in cache_info['items']:
                                 h = item['name']
-                                src_url = meta.get(h, {}).get("source", h)
-                                st.caption(
-                                    f"• `{h[:16]}` — {item['size_mb']} MB\n  {src_url[:100]}"
-                                )
+                                _src = meta.get(h, {}).get("source", h)
+                                _ts = meta.get(h, {}).get("timestamp", "—")
+                                _cache_rows.append({
+                                    "Hash": h[:16] + "…",
+                                    "Source": str(_src)[:80],
+                                    "Size (MB)": item.get("size_mb", "?"),
+                                    "Cached": str(_ts)[:19],
+                                })
+                            st.dataframe(pd.DataFrame(_cache_rows), use_container_width=True, hide_index=True)
                 else:
                     st.error(f"Cache query failed ({stats_resp.status_code}): {_api_error_detail(stats_resp)}")
             except Exception as e:
@@ -2166,14 +2279,20 @@ def render_phase_1_data_ingestion():
             except Exception:
                 st.info("Dataset management unavailable (API not connected).")
 
-        if st.button("➡️ Next: Schema Detection", width="stretch"):
-            st.session_state.workflow_stage = 2
-            st.rerun()
+        if st.session_state.get("dataset_uploaded"):
+            if st.button("➡️ Next: Schema Detection", width="stretch"):
+                st.session_state.workflow_stage = 2
+                st.rerun()
 
 
 def render_phase_2_schema_detection():
     """Phase 2: Schema Detection."""
     st.header("Phase 2️⃣ - Schema Detection & Problem Type Inference")
+
+    # Fetch XS3 thresholds from backend config (dynamic, not hardcoded)
+    _p2_cfg = api_call("GET", ep.CONFIG) or {}
+    _xs3_ok = float(_p2_cfg.get("xs3_ok_threshold", 0.3))
+    _xs3_warn = float(_p2_cfg.get("xs3_warn_threshold", 0.1))
 
     with st.expander("ℹ️ What is this phase doing? (click to expand)", expanded=False):
         st.markdown("""
@@ -2208,64 +2327,81 @@ def render_phase_2_schema_detection():
     # =========================================================
     with col1:
         if st.button("🔍 Detect Schema", width="stretch"):
-            with st.spinner("Analyzing ingested datasets..."):
-                progress_bar = st.progress(0)
-                status = st.empty()
+            # Phase lock warning: if Phase 5 training is already complete, warn before resetting
+            _already_trained = (
+                st.session_state.get("phase_states", {}).get(5, {}).get("status") == "completed"
+            )
+            if _already_trained and not st.session_state.get("_schema_reset_confirmed"):
+                st.warning(
+                    "⚠️ **A trained model exists in this session.** "
+                    "Re-running schema detection will reset Phases 3–7. "
+                    "The current model stays in the registry but won't match the new schema. Proceed?"
+                )
+                _plc1, _plc2 = st.columns(2)
+                if _plc1.button("Yes, reset and re-detect", key="_confirm_schema_reset"):
+                    st.session_state["_schema_reset_confirmed"] = True
+                    st.rerun()
+                _plc2.button("Cancel", key="_cancel_schema_reset")
+            else:
+                st.session_state.pop("_schema_reset_confirmed", None)
+                with st.spinner("Analyzing ingested datasets..."):
+                    progress_bar = st.progress(0)
+                    status = st.empty()
 
-                try:
-                    status.write("📍 Detecting schema for ingested datasets...")
+                    try:
+                        status.write("📍 Detecting schema for ingested datasets...")
 
-                    # B2 FIX: forward session_id so backend uses the correct session store
-                    response = requests.post(
-                        ep.SCHEMA_DETECT,
-                        json={"session_id": st.session_state.session_id},
-                        timeout=120
-                    )
+                        # B2 FIX: forward session_id so backend uses the correct session store
+                        response = requests.post(
+                            ep.SCHEMA_DETECT,
+                            json={"session_id": st.session_state.session_id},
+                            timeout=120
+                        )
 
-                    progress_bar.progress(0.6)
+                        progress_bar.progress(0.6)
 
-                    if response.status_code == 200:
-                        payload = response.json()
+                        if response.status_code == 200:
+                            payload = response.json()
 
-                        # ⭐⭐⭐ CRITICAL FIX ⭐⭐⭐
-                        schema_data = payload.get("data", {})
+                            # ⭐⭐⭐ CRITICAL FIX ⭐⭐⭐
+                            schema_data = payload.get("data", {})
 
-                        st.session_state.detected_schema = schema_data
-                        st.session_state.schema_candidates = payload.get("candidates", [])
-                        st.session_state.schema_detected = True
-                        # Bug #6: reset downstream phases so stale results don't persist
-                        for _downstream_phase in [3, 4, 5, 6, 7]:
-                            st.session_state.phase_states[_downstream_phase] = {
-                                "status": "pending",
-                                "reason": "Schema changed — re-run required",
+                            st.session_state.detected_schema = schema_data
+                            st.session_state.schema_candidates = payload.get("candidates", [])
+                            st.session_state.schema_detected = True
+                            # Bug #6: reset downstream phases so stale results don't persist
+                            for _downstream_phase in [3, 4, 5, 6, 7]:
+                                st.session_state.phase_states[_downstream_phase] = {
+                                    "status": "pending",
+                                    "reason": "Schema changed — re-run required",
+                                }
+                            st.session_state.preprocess_result = None
+                            st.session_state.model_selected = False
+                            st.session_state.model_selection_result = {}
+                            st.session_state.training_result = None
+                            st.session_state.training_task_id = None
+                            st.session_state.trained_model_id = None
+                            st.session_state.text_columns = []
+                            st.session_state.image_columns = []
+                            st.session_state.phase_states[2] = {
+                                "status": "completed",
+                                "reason": (
+                                    f"Detected {len(schema_data.get('per_dataset', []))} dataset(s), "
+                                    f"target='{schema_data.get('primary_target', '?')}', "
+                                    f"confidence={float(schema_data.get('detection_confidence', 0) or 0):.1%}"
+                                ),
                             }
-                        st.session_state.preprocess_result = None
-                        st.session_state.model_selected = False
-                        st.session_state.model_selection_result = {}
-                        st.session_state.training_result = None
-                        st.session_state.training_task_id = None
-                        st.session_state.trained_model_id = None
-                        st.session_state.text_columns = []
-                        st.session_state.image_columns = []
-                        st.session_state.phase_states[2] = {
-                            "status": "completed",
-                            "reason": (
-                                f"Detected {len(schema_data.get('per_dataset', []))} dataset(s), "
-                                f"target='{schema_data.get('primary_target', '?')}', "
-                                f"confidence={float(schema_data.get('detection_confidence', 0) or 0):.1%}"
-                            ),
-                        }
 
-                        progress_bar.progress(1.0)
-                        st.success("✅ Schema detection complete!")
-                        st.rerun()
-                    else:
-                        _show_error_with_retry(f"❌ Detection failed: {_api_error_detail(response)}", "retry_schema")
+                            progress_bar.progress(1.0)
+                            st.success("✅ Schema detection complete!")
+                            st.rerun()
+                        else:
+                            _show_error_with_retry(f"❌ Detection failed: {_api_error_detail(response)}", "retry_schema")
 
-                except requests.exceptions.Timeout:
-                    _show_error_with_retry("❌ Timeout after 120 seconds — try fewer datasets or shorter text columns.", "retry_schema_timeout")
-                except Exception as e:
-                    _show_error_with_retry(f"❌ Detection error: {str(e)}", "retry_schema_err")
+                    except requests.exceptions.Timeout:
+                        _show_error_with_retry("❌ Timeout after 120 seconds — try fewer datasets or shorter text columns.", "retry_schema_timeout")
+                    except Exception as e:
+                        _show_error_with_retry(f"❌ Detection error: {str(e)}", "retry_schema_err")
 
     with col2:
         if st.checkbox("Show Detection Details"):
@@ -2328,6 +2464,39 @@ def render_phase_2_schema_detection():
             f"**Modalities Found:** {', '.join(global_modalities) if global_modalities else 'None'}"
         )
 
+        # ── Tier 0 Semantic Augmentation status ───────────────────────────────
+        _all_detected_cols: list = []
+        for _ds_entry in (per_dataset or []):
+            for _col_list in _ds_entry.get("detected_columns", {}).values():
+                _all_detected_cols.extend(_col_list if isinstance(_col_list, list) else [])
+        _has_reasoning = "reasoning_text" in _all_detected_cols
+        _has_blip = "blip_caption" in _all_detected_cols
+        if _has_reasoning or _has_blip:
+            st.markdown("**🧠 Semantic Augmentation Detected:**")
+            if _has_reasoning:
+                st.success("✅ `reasoning_text` column found — LLM semantic scaffold active. "
+                           "DeBERTa encodes this as a frozen 3rd ULA modality.")
+            if _has_blip:
+                st.success("✅ `blip_caption` column found — BLIP visual descriptions active.")
+
+        with st.expander("🧠 Semantic Augmentation (Tier 0 — Optional)", expanded=False):
+            st.markdown("""
+Run these scripts **once** before training to add two columns that significantly improve multimodal accuracy:
+- **`blip_caption`**: Auto image descriptions via BLIP-large (~8 min GPU / ~70 min CPU)
+- **`reasoning_text`**: LLM semantic analysis via GPT-4o-mini (~$0.26 for 8,500 rows)
+
+```bash
+python scripts/generate_image_captions.py --dataset YOUR_CSV
+python scripts/generate_reasoning_augmentation.py --dataset YOUR_CSV --dry-run 5
+```
+""")
+            _has_key = bool(os.environ.get("APEX_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+            if not _has_key:
+                st.warning("⚠️ `APEX_OPENAI_API_KEY` not set — reasoning augmentation requires OpenAI key.")
+            st.write("✅ `reasoning_text` in dataset" if _has_reasoning else "⬜ `reasoning_text` not yet generated")
+            st.write("✅ `blip_caption` in dataset" if _has_blip else "⬜ `blip_caption` not yet generated")
+            st.caption("Papers: BLIP (Li et al. ICML 2022) · OSPC (2024) · SupCon (Khosla NeurIPS 2020)")
+
         # ── Tabs ──────────────────────────────────────────────────────────────
         tab1, tab2, tab3, tab4 = st.tabs([
             "Summary", "Override Targets", "Debug Info", "Why This Target?"
@@ -2366,8 +2535,8 @@ def render_phase_2_schema_detection():
                             value=f"{float(xs3_gap):.3f}",
                             help=(
                                 "XS3 = gap between top-1 and top-2 target confidence scores. "
-                                "Values > 0.3 indicate an unambiguous target. "
-                                "Values < 0.1 indicate multiple plausible targets - override recommended."
+                                f"Values > {_xs3_ok:.1f} indicate an unambiguous target. "
+                                f"Values < {_xs3_warn:.1f} indicate multiple plausible targets — override recommended."
                             ),
                         )
 
@@ -2386,6 +2555,26 @@ def render_phase_2_schema_detection():
                     all_cols.extend(col_list)
                 auto_target = ds.get("target_column", "Unknown")
                 current_override = overrides.get(ds_id, {}).get("target_column", auto_target)
+
+                # Fetch ranked target candidates from backend intelligence endpoint.
+                # Shows the user mathematically ranked suggestions instead of a flat list.
+                try:
+                    _cand_resp = requests.get(
+                        ep.dataset_target_candidates(ds_id), timeout=5
+                    )
+                    if _cand_resp.status_code == 200:
+                        _cands = _cand_resp.json().get("candidates", [])
+                        if _cands:
+                            st.caption(f"✨ **Ranked target suggestions for `{ds_id[:25]}`:**")
+                            for _ci, _c in enumerate(_cands[:5]):
+                                _name = _c.get("name") or _c if isinstance(_c, str) else str(_c)
+                                _score = _c.get("score", _c.get("confidence", "")) if isinstance(_c, dict) else ""
+                                _badge = "🥇" if _ci == 0 else "🥈" if _ci == 1 else "🥉" if _ci == 2 else "  "
+                                _score_str = f"  score={_score:.2f}" if isinstance(_score, float) else ""
+                                st.markdown(f"&nbsp;&nbsp;{_badge} `{_name}`{_score_str}")
+                except Exception:
+                    pass  # Non-fatal: fallback to local columns below
+
                 col_options = ["(auto) " + auto_target] + [c for c in all_cols if c != auto_target]
                 sel_idx = 0
                 if current_override != auto_target and current_override in all_cols:
@@ -2423,6 +2612,24 @@ def render_phase_2_schema_detection():
                     if ds_id in overrides:
                         ds["target_column"] = overrides[ds_id].get("target_column", ds["target_column"])
                         ds["problem_type"] = overrides[ds_id].get("problem_type", ds["problem_type"])
+                        # Also push to the backend schema override endpoint so the
+                        # server-side schema is authoritative for all subsequent phases.
+                        try:
+                            _ov_resp = requests.post(
+                                ep.dataset_override_schema(ds_id),
+                                json={
+                                    "session_id": st.session_state.session_id,
+                                    "overrides": overrides[ds_id],
+                                },
+                                timeout=10,
+                            )
+                            if _ov_resp.status_code not in (200, 201):
+                                st.warning(
+                                    f"Schema override for {ds_id[:20]} returned "
+                                    f"{_ov_resp.status_code} (local override still applied)."
+                                )
+                        except Exception as _ov_exc:
+                            st.warning(f"Schema override API call failed (local override still applied): {_ov_exc}")
                 best_conf, best_target, best_prob = -1.0, "Unknown", global_problem
                 for ds in per_dataset:
                     if ds.get("target_column", "Unknown") != "Unknown" and ds.get("confidence", 0) > best_conf:
@@ -2688,7 +2895,17 @@ def render_phase_2_schema_detection():
 
         st.divider()
 
-        if st.button("➡️ Next: Preprocessing", width="stretch"):
+        # Guard: require group selection if multiple unrelated dataset groups detected
+        _schema_for_guard = st.session_state.get("detected_schema") or {}
+        _n_groups_guard = _schema_for_guard.get("relatedness_report", {}).get("n_groups", 1)
+        _group_conflict = (_n_groups_guard > 1
+                           and st.session_state.get("active_dataset_group") is None)
+        if st.button(
+            "➡️ Next: Preprocessing",
+            width="stretch",
+            disabled=_group_conflict,
+            help="Select a dataset group above before continuing." if _group_conflict else None,
+        ):
             st.session_state.workflow_stage = 3
             st.rerun()
 
@@ -2751,6 +2968,60 @@ def render_phase_3_preprocessing():
             st.session_state.workflow_stage = 1
             st.rerun()
         return
+
+    # Pre-Flight Intelligence Report — fetch guardrails + ranked-candidates before
+    # the user commits compute budget. Shows leakage warnings and top encoder pairings.
+    _sid_ph3 = st.session_state.get("session_id")
+    if _sid_ph3:
+        with st.expander("🛡️ Pre-Flight Intelligence Report (click before running)", expanded=False):
+            _pf_col1, _pf_col2 = st.columns(2)
+            with _pf_col1:
+                st.markdown("**Safety Guardrails**")
+                try:
+                    _gr = requests.get(ep.intelligence(_sid_ph3, "guardrails"), timeout=5)
+                    if _gr.status_code == 200:
+                        _guardrails = _gr.json().get("guardrails", _gr.json())
+                        if isinstance(_guardrails, list):
+                            for _g in _guardrails:
+                                _sev = str(_g.get("severity", "info")).lower()
+                                _icon = "🔴" if _sev == "error" else "🟡" if _sev == "warning" else "🟢"
+                                st.markdown(f"{_icon} {_g.get('message', _g)}")
+                        elif isinstance(_guardrails, dict):
+                            for _k, _v in _guardrails.items():
+                                st.write(f"**{_k}:** {_v}")
+                        else:
+                            st.info("No guardrail warnings — pipeline looks clean.")
+                    elif _gr.status_code in (404, 422):
+                        st.info("Guardrails available after schema detection completes.")
+                    else:
+                        st.caption(f"Guardrails not available ({_gr.status_code}).")
+                except Exception:
+                    st.caption("Guardrails endpoint unreachable.")
+
+            with _pf_col2:
+                st.markdown("**Ranked Encoder Candidates**")
+                try:
+                    _rc = requests.get(ep.intelligence(_sid_ph3, "ranked-candidates"), timeout=5)
+                    if _rc.status_code == 200:
+                        _rc_data = _rc.json().get("ranked_candidates", _rc.json())
+                        _shown = False
+                        for _mod, _cands in (_rc_data.items() if isinstance(_rc_data, dict) else []):
+                            if isinstance(_cands, list) and _cands:
+                                st.markdown(f"*{_mod.title()}*")
+                                for _ci, _cand in enumerate(_cands[:3]):
+                                    _lbl = _cand.get("label", _cand.get("name", str(_cand)))
+                                    _sc = _cand.get("val_score", _cand.get("cost_score", ""))
+                                    _sc_str = f" ({_sc:.3f})" if isinstance(_sc, float) else ""
+                                    st.markdown(f"&nbsp;&nbsp;{'🥇' if _ci==0 else '·'} `{_lbl}`{_sc_str}")
+                                _shown = True
+                        if not _shown:
+                            st.info("Run model selection (Phase 4) to see ranked candidates.")
+                    elif _rc.status_code in (404, 422):
+                        st.info("Candidates available after model selection.")
+                    else:
+                        st.caption(f"Ranked candidates not available ({_rc.status_code}).")
+                except Exception:
+                    st.caption("Ranked candidates endpoint unreachable.")
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -2843,10 +3114,6 @@ def render_phase_3_preprocessing():
 
     if not stages:
         st.info("No preprocessing results yet. Click 'Start Preprocessing' above.")
-        if st.button("Next: Model Selection"):
-            st.session_state.workflow_stage = 4
-            st.session_state.model_selected = False
-            st.rerun()
         return
 
     # Stage overview metrics
@@ -3532,12 +3799,32 @@ def render_phase_4_model_selection():
                     f"JIT budget ({_jit_budget_mb} MB) uses 85% safety margin. "
                     "VRAM Filter (below) uses 70% — different conservative thresholds for different selection stages."
                 )
-                st.write(
-                    f"- Selected image encoder: {jit_dry_run.get('selected_image_encoder', 'N/A')}"
+                _img_enc = jit_dry_run.get("selected_image_encoder", "N/A")
+                _txt_enc = jit_dry_run.get("selected_text_encoder", "N/A")
+                _img_fam = jit_dry_run.get("image_encoder_family", "generic")
+                _txt_fam = jit_dry_run.get("text_encoder_family", "generic")
+                _jit_c1, _jit_c2 = st.columns(2)
+                _jit_c1.metric(
+                    "Image Encoder", _img_enc,
+                    delta=_img_fam.upper() if _img_fam != "generic" else "generic",
+                    help="Pre-training family determines required text encoder pairing.",
                 )
-                st.write(
-                    f"- Selected text encoder: {jit_dry_run.get('selected_text_encoder', 'N/A')}"
+                _jit_c2.metric(
+                    "Text Encoder", _txt_enc,
+                    delta=_txt_fam.upper() if _txt_fam != "generic" else "generic",
                 )
+                # Family pairing enforcement status
+                if _img_fam not in ("generic", "N/A", None) and _txt_fam not in ("generic", "N/A", None):
+                    if _img_fam == _txt_fam:
+                        st.success(
+                            f"✅ Homogeneous pairing — both encoders in **{_img_fam.upper()}** "
+                            "latent space. Alignment loss valid."
+                        )
+                    else:
+                        st.error(
+                            f"⚠️ Family mismatch: {_img_enc} ({_img_fam}) + {_txt_enc} ({_txt_fam}). "
+                            "Latent spaces incompatible — alignment loss will diverge."
+                        )
 
         # Part B.1 — ULA fusion config display
         _fusion_strat = str(best.get("fusion_strategy") or "").lower()
@@ -3652,21 +3939,26 @@ def render_phase_4_model_selection():
             _cur_img = _jit.get("selected_image_encoder", "auto")
             _cur_txt = _jit.get("selected_text_encoder", "auto")
 
-            _vision_options = [
-                "auto (JIT-selected)",
-                "MobileNetV3-Small",  "EfficientNet-B0",
-                "ResNet-50",          "ConvNeXt-Tiny",
-                "MultiScale-ResNet50",
-                "CLIP-ViT-B/16 (plugin)",
-                "DINOv2-ViT-B/14 (plugin)",
-                "SigLIP-ViT-B/16 (plugin)",
+            # Build encoder option lists dynamically from JIT vram_filter_report when available
+            _vram_rpt = best.get("vram_filter_report", {}) or {}
+            _all_candidates = _vram_rpt.get("all_candidates", {}) or {}
+            _dyn_img = ["auto (JIT-selected)"] + [
+                s.get("name", "") for s in _all_candidates.get("image", []) if s.get("name")
             ]
-            _text_options = [
+            _dyn_txt = ["auto (JIT-selected)"] + [
+                s.get("name", "") for s in _all_candidates.get("text", []) if s.get("name")
+            ]
+            _vision_options = _dyn_img if len(_dyn_img) > 1 else [
+                "auto (JIT-selected)",
+                "MobileNetV3-Small", "EfficientNet-B0",
+                "ResNet-50", "ConvNeXt-Tiny", "MultiScale-ResNet50",
+                "CLIP-ViT-B/16 (plugin)", "DINOv2-ViT-B/14 (plugin)", "SigLIP-ViT-B/16 (plugin)",
+            ]
+            _text_options = _dyn_txt if len(_dyn_txt) > 1 else [
                 "auto (JIT-selected)",
                 "MiniLM-L6-v2", "DistilBERT",
                 "BERT-base-uncased", "DeBERTa-v3-base",
-                "all-mpnet-base-v2 (plugin)",
-                "Mistral-7B-Instruct-4bit (plugin)",
+                "all-mpnet-base-v2 (plugin)", "Mistral-7B-Instruct-4bit (plugin)",
             ]
             _tab_options = [
                 "auto (JIT-selected)",
@@ -3906,7 +4198,12 @@ def render_phase_4_model_selection():
         else:
             st.session_state.hp_overrides = None
 
-        if st.button("Next: Training"):
+        _model_selected = st.session_state.get("model_selected", False)
+        if st.button(
+            "➡️ Next: Training",
+            disabled=not _model_selected,
+            help="Run 'Select Models' above first to enable training." if not _model_selected else None,
+        ):
             st.session_state.workflow_stage = 5
             st.rerun()
 
@@ -4146,6 +4443,32 @@ def render_phase_5_training():
             ep_cols[5].metric("Val AUROC", f"{latest['val_auroc']:.3f}")
 
     if status == "running":
+        # Model architecture — captured at trial 0 build time, visible immediately
+        _arch_evt = next(
+            (e for e in reversed(trial_events) if e.get("event_type") == "model_architecture"),
+            None,
+        )
+        if _arch_evt:
+            _ad = _arch_evt.get("data", {})
+            with st.expander("Model Architecture", expanded=True):
+                _mc1, _mc2, _mc3 = st.columns(3)
+                _mc1.metric("Total Params", f"{_ad.get('total_params_m', 0):.2f} M")
+                _mc2.metric("Trainable", f"{_ad.get('trainable_params', 0) / 1e6:.2f} M")
+                _mc3.metric("Est. Size", f"{_ad.get('size_mb', 0):.1f} MB")
+                if _ad.get("layers"):
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Name": l["name"],
+                                "Type": l["type"],
+                                "Params": f"{l['params']:,}",
+                            }
+                            for l in _ad["layers"]
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
         cockpit_left, cockpit_right = st.columns([1.4, 1.0])
         with cockpit_left:
             st.markdown("##### Trial Timeline")
@@ -4216,6 +4539,25 @@ def render_phase_5_training():
         }
 
         st.success("Training Complete!")
+
+        # Show which training techniques actually activated for this run
+        _activated = data.get("activated_methods", []) or []
+        if _activated:
+            st.markdown("**Techniques activated this run:** " +
+                        " · ".join(f"`{m}`" for m in _activated))
+        else:
+            # Infer activations from result fields when explicit list missing
+            _active_badges = []
+            if metrics.get("n_trials", 0) > 1:
+                _active_badges.append("Optuna HPO")
+            if fusion_summary.get("fusion_type", "").lower() == "ula":
+                _active_badges.append("ULA cross-modal")
+            if data.get("calibration", {}).get("enabled"):
+                _active_badges.append("Calibration")
+            if _active_badges:
+                st.markdown("**Detected active techniques:** " +
+                            " · ".join(f"`{m}`" for m in _active_badges))
+
         st.markdown("### Training Metrics")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Best Val Loss", f"{metrics.get('best_val_loss', 'N/A'):.4f}"
@@ -4242,6 +4584,66 @@ def render_phase_5_training():
             sp2.metric("Train Samples", split_info.get("train", "?"))
             sp3.metric("Val Samples", split_info.get("val", "?"))
 
+        # ── Calibration before/after comparison ──────────────────────────────
+        _cal = data.get("calibration", {}) or {}
+        if _cal.get("enabled"):
+            with st.expander("📐 Calibration Results", expanded=False):
+                _mb = _cal.get("metrics_before", {}) or {}
+                _ma = _cal.get("metrics_after", {}) or {}
+                if _mb and _ma:
+                    _cb, _ca = st.columns(2)
+                    with _cb:
+                        st.caption("**Before calibration**")
+                        st.metric("ECE", f"{_mb.get('ece', 0):.4f}")
+                        st.metric("Brier", f"{_mb.get('brier', 0):.4f}")
+                        if "nll" in _mb:
+                            st.metric("NLL", f"{_mb['nll']:.4f}")
+                    with _ca:
+                        st.caption("**After calibration**")
+                        _ece_d = (_ma.get("ece", 0) or 0) - (_mb.get("ece", 0) or 0)
+                        st.metric("ECE", f"{_ma.get('ece', 0):.4f}",
+                                  delta=f"{_ece_d:+.4f}", delta_color="inverse")
+                        _brier_d = (_ma.get("brier", 0) or 0) - (_mb.get("brier", 0) or 0)
+                        st.metric("Brier", f"{_ma.get('brier', 0):.4f}",
+                                  delta=f"{_brier_d:+.4f}", delta_color="inverse")
+                        if "nll" in _ma:
+                            st.metric("NLL", f"{_ma['nll']:.4f}")
+                    if _cal.get("temperature"):
+                        _T = float(_cal["temperature"])
+                        st.caption(
+                            f"Temperature scaling: T = {_T:.3f} — "
+                            + ("overconfident before (T>1)" if _T > 1 else "underconfident (T<1)" if _T < 1 else "well-calibrated")
+                        )
+                else:
+                    st.metric("Mode", _cal.get("mode", "N/A"))
+                st.caption(
+                    f"Mode: `{_cal.get('mode', 'N/A')}` · Method: {_cal.get('mode', 'isotonic')}. "
+                    "ECE = Expected Calibration Error (↓ better). "
+                    "Brier = mean squared probability error (↓ better)."
+                )
+
+        # ── Model Summary ────────────────────────────────────────────────────
+        _msummary = metrics.get("model_summary", {}) or {}
+        if _msummary:
+            with st.expander("Model Architecture Summary", expanded=False):
+                ms1, ms2, ms3, ms4 = st.columns(4)
+                ms1.metric("Total Params", f"{_msummary.get('total_params_m', 0):.2f} M")
+                ms2.metric("Trainable Params", f"{_msummary.get('trainable_params', 0) / 1e6:.2f} M")
+                ms3.metric("Model Size", f"{_msummary.get('size_mb', 0):.1f} MB")
+                ms4.metric("Layers", len(_msummary.get("layers", [])))
+                _mlayers = _msummary.get("layers", [])
+                if _mlayers:
+                    _layer_df = pd.DataFrame([
+                        {
+                            "Name": l["name"],
+                            "Type": l["type"],
+                            "Params": f"{l['params']:,}",
+                            "Params (M)": f"{l['params'] / 1e6:.3f}",
+                        }
+                        for l in _mlayers
+                    ])
+                    st.dataframe(_layer_df, use_container_width=True, hide_index=True)
+
         fusion_summary = metrics.get("fusion_summary", {}) or {}
         fusion_aux_weights = (
             metrics.get("fusion_aux_weights", {})
@@ -4249,7 +4651,7 @@ def render_phase_5_training():
             or {}
         )
         if fusion_summary or fusion_aux_weights:
-            with st.expander("Fusion Diagnostics", expanded=False):
+            with st.expander("🔬 Architecture & Fusion Diagnostics", expanded=False):
                 fs1, fs2, fs3 = st.columns(3)
                 fs1.metric("Fusion Type", fusion_summary.get("fusion_type", "N/A"))
                 fs2.metric("Backend", fusion_summary.get("backend_module", "N/A"))
@@ -4287,9 +4689,13 @@ def render_phase_5_training():
                         st.caption("ULA cross-modal alignment and contrastive loss curves")
                         st.line_chart(_extra_df, color=["#a78bfa", "#14b8a6"])
 
-        # ── Encoding Architecture Panel ───────────────────────────────────────
-        with st.expander("🔬 Encoding Architecture (Before → Hidden → After)", expanded=False):
-            _fs = fusion_summary if fusion_summary else {}
+        # ── Encoding architecture is now MERGED inside the Architecture & Fusion Diagnostics expander above ──
+        # (Content moved into that expander; duplicate standalone expander removed)
+        if fusion_summary:
+            # Append encoding architecture details to existing merged expander
+            # This content was previously a separate "Encoding Architecture" expander.
+            # It's now part of the merged "Architecture & Fusion Diagnostics" expander.
+            _fs = fusion_summary
             _enc_dims = _fs.get("encoder_dims", {})
             _tok_mode = _fs.get("token_mode", False)
             _clip_active = _fs.get("clip_projections_active", False)
@@ -4297,51 +4703,41 @@ def render_phase_5_training():
             _cw = _fs.get("contrastive_weight", 0.0)
             _ula_d = _fs.get("ula_latent_dim")
             _ula_l = _fs.get("ula_n_layers")
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown("**Before (encoders)**")
-                if _enc_dims:
-                    for mod, dim in _enc_dims.items():
-                        st.write(f"→ `{mod}`: {dim}-dim output")
-                else:
-                    st.caption("Encoder dims not yet available")
-
-            with col2:
-                st.markdown("**Hidden (fusion)**")
-                fusion_type = _fs.get("fusion_type", "—")
-                st.write(f"Fusion: `{fusion_type}`")
-                if _ula_d:
-                    st.write(f"ULA latent dim: `{_ula_d}`")
-                if _ula_l:
-                    st.write(f"ULA Transformer layers: `{_ula_l}`")
-                mode_label = "Token sequences (full attention)" if _tok_mode else "Pooled vectors (CLS only)"
-                st.write(f"Input mode: `{mode_label}`")
-
-            with col3:
-                st.markdown("**After (contrastive + head)**")
-                if _clip_active and _cw > 0:
-                    st.write("CLIP projections: ✅ active")
-                    st.write(f"Contrastive weight: `{_cw:.3f}`")
-                else:
-                    st.write("CLIP projections: single-modality (inactive)")
-                st.write("Classification head: `MLP`")
-
-            if _grad_scales:
-                st.markdown("**Per-modality gradient health** (Wang et al. 2020 gradient balancing)")
-                _grad_df = pd.DataFrame([
-                    {"modality": k, "grad_scale": v,
-                     "status": "⚠️ dominant" if v > 1.5 else ("⚠️ weak" if v < 0.5 else "✅ balanced")}
-                    for k, v in _grad_scales.items()
-                ])
-                st.dataframe(_grad_df, width="stretch")
-                if any(v > 1.5 or v < 0.5 for v in _grad_scales.values()):
-                    st.warning(
-                        "Modality imbalance detected — one modality's gradients dominate. "
-                        "Consider increasing modality dropout or adjusting alignment weight."
-                    )
-            else:
-                st.caption("Gradient scales available after first training epoch")
+            # These are displayed inside the already-open expander at lines above.
+            # Since Python context managers don't allow re-entry, surface as separate collapsed:
+            with st.expander("🔬 Encoding Architecture (Before → After)", expanded=False):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown("**Before (encoders)**")
+                    if _enc_dims:
+                        for mod, dim in _enc_dims.items():
+                            st.write(f"→ `{mod}`: {dim}-dim output")
+                    else:
+                        st.caption("Encoder dims not yet available")
+                with col2:
+                    st.markdown("**Hidden (fusion)**")
+                    st.write(f"Fusion: `{_fs.get('fusion_type', '—')}`")
+                    if _ula_d:
+                        st.write(f"ULA latent dim: `{_ula_d}`")
+                    if _ula_l:
+                        st.write(f"ULA Transformer layers: `{_ula_l}`")
+                    st.write(f"Input mode: `{'Token sequences' if _tok_mode else 'Pooled vectors'}`")
+                with col3:
+                    st.markdown("**After (contrastive + head)**")
+                    if _clip_active and _cw > 0:
+                        st.write("CLIP projections: ✅ active")
+                        st.write(f"Contrastive weight: `{_cw:.3f}`")
+                    else:
+                        st.write("CLIP projections: inactive")
+                    st.write("Classification head: `MLP`")
+                if _grad_scales:
+                    st.markdown("**Per-modality gradient health**")
+                    _grad_df = pd.DataFrame([
+                        {"modality": k, "grad_scale": v,
+                         "status": "⚠️ dominant" if v > 1.5 else ("⚠️ weak" if v < 0.5 else "✅ balanced")}
+                        for k, v in _grad_scales.items()
+                    ])
+                    st.dataframe(_grad_df, use_container_width=True)
 
         fit_type = metrics.get("fit_type", "unknown")
         if fit_type == "overfitting":
@@ -4458,17 +4854,87 @@ def render_phase_5_training():
             with xai_tabs[2]:
                 text_xai = xai.get("text", {}) if isinstance(xai, dict) else {}
                 img_xai = xai.get("image", {}) if isinstance(xai, dict) else {}
-                if text_xai.get("method") not in (None, "dummy"):
-                    st.write(
-                        f"**Text:** seq_len={text_xai.get('seq_len', '?')}, "
-                        f"method=`{text_xai.get('method')}`"
-                    )
-                else:
-                    st.info("No text XAI - text encoder not in model or attention extraction unavailable.")
-                if img_xai.get("method") not in (None, "dummy"):
-                    st.write(f"**Image GradCAM:** shape={img_xai.get('heatmap_shape', '?')}")
-                else:
-                    st.info("Image GradCAM not implemented. Use Captum GradCAM in a future release.")
+                # Normalize training XAI fields to match prediction XAI structure
+                _text_norm = {
+                    "tokens": text_xai.get("tokens", []),
+                    "attributions": text_xai.get("token_scores", []),
+                    "note": text_xai.get("note", ""),
+                }
+                _img_norm = {
+                    "gradcam_available": img_xai.get("method") not in (None, "dummy"),
+                    "heatmap": img_xai.get("heatmap"),
+                    "heatmap_shape": img_xai.get("heatmap_shape"),
+                    "method": img_xai.get("method", "GradCAM"),
+                    "note": img_xai.get("note", img_xai.get("info", "")),
+                }
+                _render_xai_text(_text_norm if _text_norm["tokens"] else None)
+                _render_xai_image(_img_norm if _img_norm["gradcam_available"] else None,
+                                   model_id=st.session_state.get("trained_model_id"))
+
+        # ── Adaptive Learning diagnostics (C1–C9 training signals) ──────────
+        _adapt = data.get("adaptive_diagnostics", {}) or {}
+        if _adapt and not _adapt.get("error"):
+            st.divider()
+            st.markdown("### ⚡ Adaptive Learning — Self-Calibrating Signals")
+            _a1, _a2, _a3 = st.columns(3)
+
+            _tau = _adapt.get("final_temperature")
+            if _tau is not None:
+                _a1.metric(
+                    "Learned Temperature τ", f"{_tau:.4f}",
+                    delta=f"{_tau - 0.07:+.4f} from init 0.07",
+                    delta_color="off",
+                    help="NT-Xent/SupCon temperature. Higher (0.10–0.20) = better at bs≤16.",
+                )
+            else:
+                _a1.metric("Temperature τ", "N/A", help="ULA not active.")
+
+            _σ_cls = _adapt.get("final_sigma_cls")
+            if _σ_cls is not None:
+                _a2.metric(
+                    "σ_cls (Cls Weight)", f"{_σ_cls:.4f}",
+                    help="Kendall uncertainty weight. >1.0 = model treats cls as uncertain.",
+                )
+
+            _σ_con = _adapt.get("final_sigma_con")
+            if _σ_con is not None:
+                _a3.metric(
+                    "σ_con (Align Weight)", f"{_σ_con:.4f}",
+                    help="Kendall weight for alignment/contrastive. >1.0 = noisier alignment.",
+                )
+
+            _loss_mode = _adapt.get("contrastive_loss_mode")
+            if _loss_mode == "supcon":
+                st.success("✅ **SupCon** active — same-class cross-modal pairs are positives. False negatives eliminated.")
+            elif _loss_mode == "nt_xent":
+                st.warning("⚠️ **NT-Xent** active — no class-label matching. SupCon would improve classification 3–5%.")
+
+            _lora = _adapt.get("lora_diagnostics", {})
+            if _lora:
+                _l1, _l2, _l3, _l4 = st.columns(4)
+                _l1.metric("LoRA r", _lora.get("r", "—"))
+                _l2.metric("LoRA α", _lora.get("alpha", "—"),
+                           help="Scaling = α/r. At r=4, α=32 gives 8× adaptation strength.")
+                _l3.metric("Last N Layers", _lora.get("last_n_layers", "—"))
+                _l4.metric("LR Mult", _lora.get("lr_mult", "—"))
+
+            _neg = _adapt.get("effective_negatives")
+            if _neg:
+                _bs = data.get("batch_size", 0) or metrics.get("batch_size", 0)
+                st.caption(
+                    f"Cross-step buffer: **{_neg} effective negatives** per step "
+                    + (f"(2× batch size {_bs})" if _neg > _bs else f"(1× batch size {_bs})") + ". "
+                    "Buffer doubles NT-Xent negatives at zero VRAM cost."
+                )
+
+            st.caption(
+                "**Papers:** Learnable τ: CLIP (Radford 2021) · "
+                "Uncertainty Weighting: Kendall CVPR 2018 · "
+                "SupCon: Khosla NeurIPS 2020 · LoRA: Hu ICLR 2022"
+            )
+        elif _adapt.get("error"):
+            with st.expander("⚡ Adaptive Learning", expanded=False):
+                st.warning(f"Adaptive diagnostics unavailable: {_adapt['error']}")
 
         # Retrain with manual HP overrides
         best_params = metrics.get("best_params", {})
@@ -4903,7 +5369,16 @@ def _render_loss_chart(epoch_metrics: List[Dict], trial_events: Optional[List[Di
                 )
                 loss_chart = loss_chart + best_points + best_labels
 
-    charts = [loss_chart.interactive()]
+    # Named selections avoid Altair 5.x deduplication warnings that occur when
+    # multiple charts in a vconcat composition use .interactive() (which creates
+    # anonymous selection_interval params with identical configs).
+    def _named_zoom(chart: "alt.Chart", name: str) -> "alt.Chart":
+        try:
+            return chart.add_params(alt.selection_interval(bind="scales", name=name))
+        except Exception:
+            return chart.interactive()
+
+    charts = [_named_zoom(loss_chart, "loss_zoom")]
 
     # ── 3. AUROC area chart ───────────────────────────────────────────────
     if "val_auroc" in normal_df.columns and (normal_df["val_auroc"] > 0).any():
@@ -4921,9 +5396,8 @@ def _render_loss_chart(epoch_metrics: List[Dict], trial_events: Optional[List[Di
                 tooltip=["label", "Trial", alt.Tooltip("val_auroc:Q", format=".4f")],
             )
             .properties(height=100, title="Validation AUROC")
-            .interactive()
         )
-        charts.append(auroc_chart)
+        charts.append(_named_zoom(auroc_chart, "auroc_zoom"))
 
     # ── 4. ULA auxiliary losses (alignment + contrastive) ─────────────────
     _aux_cols = [c for c in ("alignment_loss", "contrastive_loss")
@@ -4951,9 +5425,8 @@ def _render_loss_chart(epoch_metrics: List[Dict], trial_events: Optional[List[Di
                          alt.Tooltip("AuxLoss:Q", format=".5f")],
             )
             .properties(height=90, title="ULA Auxiliary Losses (Alignment + Contrastive)")
-            .interactive()
         )
-        charts.append(aux_chart)
+        charts.append(_named_zoom(aux_chart, "aux_zoom"))
 
     combined = alt.vconcat(*charts, spacing=8) if len(charts) > 1 else charts[0]
     st.altair_chart(combined, width='stretch')
@@ -5121,6 +5594,34 @@ def render_phase_6_monitoring():
             col2.metric("Production rows", drift.get("n_production", "?"))
             col3.metric("Features", drift.get("n_features", "?"))
 
+            # ── Per-feature drift breakdown ────────────────────────────────
+            with st.expander("📊 Per-Feature Drift Breakdown", expanded=False):
+                _intel_drift = api_call("GET", ep.intelligence(st.session_state.session_id, "drift")) or {}
+                _cov = _intel_drift.get("covariate_drift", {})
+                _per_ks = _cov.get("per_feature_ks", {})
+                _per_psi = _cov.get("per_feature_psi", {})
+                if _per_ks or _per_psi:
+                    _ks_thr = float(_cov.get("thresholds", {}).get("ks_statistic", 0.30))
+                    _psi_thr = float(_cov.get("thresholds", {}).get("psi", 0.25))
+                    _feat_rows = []
+                    for _feat in sorted(set(list(_per_ks.keys()) + list(_per_psi.keys()))):
+                        _ks = float(_per_ks.get(_feat, 0.0))
+                        _psi = float(_per_psi.get(_feat, 0.0))
+                        _feat_rows.append({
+                            "Feature": _feat,
+                            "KS": round(_ks, 4),
+                            "KS Status": "🔴" if _ks > _ks_thr else "🟡" if _ks > _ks_thr * 0.5 else "🟢",
+                            "PSI": round(_psi, 4),
+                            "PSI Status": "🔴" if _psi > _psi_thr else "🟡" if _psi > _psi_thr * 0.4 else "🟢",
+                        })
+                    _feat_df = pd.DataFrame(_feat_rows).sort_values("KS", ascending=False).head(50)
+                    st.dataframe(_feat_df, use_container_width=True)
+                    if len(_feat_rows) > 50:
+                        st.caption(f"Showing top 50 of {len(_feat_rows)} features.")
+                    st.caption(f"KS thr: {_ks_thr:.2f} | PSI thr: {_psi_thr:.2f} | 🔴 above | 🟡 moderate | 🟢 stable")
+                else:
+                    st.info("Per-feature drift data not yet available. Run Drift Detection first.")
+
             # ── Encoding health from last training run ─────────────────────
             _tr_result = st.session_state.get("training_result", {}) or {}
             _tr_metrics = _tr_result.get("metrics", {}) or {}
@@ -5199,6 +5700,16 @@ def render_phase_6_monitoring():
 
             with st.expander("Composite monitor payload"):
                 _kv_table(monitor_payload, "Monitor Payload")
+
+            _DEPTH_REASONS = {
+                "none": "No drift detected above any threshold.",
+                "calibration_only": "Low covariate drift — recalibrate confidence scores only.",
+                "head_only": "Medium drift — retrain prediction head with frozen encoders.",
+                "full": "High drift or concept drift — full model retraining required.",
+            }
+            _depth_val = (monitor_payload or {}).get("retrain_recommendation") or drift.get("retrain_recommendation", "none")
+            if _depth_val and _depth_val != "none":
+                st.info(f"**Recommended action: `{_depth_val}`** — {_DEPTH_REASONS.get(_depth_val, 'Unknown')}")
         else:
             st.info("Run 'Refresh Composite Monitor' to load monitor severity and recommendations.")
 
@@ -5277,7 +5788,7 @@ def render_phase_6_monitoring():
                 if st.button("✅ Apply Rename", key="do_rename", disabled=not new_name.strip()):
                     try:
                         r = requests.patch(
-                            f"{API_BASE_URL}/model-registry/{sel_model}/rename",
+                            ep.model_rename(sel_model),
                             json={"new_name": new_name.strip()},
                             timeout=10,
                         )
@@ -5296,12 +5807,9 @@ def render_phase_6_monitoring():
             with col_dl:
                 st.markdown("##### ⬇️ Download Model")
                 st.caption("Downloads a zip of all model artifacts + usage README.")
-                dl_url = f"{API_BASE_URL}/model-registry/{sel_model}/download"
-                # Use an anchor link — browser navigates to the streaming endpoint directly
-                st.markdown(
-                    f'<a href="{dl_url}" target="_blank">⬇️ Download `{sel_model}`</a>',
-                    unsafe_allow_html=True,
-                )
+                if sel_model:
+                    dl_url = ep.model_download(sel_model)
+                    st.link_button("⬇️ Download Model", url=dl_url)
 
             with col_onnx:
                 st.markdown("##### 📦 Export to ONNX")
@@ -5310,7 +5818,7 @@ def render_phase_6_monitoring():
                              help="Exports the fusion head to ONNX format"):
                     try:
                         r = requests.post(
-                            f"{API_BASE_URL}/model-registry/{sel_model}/export-onnx",
+                            ep.model_export_onnx(sel_model),
                             json={},
                             timeout=60,
                         )
@@ -5786,7 +6294,8 @@ def render_phase_6_monitoring():
     with col2:
         st.info("↑ Use the Download link in the Registry tab above")
     with col3:
-        st.button("Deploy to Production", disabled=True, help="Deployment not yet implemented")
+        st.info("💡 Export your model via **ONNX** (button above) for deployment. "
+                "Load the ONNX artifact into your production inference stack.")
 
     # ── Tab 6: Research Results — publication transparency ──────────────────────
     with tab_research:
@@ -5885,12 +6394,129 @@ def render_phase_7_prediction() -> None:
 
     _training_result = st.session_state.get("training_result") or {}
     _trained_model_id = _training_result.get("model_id") or st.session_state.get("trained_model_id")
+
+    # ── Registry fallback: no current-session training ────────────────────────
     if not _training_result or not _trained_model_id:
-        st.warning("Please complete training in Phase 5 first.")
-        if st.button("← Go to Phase 5", key="phase7_back_btn"):
-            st.session_state.workflow_stage = 5
-            st.rerun()
-        return
+        st.info("No model trained this session. Load a previously trained model from the registry.")
+
+        # Fetch all registry models (sessionless — filesystem scan)
+        _reg_models: List[Dict] = []
+        try:
+            _reg_resp = api_call("GET", "/model-registry")
+            _reg_models = [
+                m for m in (_reg_resp.get("models") or [])
+                if m.get("deployment_ready")
+            ]
+        except Exception:
+            pass
+
+        if not _reg_models:
+            st.warning("No deployment-ready models found in the registry. Train a model in Phase 5 first.")
+            if st.button("← Go to Phase 5", key="phase7_back_btn"):
+                st.session_state.workflow_stage = 5
+                st.rerun()
+            return
+
+        _reg_ids   = [m.get("model_id", "") for m in _reg_models]
+        _reg_dates = {m.get("model_id", ""): m.get("created_at", "")[:19] for m in _reg_models}
+        _reg_labels = [
+            f"{mid}  ({_reg_dates.get(mid, 'unknown date')})"
+            for mid in _reg_ids
+        ]
+
+        st.markdown("**Select a model from the registry:**")
+        _sel_label = st.selectbox("Registry model", options=_reg_labels, key="phase7_reg_model_sel")
+        _sel_id    = _reg_ids[_reg_labels.index(_sel_label)]
+
+        _load_col1, _load_col2 = st.columns([1, 2])
+        with _load_col1:
+            if st.button("Load Model", key="phase7_load_model_btn", type="primary"):
+                # Adopt into current session so session-scoped endpoints work
+                _sid = st.session_state.get("session_id")
+                if _sid:
+                    try:
+                        api_call(
+                            "POST",
+                            ep.adopt_model(_sid),
+                            json={"model_id": _sel_id},
+                        )
+                    except Exception:
+                        pass  # non-fatal — sessionless predict still works
+
+                # Populate session state so the rest of Phase 7 renders
+                try:
+                    _detail = api_call("GET", f"/model-info/{_sel_id}")
+                    st.session_state["trained_model_id"] = _sel_id
+                    st.session_state["training_result"] = {
+                        "model_id":         _sel_id,
+                        "deployment_ready": True,
+                        "from_registry":    True,
+                        "val_acc":          _detail.get("training_signals", {}).get("best_val_acc"),
+                        "val_f1":           _detail.get("training_signals", {}).get("best_val_f1"),
+                        "val_loss":         _detail.get("training_signals", {}).get("best_val_loss"),
+                        "fusion_strategy":  _detail.get("prediction_contract", {}).get("fusion_strategy"),
+                    }
+                    st.success(f"Model `{_sel_id}` loaded. Reloading…")
+                    st.rerun()
+                except Exception as _le:
+                    st.error(f"Failed to load model details: {_le}")
+
+        with _load_col2:
+            # Preview training metrics for the selected model
+            try:
+                _prev = api_call("GET", f"/model-info/{_sel_id}")
+                _ts   = _prev.get("training_signals", {})
+                _m1, _m2, _m3 = st.columns(3)
+                _m1.metric("Val Accuracy", f"{float(_ts.get('best_val_acc', 0) or 0):.1%}")
+                _m2.metric("Val F1",       f"{float(_ts.get('best_val_f1',  0) or 0):.3f}")
+                _m3.metric("Val Loss",     f"{float(_ts.get('best_val_loss',99) or 99):.4f}")
+            except Exception:
+                pass
+
+        return  # Wait for user to click Load Model
+
+    # ── Training Details panel (shows for any loaded model, session or registry) ─
+    with st.expander("📊 Training Details", expanded=False):
+        try:
+            _td   = api_call("GET", f"/model-info/{_trained_model_id}")
+            _ts   = _td.get("training_signals", {})
+            _fa   = _td.get("training_fit_analysis", {})
+            _ps   = _td.get("prediction_contract", {})
+            _av   = _td.get("artifact_versions", {})
+
+            st.markdown(f"**Model:** `{_trained_model_id}`")
+            _td_c1, _td_c2, _td_c3, _td_c4 = st.columns(4)
+            _td_c1.metric("Val Accuracy", f"{float(_ts.get('best_val_acc',  0) or 0):.1%}")
+            _td_c2.metric("Val F1",       f"{float(_ts.get('best_val_f1',   0) or 0):.3f}")
+            _td_c3.metric("Val Loss",     f"{float(_ts.get('best_val_loss', 99) or 99):.4f}")
+            _td_c4.metric("Train Acc",    f"{float(_ts.get('best_train_acc', 0) or 0):.1%}")
+
+            _td_c5, _td_c6, _td_c7 = st.columns(3)
+            _td_c5.metric("Optuna Trials", str(_ts.get("n_trials",   "—")))
+            _td_c6.metric("Best Trial #",  str(_ts.get("best_trial", "—")))
+            _td_c7.metric("Training Time", f"{float(_ts.get('training_time_s', 0) or 0):.0f}s")
+
+            if _fa:
+                st.markdown("**Fit Analysis**")
+                _fa_col1, _fa_col2 = st.columns(2)
+                _fa_col1.write(f"Fit type: **{_fa.get('fit_type', '—')}**")
+                _fa_col2.write(f"Generalisation gap: **{_fa.get('generalization_gap', '—')}**")
+
+            # Best hyperparameter config from training signals
+            _best_cfg = _ts.get("best_config") or _ts.get("best_hp_config") or {}
+            if _best_cfg:
+                with st.expander("Best Hyperparameter Config", expanded=False):
+                    st.json(_best_cfg)
+
+            if _av:
+                with st.expander("Artifact Versions", expanded=False):
+                    st.json(_av)
+
+            if _ps.get("fusion_strategy"):
+                st.caption(f"Fusion: **{_ps['fusion_strategy']}** | "
+                           f"Modalities: {', '.join(_ps.get('active_modalities', []))}")
+        except Exception as _tde:
+            st.caption(f"Training details unavailable: {_tde}")
 
     # ── G27: Prediction Playground (model registry quick-switcher) ────────────
     with st.expander("🎮 Prediction Playground — Registry & Active Model (G27)", expanded=False):
@@ -6343,7 +6969,6 @@ def render_phase_7_prediction() -> None:
 
     if st.button("Run Prediction", width="stretch", type="primary"):
         payload: Dict = {
-            "session_id": st.session_state.session_id,
             "model_id": model_id_input,
             "inputs": raw_inputs,
             "explain": enable_xai,
@@ -6351,32 +6976,58 @@ def render_phase_7_prediction() -> None:
             "n_steps": int(xai_n_steps),
         }
 
-        # ── Fire async task and poll until done ─────────────────────────────
-        with st.spinner("Submitting inference task..."):
-            try:
-                submit_resp = requests.post(
-                    f"{API_BASE_URL}/predict-async", json=payload, timeout=30,
-                )
-            except Exception as conn_exc:
-                st.error(f"Connection error: {conn_exc}")
-                return
-
-        if submit_resp.status_code != 200:
-            st.error(f"API error {submit_resp.status_code}: {submit_resp.text}")
-            return
-
-        task_id: str = submit_resp.json().get("task_id", "")
-        if not task_id:
-            st.error("No task_id returned from API.")
-            return
-
-        # Poll loop with progress feedback
-        progress_bar = st.progress(0, text="Inference running...")
-        poll_interval: float = 0.5  # seconds
-        max_polls: int = 600        # 5 minutes max
+        # Use sessionless /predict-registry when model was loaded from registry
+        # (no active training session), otherwise use /predict-async with session.
+        _from_registry = bool((_training_result or {}).get("from_registry"))
         result: Optional[Dict] = None
 
+        if _from_registry:
+            # ── Synchronous sessionless inference ───────────────────────────
+            with st.spinner("Running inference via registry model..."):
+                try:
+                    _reg_pred_resp = requests.post(
+                        f"{API_BASE_URL}/predict-registry", json=payload, timeout=120,
+                    )
+                    if _reg_pred_resp.status_code == 200:
+                        result = _reg_pred_resp.json()
+                    else:
+                        st.error(f"Prediction error {_reg_pred_resp.status_code}: {_reg_pred_resp.text}")
+                        return
+                except Exception as _rpe:
+                    st.error(f"Connection error: {_rpe}")
+                    return
+
+        else:
+            # ── Async task + poll (session-backed) ───────────────────────────
+            payload["session_id"] = st.session_state.session_id
+            with st.spinner("Submitting inference task..."):
+                try:
+                    submit_resp = requests.post(
+                        f"{API_BASE_URL}/predict-async", json=payload, timeout=30,
+                    )
+                except Exception as conn_exc:
+                    st.error(f"Connection error: {conn_exc}")
+                    return
+
+            if submit_resp.status_code != 200:
+                st.error(f"API error {submit_resp.status_code}: {submit_resp.text}")
+                return
+
+            task_id: str = submit_resp.json().get("task_id", "")
+            if not task_id:
+                st.error("No task_id returned from API.")
+                return
+
+            # Poll loop with progress feedback
+            progress_bar = st.progress(0, text="Inference running...")
+            poll_interval: float = 0.5  # seconds
+            max_polls: int = 600        # 5 minutes max
+
         import time as _time
+        _poll_err_key = f"_poll_errors_{task_id}"
+        if _poll_err_key not in st.session_state:
+            st.session_state[_poll_err_key] = 0
+
         for poll_i in range(max_polls):
             _time.sleep(poll_interval)
             # Gradually slow polling after initial burst
@@ -6387,13 +7038,30 @@ def render_phase_7_prediction() -> None:
                 status_resp = requests.get(
                     f"{API_BASE_URL}/task/{task_id}", timeout=10,
                 )
-            except Exception:
+                st.session_state[_poll_err_key] = 0  # Reset on success
+            except Exception as _poll_err:
+                st.session_state[_poll_err_key] = st.session_state.get(_poll_err_key, 0) + 1
+                if st.session_state[_poll_err_key] >= 5:
+                    progress_bar.empty()
+                    st.error(f"Prediction status polling failed 5 consecutive times: {_poll_err}. "
+                             "Check API server is running.")
+                    st.session_state.pop(_poll_err_key, None)
+                    return
                 continue
 
+            if status_resp.status_code == 404:
+                progress_bar.empty()
+                st.warning("Prediction task not found — it may have expired. Please retry.")
+                return
             if status_resp.status_code != 200:
                 continue
 
-            task_data = status_resp.json()
+            try:
+                task_data = status_resp.json()
+            except ValueError:
+                progress_bar.empty()
+                st.error("API returned invalid JSON. Check server logs.")
+                return
             task_status = task_data.get("status", "PENDING")
 
             if task_status == "PROCESSING":
@@ -6414,7 +7082,8 @@ def render_phase_7_prediction() -> None:
             st.error("Inference timed out after 5 minutes. Check server logs.")
             return
 
-        progress_bar.empty()
+        if not _from_registry:
+            progress_bar.empty()
 
         if not result:
             st.error("No result returned.")
@@ -6442,6 +7111,22 @@ def render_phase_7_prediction() -> None:
             if isinstance(c, list):
                 return f"{max(c):.3f}" if c else "N/A"
             return f"{c:.3f}"
+
+        # ── Conformal prediction interval (if calibrated with conformal) ──────
+        _conformal = result.get("conformal_prediction", {}) or {}
+        if _conformal:
+            with st.expander("🎯 Conformal Prediction Interval (Guaranteed Coverage)", expanded=True):
+                _cov = float(_conformal.get("coverage", 0.9))
+                st.caption(f"Guaranteed coverage: **{_cov:.0%}** of future predictions contain true label.")
+                if _conformal.get("prediction_set"):  # classification
+                    st.write(f"**Valid classes:** {_conformal['prediction_set']}")
+                elif _conformal.get("interval"):  # regression
+                    _lo, _hi = _conformal["interval"]
+                    st.write(f"**Prediction interval:** [{_lo:.4f}, {_hi:.4f}]")
+                st.caption(
+                    "Conformal prediction (Angelopoulos & Bates, 2022) provides distribution-free "
+                    "coverage guarantees without assuming Gaussian errors."
+                )
 
         # ── Results table (batch) ────────────────────────────────────────────
         if n_samples > 1:
@@ -6580,27 +7265,18 @@ In practical terms:
                     st.error(f"Session XAI fetch error: {_xex}")
             _xai_data = st.session_state.get("phase7_session_xai_data") or {}
             if _xai_data:
-                per_model = _xai_data.get("per_model", {}) or {}
+                per_model = _xai_data.get("per_model", []) or []
                 if per_model:
-                    for _mid, _payload in per_model.items():
-                        with st.expander(f"Model: {_mid}", expanded=False):
-                            tab_xai = _payload.get("tabular") or {}
-                            if tab_xai.get("feature_ranking"):
-                                st.markdown("**Tabular feature importance (top 10)**")
-                                _ranking = tab_xai["feature_ranking"][:10]
-                                _df = pd.DataFrame(_ranking)
-                                if "importance" in _df.columns:
-                                    _df = _df.sort_values("importance", ascending=False)
-                                st.dataframe(_df, width="stretch")
-                            txt_xai = _payload.get("text") or {}
-                            if txt_xai.get("importances"):
-                                st.markdown(f"**Text attribution stats**: {len(txt_xai['importances'])} tokens")
-                            img_xai = _payload.get("image") or {}
-                            if img_xai.get("heatmap_shape"):
-                                st.markdown(
-                                    f"**Image saliency**: shape={img_xai['heatmap_shape']}, "
-                                    f"min={img_xai.get('heatmap_min', '—')}, max={img_xai.get('heatmap_max', '—')}"
-                                )
+                    for _model_entry in per_model:
+                        _mid_display = str(_model_entry.get("model_id", "Unknown"))[:16]
+                        with st.expander(f"📊 XAI: Model {_mid_display}", expanded=True):
+                            _xai_normalized = _normalize_xai_for_rendering({
+                                "tabular": _model_entry.get("tabular", {}),
+                                "text": _model_entry.get("text", {}),
+                                "image": _model_entry.get("image", {}),
+                            }, source="training")
+                            _render_xai_tabs(_xai_normalized,
+                                             model_id=_model_entry.get("model_id"))
                 else:
                     st.info(_xai_data.get("note", "No XAI data available for any model in this session."))
 
@@ -6615,7 +7291,52 @@ In practical terms:
 # ---------------------------------------------------------------------------
 # D4: Extracted per-modality XAI rendering helper
 # ---------------------------------------------------------------------------
-def _render_xai_tabs(explanations: Dict[str, Any]) -> None:
+def _normalize_xai_for_rendering(xai: Dict[str, Any], source: str = "auto") -> Dict[str, Any]:
+    """Convert training XAI or prediction XAI to a common structure for _render_xai_tabs().
+
+    Training XAI (xai_engine): feature_importances, token_scores, heatmap_path (no array).
+    Prediction XAI (inference_engine): attributions, feature_names, heatmap array.
+    """
+    normalized: Dict[str, Any] = {}
+    if source == "auto":
+        tab = xai.get("tabular") or {}
+        source = "prediction" if "attributions" in tab else "training"
+
+    tab = xai.get("tabular") or {}
+    if tab:
+        _imp = tab.get("attributions") or tab.get("feature_importances") or tab.get("feature_importance") or []
+        _names = tab.get("feature_names") or [f"Feature {i}" for i in range(len(_imp))]
+        normalized["tabular"] = {"feature_names": _names, "attributions": _imp}
+
+    txt = xai.get("text") or {}
+    if txt:
+        normalized["text"] = {
+            "tokens": txt.get("tokens", []),
+            "attributions": txt.get("attributions") or txt.get("token_scores", []),
+            "note": txt.get("note", ""),
+        }
+
+    img = xai.get("image") or {}
+    if img:
+        normalized["image"] = {
+            "gradcam_available": bool(img.get("heatmap") or img.get("gradcam_available")),
+            "heatmap": img.get("heatmap"),
+            "heatmap_shape": img.get("heatmap_shape"),
+            "method": img.get("method", "GradCAM"),
+            "note": img.get("note", img.get("info", "")),
+        }
+
+    fus = xai.get("fusion") or {}
+    if fus:
+        normalized["fusion"] = {
+            "weights": fus.get("weights", {}),
+            "method": fus.get("method", "unknown"),
+        }
+
+    return normalized
+
+
+def _render_xai_tabs(explanations: Dict[str, Any], model_id: str = None) -> None:
     """Render the 4-tab XAI explainability panel.
 
     Extracted from Phase 7 inline code so each modality's rendering
@@ -6635,7 +7356,7 @@ def _render_xai_tabs(explanations: Dict[str, Any]) -> None:
         _render_xai_text(explanations.get("text"))
 
     with xai_tabs[2]:
-        _render_xai_image(explanations.get("image"))
+        _render_xai_image(explanations.get("image"), model_id=model_id)
 
     with xai_tabs[3]:
         _render_xai_fusion()
@@ -6677,7 +7398,7 @@ def _render_xai_text(text_xai: Optional[Dict]) -> None:
         st.info("No token attributions returned.")
 
 
-def _render_xai_image(img_xai: Optional[Dict]) -> None:
+def _render_xai_image(img_xai: Optional[Dict], model_id: str = None) -> None:
     """Render image XAI — GradCAM or ViT Attention Rollout heatmap."""
     if not img_xai:
         st.info("No image attributions — model may not have an image modality.")
@@ -6692,7 +7413,22 @@ def _render_xai_image(img_xai: Optional[Dict]) -> None:
 
     heatmap = img_xai.get("heatmap")
     if not heatmap:
-        st.info("XAI payload missing heatmap data.")
+        # Fallback: try loading training-time heatmap from API disk endpoint
+        if model_id:
+            try:
+                _hm_resp = api_call("GET", ep.model_xai_heatmap(model_id)) or {}
+                if _hm_resp.get("heatmap_b64"):
+                    import base64 as _b64
+                    _img_bytes = _b64.b64decode(_hm_resp["heatmap_b64"])
+                    st.image(_img_bytes, caption=f"GradCAM Saliency (training-time | shape: {_hm_resp.get('shape')})")
+                    st.caption(
+                        f"Range: [{_hm_resp.get('min', 0):.3f}, {_hm_resp.get('max', 0):.3f}] | "
+                        f"Mean activation: {_hm_resp.get('mean', 0):.3f}"
+                    )
+                    return
+            except Exception:
+                pass
+        st.info("XAI payload missing heatmap data. Heatmaps are generated during training with image modality.")
         return
 
     # Part B.4 — method-aware caption for AttentionRollout vs GradCAM
@@ -6867,9 +7603,14 @@ st.sidebar.markdown("### 🪪 Session Info")
 if not _app_session_ready:
     st.sidebar.caption("No active session yet.")
 else:
+    _sid_safe = st.session_state.get("session_id") or ""
+    if not _sid_safe:
+        # session_id missing — re-initialize defensively before any API call
+        _sid_safe = uuid.uuid4().hex[:12]
+        st.session_state.session_id = _sid_safe
     try:
         _sess_resp = requests.get(
-            f"{API_BASE_URL}/v2/sessions/{st.session_state.session_id}",
+            f"{API_BASE_URL}/v2/sessions/{_sid_safe}",
             timeout=5,
         )
         if _sess_resp.ok:
@@ -6880,20 +7621,36 @@ else:
             st.sidebar.caption(f"🕐 Created: `{_created}`")
             st.sidebar.caption(f"📦 Datasets: **{_n_datasets}**")
             st.sidebar.caption(f"⚙️ Stage: `{_stage}`")
+
+            # Show restore button when session has progress but frontend is behind
+            # (page refresh after training timeout lands at Phase 1)
+            _current_wf = st.session_state.get("workflow_stage", 1)
+            _stage_to_wf = {
+                "training": 5, "model_selection": 5,
+                "preprocessing_planning": 4, "monitoring": 6,
+            }
+            _expected_wf = _stage_to_wf.get(_stage, 0)
+            if _expected_wf > _current_wf:
+                if st.sidebar.button(
+                    "🔄 Restore Full Session",
+                    key="restore_full_session_btn",
+                    help=f"Recover session state to Phase {_expected_wf} (last known: {_stage})",
+                ):
+                    st.session_state._recovery_attempted = False
+                    st.session_state.pop("schema_detected", None)
+                    st.session_state.pop("dataset_uploaded", None)
+                    st.rerun()
+
             if st.sidebar.button("🗑 Close Session", key="close_session_btn",
                                  help="Closes this session. Your work is saved and can be re-loaded by session ID."):
                 _close_resp = requests.post(
-                    f"{API_BASE_URL}/v2/sessions/{st.session_state.session_id}/close",
+                    f"{API_BASE_URL}/v2/sessions/{_sid_safe}/close",
                     timeout=10,
                 )
                 if _close_resp.ok:
                     st.sidebar.success("Session closed.")
-                    # BUG-4 FIX: reset to a new UUID instead of None.
-                    # Setting session_id=None causes TypeError on the next render
-                    # when code does session_id[:20] or passes it to f-strings.
                     import uuid as _uuid
                     st.session_state.session_id = _uuid.uuid4().hex[:12]
-                    # Reset pipeline state so user starts fresh
                     for _k, _default in [
                         ("dataset_uploaded", False), ("schema_detected", False),
                         ("detected_schema", None), ("training_task_id", None),
@@ -6904,9 +7661,10 @@ else:
                     st.session_state.workflow_stage = 1
                     st.rerun()
         else:
-            st.sidebar.caption(f"Session: `{st.session_state.session_id[:20]}...`")
+            st.sidebar.caption(f"Session: `{_sid_safe[:20]}...`")
     except Exception:
-        st.sidebar.caption(f"Session: `{st.session_state.session_id[:20]}...`")
+        _sid_display = st.session_state.get("session_id") or _sid_safe or "?"
+        st.sidebar.caption(f"Session: `{_sid_display[:20]}...`")
 
 st.sidebar.divider()
 st.sidebar.markdown("### 📚 Documentation")
@@ -6928,28 +7686,48 @@ st.sidebar.link_button("🌐 API Docs", f"{API_BASE_URL}/docs")
 st.sidebar.link_button("📋 GitHub", "https://github.com/hrishi-cz/main-project")
 st.sidebar.divider()
 
-st.sidebar.markdown("### 🔬 Research Methods Active")
-st.sidebar.caption("15 peer-reviewed papers implemented:")
-_SIDEBAR_PAPERS = [
-    ("✅", "[1]",  "Structural-Semantic Unifier",  "ICML 2025",    "https://arxiv.org/abs/2405.00001"),
-    ("✅", "[2]",  "Cross-Layer RGAT Head",         "NeurIPS 2025", "https://arxiv.org/abs/2406.00002"),
-    ("✅", "[3]",  "Uncertainty Graph Fusion",      "CVPR 2025",    "https://arxiv.org/abs/2403.00003"),
-    ("✅", "[4]",  "CrossFuse Complementarity",     "ECCV 2024",    "https://arxiv.org/abs/2407.00004"),
-    ("✅", "[8]",  "EWC Continual Learning",        "TNNLS 2024",   "https://arxiv.org/abs/1612.00796"),
-    ("✅", "[9]",  "NN Calibration (Temperature)",  "ICML 2017",    "https://arxiv.org/abs/1706.04599"),
-    ("✅", "[10]", "DDM Concept Drift",             "SBIA 2004",    "https://dl.acm.org/doi/10.1145/1007730.1007768"),
-    ("✅", "[11]", "DriftLens Cosine Drift",        "IEEE 2024",    "https://arxiv.org/abs/2210.00000"),
-    ("✅", "[12]", "FTTransformer Tabular",         "NeurIPS 2021", "https://arxiv.org/abs/2106.11959"),
-    ("✅", "[13]", "Focal Loss",                    "ICCV 2017",    "https://arxiv.org/abs/1708.02002"),
-    ("✅", "[14]", "SWA Weight Averaging",          "UAI 2018",     "https://arxiv.org/abs/1803.05407"),
-    ("✅", "[15]", "PCGrad Gradient Surgery",       "NeurIPS 2020", "https://arxiv.org/abs/2001.06782"),
-]
-for icon, ref, name, venue, url in _SIDEBAR_PAPERS:
-    st.sidebar.markdown(
-        f'{icon} **{ref}** {name} <span style="color:#5a5a8a;font-size:.75rem">_{venue}_</span> '
-        f'<a href="{url}" target="_blank" style="color:#7c3aed;font-size:.7rem;text-decoration:none">↗</a>',
-        unsafe_allow_html=True,
-    )
+with st.sidebar.expander("🔬 Research Methods (15 papers)", expanded=False):
+    st.caption("15 peer-reviewed papers implemented:")
+    _SIDEBAR_PAPERS = [
+        ("✅", "[1]",  "Structural-Semantic Unifier",  "ICML 2025",    "https://arxiv.org/abs/2405.00001"),
+        ("✅", "[2]",  "Cross-Layer RGAT Head",         "NeurIPS 2025", "https://arxiv.org/abs/2406.00002"),
+        ("✅", "[3]",  "Uncertainty Graph Fusion",      "CVPR 2025",    "https://arxiv.org/abs/2403.00003"),
+        ("✅", "[4]",  "CrossFuse Complementarity",     "ECCV 2024",    "https://arxiv.org/abs/2407.00004"),
+        ("✅", "[8]",  "EWC Continual Learning",        "TNNLS 2024",   "https://arxiv.org/abs/1612.00796"),
+        ("✅", "[9]",  "NN Calibration (Temperature)",  "ICML 2017",    "https://arxiv.org/abs/1706.04599"),
+        ("✅", "[10]", "DDM Concept Drift",             "SBIA 2004",    "https://dl.acm.org/doi/10.1145/1007730.1007768"),
+        ("✅", "[11]", "DriftLens Cosine Drift",        "IEEE 2024",    "https://arxiv.org/abs/2210.00000"),
+        ("✅", "[12]", "FTTransformer Tabular",         "NeurIPS 2021", "https://arxiv.org/abs/2106.11959"),
+        ("✅", "[13]", "Focal Loss",                    "ICCV 2017",    "https://arxiv.org/abs/1708.02002"),
+        ("✅", "[14]", "SWA Weight Averaging",          "UAI 2018",     "https://arxiv.org/abs/1803.05407"),
+        ("✅", "[15]", "PCGrad Gradient Surgery",       "NeurIPS 2020", "https://arxiv.org/abs/2001.06782"),
+    ]
+    for icon, ref, name, venue, url in _SIDEBAR_PAPERS:
+        st.markdown(
+            f'{icon} **{ref}** {name} <span style="color:#7878a8;font-size:.75rem">_{venue}_</span> '
+            f'<a href="{url}" target="_blank" style="color:#7c3aed;font-size:.7rem;text-decoration:none">↗</a>',
+            unsafe_allow_html=True,
+        )
+
+# APEX environment variable settings panel
+with st.sidebar.expander("⚙️ APEX Settings", expanded=False):
+    st.caption("Key env vars controlling training behavior. Set via `.env`, restart API after changes.")
+    _apex_cfg = api_call("GET", ep.CONFIG) or {}
+    _apex_env_rows = [
+        ("APEX_FRESH_STUDY",     _apex_cfg.get("fresh_study", os.environ.get("APEX_FRESH_STUDY", "0")),
+         "Clear stale Optuna DB before HPO (fixes fusion lock)"),
+        ("APEX_LORA_MAX_EPOCHS", _apex_cfg.get("lora_max_epochs", os.environ.get("APEX_LORA_MAX_EPOCHS", "6")),
+         "Max LoRA trial epochs"),
+        ("APEX_N_TRIALS",        _apex_cfg.get("n_trials", os.environ.get("APEX_N_TRIALS", "auto")),
+         "Override Optuna trial count"),
+        ("APEX_REQUIRE_GPU",     os.environ.get("APEX_REQUIRE_GPU", "0"),
+         "Fail if no CUDA"),
+        ("APEX_REASONING_MODEL", os.environ.get("APEX_REASONING_MODEL", "gpt-4o-mini"),
+         "LLM oracle for Tier 0 reasoning"),
+    ]
+    for _var, _val, _desc in _apex_env_rows:
+        st.code(f"{_var}={_val if _val else '(not set)'}", language=None)
+        st.caption(_desc)
 
 st.sidebar.divider()
 st.sidebar.caption(f"Session: `{st.session_state.session_id}`")

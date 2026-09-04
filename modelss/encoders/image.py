@@ -22,11 +22,20 @@ the fusion layer.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torchvision.models as tv_models
+
+
+def _is_hf_cached(model_name: str) -> bool:
+    """Return True if model weights exist in the local HuggingFace cache."""
+    cache = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+    safe = model_name.replace("/", "--")
+    return (cache / "hub" / f"models--{safe}").exists()
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +185,34 @@ class ViTImageEncoder(nn.Module):
 
         try:
             from transformers import AutoModel
-            self._vit: Optional[nn.Module] = AutoModel.from_pretrained(model_name)
+            _cached = _is_hf_cached(model_name)
+            _restore_verbosity = lambda: None  # noqa: E731
+            try:
+                from transformers.utils import logging as _hf_log
+                _prev_verbosity = _hf_log.get_verbosity()
+                _hf_log.set_verbosity_error()
+                _restore_verbosity = lambda: _hf_log.set_verbosity(_prev_verbosity)  # noqa: E731
+            except Exception:
+                pass
+            try:
+                _is_clip_model = "clip" in model_name.lower() and "siglip" not in model_name.lower()
+                if _is_clip_model:
+                    from transformers import CLIPVisionModel
+                    try:
+                        self._vit: Optional[nn.Module] = CLIPVisionModel.from_pretrained(
+                            model_name, local_files_only=_cached
+                        )
+                    except OSError:
+                        self._vit = CLIPVisionModel.from_pretrained(model_name)
+                else:
+                    try:
+                        self._vit: Optional[nn.Module] = AutoModel.from_pretrained(
+                            model_name, local_files_only=_cached
+                        )
+                    except OSError:
+                        self._vit = AutoModel.from_pretrained(model_name)
+            finally:
+                _restore_verbosity()
             # Detect output dimension from config
             cfg = self._vit.config
             hidden = getattr(cfg, "hidden_size", None) or getattr(cfg, "vision_config", None)
@@ -343,3 +379,83 @@ class MultiScaleImageEncoder(nn.Module):
 
     def get_output_dim(self) -> int:
         return self.output_dim
+
+
+# ---------------------------------------------------------------------------
+# SigLIP Vision Encoder (sigmoid-loss pre-trained, 768-dim)
+# ---------------------------------------------------------------------------
+
+class SigLIPEncoder(nn.Module):
+    """
+    SigLIP vision encoder producing 768-dim patch embeddings.
+
+    Pre-trained with per-pair sigmoid binary loss (not softmax NT-Xent).
+    This makes it significantly more stable at small batch sizes (bs ≤ 32)
+    than CLIP, and produces no false-negative alignment artefacts.
+
+    Supports two output modes:
+    - Pooled (default): mean-pooled representation ``(N, D)``
+    - Token-sequence (return_all_tokens=True): all patch tokens ``(N, P, D)``
+      for true cross-modal attention in UnifiedLatentFusion.
+
+    Encoder family: "siglip" — MUST be paired with SigLIPTextEncoder.
+    Pairing with CLIPTextEncoder will cause latent space misalignment.
+    """
+
+    ENCODER_FAMILY: str = "siglip"
+
+    def __init__(
+        self,
+        model_name: str = "google/siglip-base-patch16-224",
+        freeze_backbone: bool = True,
+    ) -> None:
+        super().__init__()
+        self.model_name = model_name
+        self._output_dim = 768
+
+        try:
+            from transformers import SiglipVisionModel
+            _cached = _is_hf_cached(model_name)
+            try:
+                self._model = SiglipVisionModel.from_pretrained(model_name, local_files_only=_cached)
+            except OSError:
+                self._model = SiglipVisionModel.from_pretrained(model_name)
+            hidden = getattr(self._model.config, "hidden_size", 768)
+            if isinstance(hidden, int) and hidden > 0:
+                self._output_dim = hidden
+        except Exception as exc:
+            logger.warning("SigLIPEncoder: failed to load '%s': %s", model_name, exc)
+            self._model = None
+
+        if self._model is not None and freeze_backbone:
+            for p in self._model.parameters():
+                p.requires_grad_(False)
+
+        logger.info("SigLIPEncoder: model=%s  freeze=%s  output_dim=%d",
+                    model_name, freeze_backbone, self._output_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_all_tokens: bool = False,
+    ) -> torch.Tensor:
+        if self._model is None:
+            N = x.shape[0]
+            if return_all_tokens:
+                return torch.zeros(N, 196, self._output_dim, device=x.device)
+            return torch.zeros(N, self._output_dim, device=x.device)
+
+        out = self._model(pixel_values=x)
+        if return_all_tokens:
+            # Return all patch token embeddings for cross-modal attention
+            return out.last_hidden_state   # (N, P, D)
+        # SigLIP has no CLS token — use mean pool over all patches
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            return out.pooler_output
+        return out.last_hidden_state.mean(dim=1)  # (N, D)
+
+    def get_output_dim(self) -> int:
+        return self._output_dim
+
+    def configure(self, plan=None) -> None:
+        pass

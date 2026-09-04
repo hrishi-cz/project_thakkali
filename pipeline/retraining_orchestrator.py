@@ -29,6 +29,7 @@ class RetrainingOrchestrator:
         session_id: Optional[str] = None,
         history_path: Optional[Path] = None,
         execution_context: Optional[Any] = None,
+        drift_threshold: float = 1.0,
     ) -> None:
         self.production_sources = list(production_sources or [])
         self.problem_type = problem_type
@@ -38,18 +39,22 @@ class RetrainingOrchestrator:
         self.session_id = session_id
         self.history_path = Path(history_path or RETRAIN_HISTORY_PATH)
         self.execution_context = execution_context
+        # Composite score threshold for auto-retraining. Default 1.0.
+        # Lower (e.g. 0.5) for safety-critical pipelines; higher (e.g. 2.0) for
+        # high-throughput pipelines where compute budget is the constraint.
+        self.drift_threshold = float(max(0.0, drift_threshold))
         self._last_trigger_by_dataset: Dict[str, float] = {}
         self._event_log: List[Dict[str, Any]] = []
 
     def should_retrain(self, drift_report: Dict[str, Any]) -> bool:
-        """Return True when drift is confirmed or composite risk is high."""
+        """Return True when drift is confirmed or composite risk exceeds drift_threshold."""
         trigger_reason: Optional[str] = None
         if bool(drift_report.get("drift_detected", False)):
             trigger_reason = "drift_detected"
         else:
             composite = float(drift_report.get("composite_score", 0.0) or 0.0)
-            if composite >= 1.0:
-                trigger_reason = f"composite_score={composite:.4f}"
+            if composite >= self.drift_threshold:
+                trigger_reason = f"composite_score={composite:.4f} >= threshold={self.drift_threshold}"
 
         if trigger_reason is not None:
             if self.execution_context is not None and hasattr(self.execution_context, "log_decision"):

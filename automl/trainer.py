@@ -391,16 +391,38 @@ class _MultimodalHead(nn.Module):
         _batch, _device = _ref.shape[0], _ref.device
 
         parts: List[torch.Tensor] = []
+        padding_masks: List[Optional[torch.Tensor]] = []
+        active_keys: List[str] = []
+
         for k in self._keys:
             is_present = (modality_mask is None) or modality_mask.get(k, True)
             if is_present and k in embeddings and embeddings[k] is not None:
                 parts.append(embeddings[k].float())
+                active_keys.append(k)
+                # Tier 2: Carry padding mask for reasoning tokens (None for others)
+                mask_key = f"{k.replace('_tokens', '')}_attention_mask" if "_tokens" in k else None
+                pad_mask = embeddings.get(mask_key) if mask_key else None
+                padding_masks.append(pad_mask)
             else:
                 # Missing/masked modality: inject zero tensor to preserve fusion dim
                 parts.append(torch.zeros(_batch, self._input_dims[k], device=_device))
-        # G25: forward modality_mask into fusion when supported
-        if modality_mask is not None and getattr(self.fusion, "accepts_mask", False):
-            x = self.fusion(parts, modality_names=list(self._keys), modality_mask=modality_mask)
+                active_keys.append(k)
+                padding_masks.append(None)
+
+        # G25 + Tier 2: forward modality_mask and padding_masks into fusion when supported
+        _fusion_accepts_mask = getattr(self.fusion, "accepts_mask", False)
+        _has_pad_masks = any(m is not None for m in padding_masks)
+        if (_fusion_accepts_mask and modality_mask is not None) or _has_pad_masks:
+            try:
+                x = self.fusion(
+                    parts,
+                    modality_names=active_keys,
+                    modality_mask=modality_mask,
+                    padding_masks=padding_masks if _has_pad_masks else None,
+                )
+            except TypeError:
+                # Fusion class doesn't support padding_masks yet — fallback without it
+                x = self.fusion(parts, modality_names=active_keys, modality_mask=modality_mask)
         else:
             x = self.fusion(parts)
         return self.layers(x)
@@ -470,9 +492,18 @@ class LossWeightScheduler:
         train_slope = float(train_losses[-1] - train_losses[0]) / max(1, len(train_losses) - 1)
         val_slope = float(val_losses[-1] - val_losses[0]) / max(1, len(val_losses) - 1)
 
-        if train_slope < -1e-3 and val_slope > 1e-3:
+        # Relative threshold: 0.1% of mean absolute loss magnitude.
+        # Absolute 1e-3 breaks on tiny losses (e.g. normalized regression ≈ 0.001)
+        # and is too lax on large-scale losses (e.g. cross-entropy on 1000 classes).
+        _mean_abs_loss = (
+            sum(abs(x) for x in train_losses) / len(train_losses)
+            + sum(abs(x) for x in val_losses) / len(val_losses)
+        ) / 2.0
+        _threshold = max(1e-6, 1e-3 * _mean_abs_loss)
+
+        if train_slope < -_threshold and val_slope > _threshold:
             fit_type = "overfitting"
-        elif abs(train_slope) < 1e-3 and abs(val_slope) < 1e-3:
+        elif abs(train_slope) < _threshold and abs(val_slope) < _threshold:
             fit_type = "underfitting"
         else:
             fit_type = "good"
@@ -637,11 +668,13 @@ class ApexLightningModule(pl.LightningModule):
                 _r     = int(lora_config.get("r", 8))
                 _alpha = float(lora_config.get("alpha", 16.0))
                 if image_encoder is not None:
-                    apply_lora(image_encoder, r=_r, alpha=_alpha)
-                    logger.info("LoRA applied to image encoder: r=%d alpha=%.0f", _r, _alpha)
+                    _last_n = int(lora_config.get("last_n_layers", 0))
+                    apply_lora(image_encoder, r=_r, alpha=_alpha, last_n_layers=_last_n)
+                    logger.info("LoRA applied to image encoder: r=%d alpha=%.0f last_n=%d", _r, _alpha, _last_n)
                 if text_encoder is not None:
-                    apply_lora(text_encoder, r=_r, alpha=_alpha)
-                    logger.info("LoRA applied to text encoder: r=%d alpha=%.0f", _r, _alpha)
+                    _last_n = int(lora_config.get("last_n_layers", 0))
+                    apply_lora(text_encoder, r=_r, alpha=_alpha, last_n_layers=_last_n)
+                    logger.info("LoRA applied to text encoder: r=%d alpha=%.0f last_n=%d", _r, _alpha, _last_n)
             except Exception as _lora_exc:
                 logger.warning("LoRA application failed: %s — encoders remain frozen", _lora_exc)
 
@@ -747,11 +780,16 @@ class ApexLightningModule(pl.LightningModule):
             text_encoder is not None,
             image_encoder is not None,
         ])
-        if contrastive_weight == 0.0 and _n_modalities >= 2:
+        # Gate contrastive loss auto-activation on alignment_weight > 0.
+        # alignment_weight is set by HPO when schema signals indicate modalities
+        # are semantically paired. Without this gate, NT-Xent loss hurts accuracy
+        # on datasets where modalities are independent (e.g. tabular + unrelated image).
+        if contrastive_weight == 0.0 and _n_modalities >= 2 and alignment_weight > 0.0:
             contrastive_weight = 0.1
             logger.info(
-                "  Auto-activated contrastive loss (weight=0.1) for %d modalities",
-                _n_modalities,
+                "  Auto-activated contrastive loss (weight=0.1) for %d modalities "
+                "(alignment_weight=%.3f indicates paired modalities)",
+                _n_modalities, alignment_weight,
             )
         self.contrastive_weight = float(max(0.0, contrastive_weight))
         self.loss_weight_scheduler = LossWeightScheduler(ctx=execution_context)
@@ -786,6 +824,18 @@ class ApexLightningModule(pl.LightningModule):
         self._memory_guard = MemoryGuard()
         self._memory_guard_every_n_steps = 50
         self._fallback_manager = FallbackManager()
+
+        # C2: Uncertainty Weighting (Kendall et al., CVPR 2018).
+        # Learned log-uncertainty scalars replace the static alignment_weight.
+        # Applied to RAW classification + alignment losses before LossWeightScheduler
+        # to avoid double-scaling. sigma_cls=1 and sigma_con=1 at init (log=0).
+        self.log_sigma_cls = nn.Parameter(torch.zeros(1))
+        self.log_sigma_con = nn.Parameter(torch.zeros(1))
+
+        # C9: SupCon needs per-batch class labels.
+        # Stored in training_step and read in _apply_adaptive_loss.
+        self._last_batch_targets: Optional[torch.Tensor] = None
+        self._cached_last_targets: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Encode raw batch → pooled embeddings
@@ -830,8 +880,11 @@ class ApexLightningModule(pl.LightningModule):
             else:
                 encoded["tabular"] = batch["tabular"]
 
-        # ── Text: use pre-computed embedding or route through frozen BERT ──
-        if "text_pooled" in batch:
+        # ── Text: prefer cached token sequences (ULA), then pooled cache, then raw encoder ──
+        if "text_tokens" in batch:
+            # Precomputed token sequences [N, T, D] — ULA cross-modal attention path
+            encoded["text_pooled"] = batch["text_tokens"]
+        elif "text_pooled" in batch:
             encoded["text_pooled"] = batch["text_pooled"]
         elif "input_ids" in batch and self._text_encoder is not None:
             try:
@@ -853,8 +906,11 @@ class ApexLightningModule(pl.LightningModule):
                 self._fallback_manager.mark_failed("text", text_name)
                 logger.warning("Text encoder failed; using dummy-fill fallback (%s): %s", text_name, exc)
 
-        # ── Image: use pre-computed embedding or route through frozen encoder ─
-        if "image_pooled" in batch:
+        # ── Image: prefer cached patch sequences (ULA), then pooled cache, then raw encoder ──
+        if "image_patches" in batch:
+            # Precomputed patch sequences [N, P, D] — ULA cross-modal attention path
+            encoded["image_pooled"] = batch["image_patches"]
+        elif "image_pooled" in batch:
             encoded["image_pooled"] = batch["image_pooled"]
         elif "image" in batch and self._image_encoder is not None:
             try:
@@ -883,6 +939,11 @@ class ApexLightningModule(pl.LightningModule):
                     encoded["tabular"] = self._tabular_tokenizer(encoded["tabular"])
             except Exception as exc:
                 logger.warning("TabularFeatureTokenizer failed; keeping pooled tabular: %s", exc)
+
+        # ── Tier 2: Reasoning token sequences (frozen, always cached) ──────────
+        if "reasoning_tokens" in batch:
+            encoded["reasoning_tokens"] = batch["reasoning_tokens"]
+            encoded["reasoning_attention_mask"] = batch.get("reasoning_attention_mask")
 
         # ── Dummy-fill any head-expected keys still missing ───────────
         # Determines reference device from existing encoded tensors or batch
@@ -992,6 +1053,16 @@ class ApexLightningModule(pl.LightningModule):
 
         logits = self(batch)
 
+        # C9: Store current batch targets for SupCon alignment loss.
+        # Only store integer class labels (not MixUp soft targets — SupCon needs discrete classes).
+        if _mixup_targets is None and self.problem_type.startswith("classification"):
+            try:
+                self._last_batch_targets = targets.long().detach()
+            except Exception:
+                self._last_batch_targets = None
+        else:
+            self._last_batch_targets = None
+
         # Use soft mixed labels when MixUp was applied
         _loss_targets = _mixup_targets if _mixup_targets is not None else targets
         if _mixup_targets is not None:
@@ -1088,6 +1159,10 @@ class ApexLightningModule(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self) -> None:
+        # Cache last batch targets for post-training SupCon diagnostic reporting
+        if hasattr(self, "_last_batch_targets") and self._last_batch_targets is not None:
+            self._cached_last_targets = self._last_batch_targets.detach().cpu()
+
         callback_metrics = getattr(self.trainer, "callback_metrics", {})
         train_loss = self._metric_to_float(callback_metrics.get("train_loss"))
         val_loss = self._metric_to_float(callback_metrics.get("val_loss"))
@@ -1223,6 +1298,34 @@ class ApexLightningModule(pl.LightningModule):
             except Exception as _le:
                 logger.warning("Could not build LoRA optimizer group: %s", _le)
 
+        # C1: log_temperature (ULA fusion) at 10× main LR.
+        # Temperature gradient is weak at small B — higher LR stabilises learning.
+        fusion_mod = getattr(self.model, "fusion", None)
+        if fusion_mod is not None and hasattr(fusion_mod, "log_temperature"):
+            temp_ids = {id(fusion_mod.log_temperature)}
+            # Exclude from default group to avoid double-counting
+            param_groups[0]["params"] = [
+                p for p in param_groups[0]["params"] if id(p) not in temp_ids
+            ]
+            param_groups.append({
+                "params": [fusion_mod.log_temperature],
+                "lr": self.learning_rate * 10.0,
+                "weight_decay": 0.0,
+            })
+            logger.info("log_temperature param group at lr=%.2e", self.learning_rate * 10.0)
+
+        # C2: Uncertainty Weighting sigma scalars at main LR, no weight decay.
+        sigma_params = [self.log_sigma_cls, self.log_sigma_con]
+        sigma_ids = {id(p) for p in sigma_params}
+        param_groups[0]["params"] = [
+            p for p in param_groups[0]["params"] if id(p) not in sigma_ids
+        ]
+        param_groups.append({
+            "params": sigma_params,
+            "lr": self.learning_rate,
+            "weight_decay": 0.0,
+        })
+
         optimizer = AdamW(param_groups)
         scheduler = AdaptiveLRScheduler(
             optimizer,
@@ -1292,16 +1395,62 @@ class ApexLightningModule(pl.LightningModule):
                 reg_term = reg_term + param.pow(2).mean()
 
         reg_strength = 1e-6 * float(weights["regularization"])
-        scaled = base_loss * float(weights["data_loss"]) + reg_strength * reg_term
 
-        aligned_features = [
-            self._last_encoded_batch[k]
-            for k in ("tabular", "text_pooled", "image_pooled")
-            if k in self._last_encoded_batch
-        ]
+        # C2: Uncertainty Weighting applied to RAW base_loss before LossWeightScheduler.
+        # Using sigma on the pre-scheduled loss prevents double-scaling.
+        sigma_cls = self.log_sigma_cls.exp().clamp(0.01, 10.0)
+        scaled = 0.5 * base_loss / (sigma_cls ** 2) + self.log_sigma_cls
+        # Regularisation term still uses LossWeightScheduler weight (independent of UW)
+        scaled = scaled + reg_strength * reg_term
+
+        fusion_mod = getattr(self.model, "fusion", None)
+
+        # Use ULA projected tokens for alignment (128d latent space, not raw 768d/512d).
+        _ula_projected = (
+            getattr(fusion_mod, "_last_projected_tokens", None)
+            if fusion_mod is not None and hasattr(fusion_mod, "alignment_loss")
+            else None
+        )
+
+        # SupCon fires only on the canonical parallel-view pair (text ↔ image).
+        # For all other combinations (text+tabular, image+tabular, etc.) fall back
+        # to cosine distance on whatever modalities are present.
+        _has_text  = "text_pooled"  in self._last_encoded_batch
+        _has_image = "image_pooled" in self._last_encoded_batch
+
+        if _has_text and _has_image:
+            # Preferred: align text ↔ image using ULA latent projections
+            if _ula_projected and len(_ula_projected) >= 2:
+                aligned_features = _ula_projected[:2]  # image + caption; reasoning is 3rd
+            else:
+                aligned_features = [
+                    self._last_encoded_batch[k]
+                    for k in ("text_pooled", "image_pooled")
+                ]
+        else:
+            # Fallback: align whatever 2+ modalities are present (cosine distance only)
+            aligned_features = [
+                self._last_encoded_batch[k]
+                for k in ("tabular", "text_pooled", "image_pooled")
+                if k in self._last_encoded_batch
+            ]
+
+        # C9: SupCon only when classification AND both text+image are present
+        _is_classification = str(self.problem_type).startswith("classification")
+        _can_use_supcon = (
+            _is_classification
+            and _has_text and _has_image
+            and self._last_batch_targets is not None
+        )
+
         if len(aligned_features) >= 2:
             try:
-                align_term = self.alignment_loss(aligned_features)
+                if fusion_mod is not None and hasattr(fusion_mod, "alignment_loss"):
+                    # ULA path: SupCon when classification, SigLIP when regression
+                    _supcon_labels = self._last_batch_targets if _can_use_supcon else None
+                    align_term = fusion_mod.alignment_loss(aligned_features, labels=_supcon_labels)
+                else:
+                    align_term = self.alignment_loss(aligned_features)
                 self._alignment_loss_epoch_values.append(
                     float(align_term.detach().float().cpu().item())
                 )
@@ -1317,15 +1466,14 @@ class ApexLightningModule(pl.LightningModule):
                     pass
             except Exception:
                 align_term = None
-            if align_term is not None and self.alignment_weight > 0.0:
-                if self._modality_grad_scales:
-                    min_scale = min(self._modality_grad_scales.values())
-                    align_scale = 2.0 - min_scale
-                else:
-                    align_scale = 1.0
-                scaled = scaled + (self.alignment_weight * align_scale * align_term)
+            if align_term is not None:
+                # C2: Uncertainty Weighting for alignment loss.
+                # sigma_con adapts how much the alignment signal is trusted.
+                # Applied to the alignment term directly (parallel to base_loss treatment above).
+                sigma_con = self.log_sigma_con.exp().clamp(0.01, 10.0)
+                weighted_align = 0.5 * align_term / (sigma_con ** 2) + self.log_sigma_con
+                scaled = scaled + weighted_align
 
-        fusion_mod = getattr(self.model, "fusion", None)
         if fusion_mod is not None:
             fusion_type = type(fusion_mod).__name__
             if fusion_type in ("GraphFusion", "UncertaintyGraphFusion"):

@@ -161,6 +161,8 @@ class ExecutionContext:
     drift_adjusted_predictability: Dict[str, float] = field(default_factory=dict)
     drifted_features: List[str] = field(default_factory=list)
     drift_feedback_applied: bool = False
+    # Per-feature drift scores (KS and PSI per column) — populated by apply_drift_feedback()
+    per_feature_drift: Dict[str, Any] = field(default_factory=dict)
 
     # Model registry integration
     registered_model_ids: List[str] = field(default_factory=list)
@@ -218,6 +220,19 @@ class ExecutionContext:
 
     # Label noise detection results (set by LabelNoiseDetector in training phase)
     suspicious_label_indices: List[int] = field(default_factory=list)
+
+    def reset_for_new_run(self) -> None:
+        """Reset transient training/drift state before a new pipeline run."""
+        self.retraining_depth_required = "none"
+        self.drift_detected = False
+        self.drift_severity = 0.0
+        self.drift_details = {}
+        self.drift_adjusted_predictability = {}
+        self.per_feature_drift = {}
+        self.drifted_features = []
+        self.drift_feedback_applied = False
+        self._update_timestamp()
+        self.log_decision("reset", "Context reset for new pipeline run")
 
     # ===== Dataset Management Methods =====
 
@@ -290,12 +305,11 @@ class ExecutionContext:
             'reason': reason,
         })
         # Propagate immediately — unlock and apply
-        self.fusion_policy_locked = False
         self.update_fusion(
             strategy=strategy,
             importance_weights=dict(self.modality_importance or {}),
+            source="user_override",
         )
-        self.fusion_policy_source = "user_override"
         self.log_decision(
             'override',
             f"User overrode fusion strategy: {old_strategy} → {strategy}",
@@ -547,17 +561,35 @@ class ExecutionContext:
             [getattr(c, 'name', str(c)) for c in candidates[:3]]
         )
 
-    def update_fusion(self, strategy: Optional[str], importance_weights: Dict[str, float]) -> None:
+    def update_fusion(
+        self,
+        strategy: Optional[str],
+        importance_weights: Dict[str, float],
+        source: str = "auto",
+    ) -> None:
         """Called by fusion layer after strategy selection."""
+        if (
+            self.fusion_policy_locked
+            and self.fusion_policy_source == "user_override"
+            and source != "user_override"
+        ):
+            logger.info(
+                "Fusion policy locked by user override (%s). Skipping auto update to '%s'.",
+                self.fusion_strategy,
+                strategy,
+            )
+            return
+
         self.fusion_strategy = strategy
         self.fusion_mode = strategy  # Sync with frontend field
         self.modality_importance = importance_weights
-        self.fusion_policy_locked = bool(strategy)
-        self.fusion_policy_source = "context_update"
+        self.fusion_policy_locked = bool(strategy) and source == "user_override"
+        self.fusion_policy_source = str(source or "auto")
         fusion_state = {
             "strategy": strategy,
             "importance": dict(importance_weights or {}),
             "locked": self.fusion_policy_locked,
+            "source": self.fusion_policy_source,
         }
         self.artifact_versions["fusion_policy"] = hashlib.sha256(
             json.dumps(fusion_state, sort_keys=True, default=str).encode()
@@ -749,8 +781,16 @@ class ExecutionContext:
         per_feature_ks: Dict[str, float] = dict(
             (drift_report_dict or {}).get("per_feature_ks", {}) or {}
         )
+        per_feature_psi: Dict[str, float] = dict(
+            (drift_report_dict or {}).get("per_feature_psi", {}) or {}
+        )
         drifted = [feat for feat, ks in per_feature_ks.items() if float(ks) > 0.30]
         self.drifted_features = drifted
+        # Persist per-feature scores for API access via /intelligence/drift
+        self.per_feature_drift = {
+            "per_feature_ks": {f: float(v) for f, v in per_feature_ks.items()},
+            "per_feature_psi": {f: float(v) for f, v in per_feature_psi.items()},
+        }
 
         # Build a schema importance map: feature → interaction score (0–1)
         # Aggregated across all datasets in feature_intelligence.
@@ -763,8 +803,26 @@ class ExecutionContext:
                 except Exception:
                     pass
 
+        status = dict((drift_report_dict or {}).get("status", {}) or {})
+        modality_drift = dict((drift_report_dict or {}).get("modality_drift", {}) or {})
+        drifted_modalities = set()
+        if drifted or any(bool(status.get(metric, False)) for metric in ("psi", "ks_statistic", "fdd")):
+            drifted_modalities.add("tabular")
+        text_drift_report = dict((drift_report_dict or {}).get("text_drift", {}) or {})
+        image_drift_report = dict((drift_report_dict or {}).get("image_drift", {}) or {})
+        if bool(text_drift_report.get("drift_detected", False)):
+            drifted_modalities.add("text")
+        if bool(image_drift_report.get("drift_detected", False)):
+            drifted_modalities.add("image")
+        for modality, details in modality_drift.items():
+            if isinstance(details, dict) and details.get("drift_detected"):
+                mod = str(modality).lower()
+                if mod in {"tabular", "text", "image"}:
+                    drifted_modalities.add(mod)
+
         current_scores = dict(self.predictability_scores or {})
-        if drifted and current_scores:
+        tabular_factor = 1.0
+        if ("tabular" in drifted_modalities) and current_scores:
             # Compute a weighted drift fraction: each drifted feature contributes
             # proportionally to its schema importance (default weight 1.0 if unknown).
             total_weight = sum(
@@ -772,23 +830,38 @@ class ExecutionContext:
             ) or 1.0
             drifted_weight = sum(importance_map.get(f, 1.0) for f in drifted)
             weighted_drift_fraction = drifted_weight / total_weight
+            if not drifted:
+                weighted_drift_fraction = 1.0
 
-            factor = max(0.0, 1.0 - float(decay) * weighted_drift_fraction)
-            for key, value in list(current_scores.items()):
-                key_str = str(key).lower()
-                if "tabular" in key_str:
-                    try:
-                        current_scores[key] = round(float(value) * factor, 4)
-                    except Exception:
-                        continue
+            tabular_factor = max(0.0, 1.0 - float(decay) * weighted_drift_fraction)
+
+        text_image_factor = max(0.0, 1.0 - float(decay) * 0.5)
+        for key, value in list(current_scores.items()):
+            key_str = str(key).lower()
+            applicable_modality = next(
+                (m for m in ("tabular", "text", "image") if m in key_str),
+                None,
+            )
+            if applicable_modality not in drifted_modalities:
+                continue
+            factor = tabular_factor if applicable_modality == "tabular" else text_image_factor
+            try:
+                current_scores[key] = round(max(0.0, float(value) * factor), 4)
+            except Exception:
+                continue
 
         self.drift_adjusted_predictability = current_scores
-        self.drift_feedback_applied = bool(drifted)
+        self.drift_feedback_applied = bool(drifted_modalities)
         self.log_decision(
             "drift_feedback",
-            f"{len(drifted)} drifted features (schema-weighted)",
+            (
+                f"{len(drifted)} drifted features; "
+                f"modalities={sorted(drifted_modalities)}"
+            ),
             f"adjusted_predictability={current_scores}; "
-            f"importance_map_size={len(importance_map)}",
+            f"importance_map_size={len(importance_map)}; "
+            f"tabular_factor={tabular_factor:.4f}; "
+            f"text_image_factor={text_image_factor:.4f}",
         )
         self._update_timestamp()
 

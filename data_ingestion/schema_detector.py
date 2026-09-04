@@ -103,8 +103,24 @@ class COGMASchemaDetector:
 
         fusion_ready = len(global_modalities) > 1
 
+        # Derive global problem type from per-dataset detections (most frequent wins;
+        # binary beats multiclass on tie so n_unique=2 datasets aren't promoted).
+        _pt_counts: Dict[str, int] = {}
+        for _s in per_dataset_results:
+            _pt = str(_s.get("problem_type") or "")
+            if _pt:
+                _pt_counts[_pt] = _pt_counts.get(_pt, 0) + 1
+        if _pt_counts:
+            _max_count = max(_pt_counts.values())
+            _candidates = [pt for pt, cnt in _pt_counts.items() if cnt == _max_count]
+            # Prefer binary over multiclass when tied; prefer classification over regression
+            _PRIORITY = {"classification_binary": 0, "classification_multiclass": 1, "regression": 2}
+            _global_pt = min(_candidates, key=lambda p: _PRIORITY.get(p, 99))
+        else:
+            _global_pt = "classification_multiclass"
+
         global_schema = GlobalSchema(
-            global_problem_type="classification_multiclass",  # Could be refined
+            global_problem_type=_global_pt,
             global_modalities=global_modalities,
             primary_target=primary_target,
             fusion_ready=fusion_ready,
@@ -1444,7 +1460,9 @@ class COGMASchemaDetector:
             vectorizer = TfidfVectorizer(max_features=max_features)
             X = vectorizer.fit_transform(texts)
             y = texts.astype("category").cat.codes
-            if y.nunique() < 2:
+            # Free-text columns have nearly every text unique → y.nunique() ≈ n_samples.
+            # Skip scoring: uninformative and triggers sklearn "classes > 50% samples" warning.
+            if y.nunique() < 2 or y.nunique() > 0.5 * len(y):
                 return 0.0
 
             X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -2361,9 +2379,46 @@ class COGMASchemaDetector:
             return "regression"
 
         n_unique: int = int(s.nunique(dropna=True))
+        logger.info(
+            "_infer_problem_type: target='%s' dtype=%s n_unique=%d values=%s",
+            target, s.dtype, n_unique, list(s.dropna().unique()[:10]),
+        )
+
+        # n_unique < 2: sample has only one class (severe class imbalance in the
+        # 500-row schema-detection subset). Use the value range to infer the true
+        # type instead of falling through to classification_multiclass.
+        if n_unique < 2:
+            try:
+                max_v = int(s.max())
+                if max_v <= 1:
+                    logger.info(
+                        "_infer_problem_type: single class in sample (n_unique=%d, max=%d)"
+                        " — treating as classification_binary based on value range",
+                        n_unique, max_v,
+                    )
+                    return "classification_binary"
+            except Exception:
+                pass
+            return "unsupervised"
 
         if n_unique == 2:
             return "classification_binary"
+
+        # Negative sentinel values (e.g. -1 = "no label" in test splits) inflate n_unique.
+        # If all non-negative values are binary {0, 1}, treat as binary classification.
+        if pd.api.types.is_numeric_dtype(s) and n_unique <= 20:
+            try:
+                non_neg_vals = {int(v) for v in s.dropna().unique() if float(v) >= 0}
+                if non_neg_vals <= {0, 1}:
+                    neg_vals = {int(v) for v in s.dropna().unique() if float(v) < 0}
+                    logger.info(
+                        "_infer_problem_type: sentinel negatives %s stripped, "
+                        "non-negative vals=%s → classification_binary",
+                        neg_vals, non_neg_vals,
+                    )
+                    return "classification_binary"
+            except Exception:
+                pass
 
         if 3 <= n_unique <= 20:
             # Sparse integer range (e.g. prices [0, 100, 5000, 200000]) → regression

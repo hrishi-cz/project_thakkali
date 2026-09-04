@@ -78,11 +78,13 @@ TABULAR_CANDIDATE_POOL: List[Dict[str, Any]] = [
     {
         "name": "grn",
         "label": "GRN (Gated Residual Network)",
+        "probe_label": "RandomForest (GRN probe surrogate)",
         "vram_mb": 200,
         "params_m": 0.3,
         "sklearn_cls": "sklearn.ensemble.RandomForestClassifier",
         "sklearn_reg": "sklearn.ensemble.RandomForestRegressor",
         "sklearn_kwargs": {"n_estimators": 50, "max_depth": 6, "random_state": 42, "n_jobs": 1},
+        "note": "Probe uses RandomForest as fast surrogate. Training uses real GRN PyTorch module.",
     },
     {
         "name": "mlp",
@@ -377,17 +379,26 @@ class CandidateSelector:
         from sklearn.linear_model import LogisticRegression
         from sklearn.metrics import accuracy_score
 
+        import torch.nn as _tnn
         model_map = {
-            "mobilenet": tv.mobilenet_v3_small,
-            "efficientnet": tv.efficientnet_b0,
-            "resnet": tv.resnet18,
+            "mobilenet":    lambda: tv.mobilenet_v3_small(weights=tv.MobileNet_V3_Small_Weights.DEFAULT),
+            "efficientnet": lambda: tv.efficientnet_b0(weights=tv.EfficientNet_B0_Weights.DEFAULT),
+            "resnet":       lambda: tv.resnet18(weights=tv.ResNet18_Weights.DEFAULT),
         }
         factory = model_map.get(model_name)
         if factory is None:
             return 0.5, 1.0
 
-        model = factory(pretrained=True)
+        model = factory()
         model.eval()
+
+        def _extract_features(m, x):
+            if hasattr(m, "features"):
+                feats = m.features(x)
+                return _tnn.functional.adaptive_avg_pool2d(feats, 1).flatten(1)
+            # ResNet: strip FC, use avgpool output
+            extractor = _tnn.Sequential(*list(m.children())[:-1])
+            return extractor(x).flatten(1)
 
         images = data["images"][:max_samples]
         labels = np.array(data["labels"][:max_samples])
@@ -395,11 +406,10 @@ class CandidateSelector:
 
         with _torch.no_grad():
             t0 = time.perf_counter()
-            features = (model.features(imgs)
-                        if hasattr(model, "features") else model(imgs))
+            features = _extract_features(model, imgs)
             latency = time.perf_counter() - t0
 
-        features = features.view(features.size(0), -1).cpu().numpy()
+        features = features.cpu().numpy()
         split = int(0.8 * len(features))
 
         clf = LogisticRegression(max_iter=200)
@@ -425,8 +435,6 @@ class CandidateSelector:
     # -------------------------------------------------------------------
     # Text / Image probes (public API — with time budget + error handling)
     # -------------------------------------------------------------------
-
-    # BUG-10: Remove duplicate quick_probe_text (kept only the L746 version below)
 
     def quick_probe_image(self, candidates, data, max_samples=500):
         """
@@ -492,6 +500,17 @@ class CandidateSelector:
                 embeddings.append(
                     tfidf.fit_transform(data["texts"][:max_samples]).toarray()
                 )
+            if image_model and "images" in data:
+                import torch as _img_torch
+                import torchvision.models as _tv
+                _probe_enc = _tv.mobilenet_v3_small(
+                    weights=_tv.MobileNet_V3_Small_Weights.DEFAULT
+                ).eval()
+                _imgs = _img_torch.stack(data["images"][:max_samples])
+                with _img_torch.no_grad():
+                    _img_feats = _probe_enc.features(_imgs)
+                    _img_feats = _img_feats.mean(dim=[2, 3])  # GAP: (N, C)
+                embeddings.append(_img_feats.numpy())
 
             if not embeddings:
                 return 0.0
@@ -528,11 +547,18 @@ class CandidateSelector:
     # Fusion strategy probe
     # -------------------------------------------------------------------
 
-    def probe_fusion(self, config, data, max_samples=500):
-        """Probe fusion strategies with lightweight training."""
-        fusion_candidates = ["concatenation", "attention"]
+    def probe_fusion(self, config, data, max_samples=500, schema_info=None):
+        """Probe concatenation (baseline) + the strategy select_fusion_strategy recommends."""
+        recommended = "concatenation"
+        if schema_info is not None:
+            try:
+                from modelss.fusion import select_fusion_strategy
+                recommended = select_fusion_strategy(schema_info)
+            except Exception:
+                pass
+        to_probe = list(dict.fromkeys(["concatenation", recommended]))  # dedup, keep order
         scores = {}
-        for fusion in fusion_candidates:
+        for fusion in to_probe:
             try:
                 score = self.joint_probe(
                     tab_model=config.get("tabular"),
@@ -544,8 +570,8 @@ class CandidateSelector:
             except Exception as exc:
                 logger.warning("Fusion probe failed for %s: %s", fusion, exc)
                 scores[fusion] = 0.0
-        best = max(scores, key=scores.get) if scores else "concatenation"
-        logger.info("Fusion probe: %s → best=%s", scores, best)
+        best = max(scores, key=scores.get) if scores else recommended
+        logger.info("Fusion probe (recommended=%s): %s → best=%s", recommended, scores, best)
         return best, scores
 
     """
@@ -611,6 +637,22 @@ class CandidateSelector:
                 c for c in TEXT_CANDIDATE_POOL
                 if avg_tokens <= c["avg_token_limit"]
             ]
+            if not candidates["text"]:
+                # All candidates exceed avg_token_limit (e.g. legal/medical docs).
+                # Force MiniLM with sliding-window truncation rather than crashing.
+                _fallback = next(
+                    (c for c in TEXT_CANDIDATE_POOL if c["name"] == "minilm"),
+                    TEXT_CANDIDATE_POOL[0],
+                )
+                _fallback = dict(_fallback)
+                _fallback["truncation_strategy"] = "sliding_window"
+                _fallback["effective_max_tokens"] = _fallback["avg_token_limit"]
+                candidates["text"] = [_fallback]
+                logger.warning(
+                    "All text candidates exceed avg_token_limit (%d tokens). "
+                    "Forcing MiniLM with sliding-window truncation.",
+                    avg_tokens,
+                )
 
         if "image" in modalities:
             candidates["image"] = list(IMAGE_CANDIDATE_POOL)
@@ -1213,11 +1255,13 @@ class CandidateSelector:
         Score estimate for unprobed tabular candidates.
         Based on general literature: XGBoost/LightGBM outperform on tabular.
         """
-        base = {"xgboost": 0.72, "lightgbm": 0.73, "grn": 0.68, "mlp": 0.65}
+        base = {"xgboost": 0.72, "lightgbm": 0.73, "mlp": 0.65}
+        # grn intentionally absent: score is unknown until probed (RF surrogate may
+        # over- or under-estimate depending on dataset; don't inject synthetic 0.68)
         s = base.get(name, 0.60)
         # Larger datasets favour more complex models
         if dataset_size > 50_000:
-            boost = {"xgboost": 0.04, "lightgbm": 0.04, "grn": 0.03, "mlp": 0.02}
+            boost = {"xgboost": 0.04, "lightgbm": 0.04, "mlp": 0.02}
             s += boost.get(name, 0.0)
         return float(s)
 

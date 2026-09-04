@@ -59,6 +59,8 @@ class DriftAdapter:
             "thresholds": thresholds,
             "status": status,
             "modality_drift": drift_result.get("modality_drift", {}),
+            "text_drift": drift_result.get("text_drift", {}),
+            "image_drift": drift_result.get("image_drift", {}),
             "retrain_recommended": retrain_recommended,
             "retrain_triggered": bool(drift_result.get("retrain_triggered", False)),
             "retrain_info": drift_result.get("retrain_info", {}),

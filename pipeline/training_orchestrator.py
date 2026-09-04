@@ -28,7 +28,7 @@ import torch
 import numpy as np
 import pandas as pd
 
-from dataclasses import asdict
+from dataclasses import asdict, replace as dataclasses_replace
 
 from data_ingestion.ingestion_manager import DataIngestionManager
 from data_ingestion.schema import GlobalSchema
@@ -89,6 +89,12 @@ def _canonical_fusion_strategy(value: Any) -> str:
         "gated_fusion": "gated",
         "gatedfusion": "gated",
         "fusemoe": "fusemoe",
+        "moe": "fusemoe",
+        "mixture_of_experts": "fusemoe",
+        "ssunifier": "structural_semantic",
+        "ssrouter": "structural_semantic",
+        "structural_semantic_router": "structural_semantic",
+        "structuralsemanticfusion": "structural_semantic",
     }
     return aliases.get(raw, raw or "concatenation")
 
@@ -101,7 +107,7 @@ def _snapshot_embedding_caches(*datasets: Any) -> List[Tuple[Any, str, Any]]:
         if dataset is None or id(dataset) in seen:
             continue
         seen.add(id(dataset))
-        for attr in ("_precomputed_text", "_precomputed_image"):
+        for attr in ("_precomputed_text", "_precomputed_image", "_precomputed_text_seq", "_precomputed_image_seq"):
             if hasattr(dataset, attr):
                 snapshot.append((dataset, attr, getattr(dataset, attr)))
     return snapshot
@@ -114,7 +120,7 @@ def _clear_embedding_caches(*datasets: Any) -> None:
         if dataset is None or id(dataset) in seen:
             continue
         seen.add(id(dataset))
-        for attr in ("_precomputed_text", "_precomputed_image"):
+        for attr in ("_precomputed_text", "_precomputed_image", "_precomputed_text_seq", "_precomputed_image_seq"):
             if hasattr(dataset, attr):
                 setattr(dataset, attr, None)
 
@@ -199,6 +205,13 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
         # Pre-computed frozen encoder embeddings (set after JIT selection)
         self._precomputed_text: Optional[torch.Tensor] = precomputed_text_embeddings
         self._precomputed_image: Optional[torch.Tensor] = precomputed_image_embeddings
+        # ULA token-mode: full token/patch sequences [N, T, D] for cross-modal attention
+        self._precomputed_text_seq: Optional[torch.Tensor] = None
+        self._precomputed_image_seq: Optional[torch.Tensor] = None
+        # Tier 2: Reasoning semantic scaffold sequences + attention masks (frozen DeBERTa)
+        # Excluded from LoRA adaptation and cache-clear cycle.
+        self._precomputed_reasoning_seq: Optional[torch.Tensor] = None   # [N, T, 768]
+        self._precomputed_reasoning_mask: Optional[torch.Tensor] = None  # [N, T] — 1=valid 0=PAD
 
         # Pre-compute column groupings from schema
         per_ds = schema_info.get("per_dataset", [{}])
@@ -277,6 +290,9 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
         if self._tabular_array is not None:
             sample["tabular"] = self._tabular_array[idx]
 
+        # Text: token sequences (ULA) take priority over pooled cache
+        if self._precomputed_text_seq is not None and self._text_cols:
+            sample["text_tokens"] = self._precomputed_text_seq[idx]
         # Text: use pre-computed embedding if available, else tokenize
         if self._precomputed_text is not None and self._text_cols:
             sample["text_pooled"] = self._precomputed_text[idx]
@@ -286,6 +302,9 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
             sample["input_ids"] = enc["input_ids"]
             sample["attention_mask"] = enc["attention_mask"]
 
+        # Image: patch sequences (ULA) take priority over pooled cache
+        if self._precomputed_image_seq is not None and self._image_cols:
+            sample["image_patches"] = self._precomputed_image_seq[idx]
         # Image: use pre-computed embedding if available, else load + preprocess
         # Training datasets apply RandomFlip/Rotate/ColorJitter augmentation
         # before Resize+Normalize.  Validation/test datasets skip augmentation
@@ -317,6 +336,11 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
                     )
                 h, w = self.image_preprocessor.target_size
                 sample["image"] = torch.zeros(3, h, w, dtype=torch.float32)
+
+        # Tier 2: Reasoning token sequences + attention masks (frozen, always cached)
+        if self._precomputed_reasoning_seq is not None and idx < len(self._precomputed_reasoning_seq):
+            sample["reasoning_tokens"]         = self._precomputed_reasoning_seq[idx]
+            sample["reasoning_attention_mask"] = self._precomputed_reasoning_mask[idx]
 
         return sample
 
@@ -414,6 +438,239 @@ def _precompute_image_embeddings(
     if progress_fn is not None:
         progress_fn(100, f"Image embeddings done: {n} samples")
     return torch.cat(all_embeds, dim=0)
+
+
+def _precompute_text_token_sequences(
+    dataset: "MultimodalPyTorchDataset",
+    text_encoder: Any,
+    device: torch.device,
+    max_length: int = 128,
+    batch_size: int = 32,
+) -> torch.Tensor:
+    """Run frozen text encoder and return full token sequences [N, max_length, hidden_size].
+
+    Unlike ``_precompute_text_embeddings`` (which returns only the CLS pooled vector),
+    this function preserves the full last-hidden-state sequence so that ULA's
+    ``UnifiedLatentFusion`` can perform true cross-modal token/patch attention.
+    """
+    text_encoder.eval()
+    all_seqs: List[torch.Tensor] = []
+    n = len(dataset)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        ids_list, mask_list = [], []
+        for i in range(start, end):
+            s = dataset[i]
+            ids_list.append(s["input_ids"])
+            mask_list.append(s["attention_mask"])
+        input_ids = torch.stack(ids_list).to(device)
+        attn_mask = torch.stack(mask_list).to(device)
+        with torch.no_grad():
+            out = text_encoder.transformer(input_ids=input_ids, attention_mask=attn_mask)
+            seq = out.last_hidden_state[:, :max_length, :]   # [B, T, H]
+            if text_encoder._projection is not None:
+                seq = text_encoder._projection(seq)          # project per-token if set
+            all_seqs.append(seq.cpu())
+    return torch.cat(all_seqs, dim=0)   # [N, max_length, H]
+
+
+def _precompute_reasoning_token_sequences(
+    df: Any,
+    reasoning_col: str,
+    text_encoder: Any,
+    device: torch.device,
+    batch_size: int = 32,
+) -> "Tuple[torch.Tensor, torch.Tensor]":
+    """Precompute frozen DeBERTa token sequences for reasoning_text column.
+
+    Returns
+    -------
+    seq_tensor  : [N, dynamic_max_length, hidden_size]  — last_hidden_state
+    mask_tensor : [N, dynamic_max_length]               — attention_mask (1=valid, 0=PAD)
+
+    Dynamic max_length is derived from the p95 of actual token counts + 16,
+    capped at 512 (DeBERTa limit). This avoids padding waste for short reasoning.
+    """
+    import numpy as _np
+
+    tokenizer = getattr(text_encoder, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("reasoning encoder has no tokenizer attribute")
+
+    reasoning_texts = list(df[reasoning_col].fillna("").astype(str))
+    n = len(reasoning_texts)
+
+    # Dynamic max_length from actual distribution (avoids 106 PAD tokens per sample)
+    _sample_lengths = [
+        len(tokenizer.encode(t, add_special_tokens=True))
+        for t in reasoning_texts[:min(n, 2000)]  # sample up to 2000 for speed
+    ]
+    _p95_len = int(sorted(_sample_lengths)[int(0.95 * len(_sample_lengths))])
+    _dynamic_max = min(512, _p95_len + 16)
+    logger.info(
+        "Reasoning dynamic max_length=%d (p95=%d over %d samples)",
+        _dynamic_max, _p95_len, len(_sample_lengths),
+    )
+
+    all_seqs: List[torch.Tensor] = []
+    all_masks: List[torch.Tensor] = []
+
+    text_encoder.eval()
+    for start in range(0, n, batch_size):
+        batch_texts = reasoning_texts[start : start + batch_size]
+        enc = tokenizer(
+            batch_texts,
+            max_length=_dynamic_max,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids  = enc["input_ids"].to(device)
+        attn_mask  = enc["attention_mask"].to(device)  # 1=valid, 0=PAD
+
+        with torch.no_grad():
+            try:
+                out = text_encoder.transformer(input_ids=input_ids, attention_mask=attn_mask)
+                seq = out.last_hidden_state  # [B, T, H]
+            except AttributeError:
+                # CLIPTextEncoder / SigLIPTextEncoder use self._model, not self.transformer
+                out = text_encoder._model(input_ids=input_ids, attention_mask=attn_mask,
+                                          output_hidden_states=True)
+                seq = out.last_hidden_state  # [B, T, H]
+
+        all_seqs.append(seq.cpu())
+        all_masks.append(attn_mask.cpu())
+
+    return (
+        torch.cat(all_seqs,  dim=0),   # [N, dynamic_max, H]
+        torch.cat(all_masks, dim=0),   # [N, dynamic_max] — 1=valid, 0=PAD
+    )
+
+
+def _precompute_image_patch_sequences(
+    dataset: "MultimodalPyTorchDataset",
+    image_encoder: Any,
+    device: torch.device,
+    pool_to: int = 7,
+    batch_size: int = 32,
+) -> torch.Tensor:
+    """Run frozen image encoder and return spatially-pooled patch tokens [N, pool_to², D].
+
+    ViT encoders (SigLIP, CLIP-ViT, DINOv2) return [B, P, D] patch sequences.
+    We apply ``AdaptiveAvgPool2d((pool_to, pool_to))`` spatially (14×14 → 7×7)
+    to compress memory from ~4.9 GB to ~1.2 GB while preserving spatial structure.
+
+    CNN encoders that cannot return patch sequences fall back to unsqueezed [N, 1, D].
+    """
+    import inspect as _inspect
+    image_encoder.eval()
+    all_patches: List[torch.Tensor] = []
+    n = len(dataset)
+    _has_token_arg = "return_all_tokens" in _inspect.signature(image_encoder.forward).parameters
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        imgs = torch.stack([dataset[i]["image"] for i in range(start, end)]).to(device)
+        with torch.no_grad():
+            if _has_token_arg:
+                patches = image_encoder(imgs, return_all_tokens=True)  # [B, P, D]
+            else:
+                patches = image_encoder(imgs)                           # [B, D] or [B, P, D]
+            if patches.ndim == 2:
+                # CNN or pooled encoder — unsqueeze to [B, 1, D]
+                patches = patches.unsqueeze(1)
+            if patches.shape[1] > pool_to * pool_to:
+                B, P, D = patches.shape
+                S = int(P ** 0.5)
+                # [B, P, D] → [B, D, S, S] → pool → [B, D, pool_to, pool_to] → [B, pool_to², D]
+                spatial = patches.permute(0, 2, 1).reshape(B, D, S, S)
+                spatial = torch.nn.functional.adaptive_avg_pool2d(spatial, (pool_to, pool_to))
+                patches = spatial.flatten(2).permute(0, 2, 1)          # [B, pool_to², D]
+            all_patches.append(patches.cpu())
+    return torch.cat(all_patches, dim=0)   # [N, pool_to², D]
+
+
+def _run_ula_warmup(
+    text_seq: torch.Tensor,
+    image_seq: torch.Tensor,
+    targets: torch.Tensor,
+    input_dims: Dict[str, int],
+    num_classes: int,
+    problem_type: str,
+    latent_dim: int,
+    n_heads: int,
+    device: torch.device,
+    warm_epochs: int,
+    accelerator: str,
+) -> Dict[str, Any]:
+    """Train ULA fusion head on training-split precomputed sequences.
+
+    Tabular is deliberately excluded: the tabular encoder is per-trial
+    random-init so cannot be warmed here.  ``strict=False`` at load time
+    skips any size-mismatched tabular projection weights.
+
+    Returns the fusion module state dict, or {} on any error.
+    """
+    try:
+        import pytorch_lightning as _pl
+        from torch.utils.data import DataLoader as _DataLoader, TensorDataset as _TDS
+
+        wu_input_dims: Dict[str, int] = {
+            "text_pooled":  text_seq.shape[-1],
+            "image_pooled": image_seq.shape[-1],
+        }
+
+        def _wu_collate(batch: List[Any]) -> Dict[str, torch.Tensor]:
+            text   = torch.stack([b[0] for b in batch])
+            image  = torch.stack([b[1] for b in batch])
+            target = torch.stack([b[2] for b in batch])
+            return {"text_tokens": text, "image_patches": image, "target": target}
+
+        wu_targets = targets.long() if "regression" not in str(problem_type) else targets.float()
+        wu_ds = _TDS(text_seq, image_seq, wu_targets)
+        wu_loader = _DataLoader(
+            wu_ds, batch_size=32, shuffle=True, num_workers=0,
+            collate_fn=_wu_collate,
+        )
+
+        wu_module = build_trainer(
+            problem_type=problem_type,
+            num_classes=num_classes,
+            input_dims=wu_input_dims,
+            learning_rate=1e-3,
+            weight_decay=1e-5,
+            dropout=0.1,
+            max_epochs=warm_epochs,
+            hidden_dim=latent_dim * 2,
+            head_num_layers=2,
+            fusion_strategy="ula",
+            fusion_config={
+                "latent_dim": latent_dim,
+                "n_layers":   2,
+                "n_heads":    n_heads,
+                "token_mode": True,
+            },
+            lora_config=None,
+        )
+
+        _pl.Trainer(
+            max_epochs=warm_epochs,
+            accelerator=accelerator,
+            devices=1,
+            precision="16-mixed" if accelerator == "gpu" else "32-true",
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            num_sanity_val_steps=0,
+            logger=False,
+        ).fit(wu_module, wu_loader)
+
+        _fusion = getattr(wu_module, "_fusion", None) or getattr(wu_module, "fusion", None)
+        if _fusion is not None:
+            return dict(_fusion.state_dict())
+        return {}
+    except Exception as _e:
+        logger.warning("ULA warm-up failed: %s", _e)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1050,6 +1307,8 @@ class TrainingOrchestrator:
                     "mmd": float(results.get("metrics", {}).get("fdd", 0.0) or 0.0),
                     "composite": float(results.get("composite_score", 0.0) or 0.0),
                     "modality_drift": dict(modality_drift or {}),
+                    "text_drift": dict(results.get("text_drift", {}) or {}),
+                    "image_drift": dict(results.get("image_drift", {}) or {}),
                     "retrain_triggered": bool(results.get("retrain_triggered", False)),
                     "retrain_info": retrain_info,
                 },
@@ -1369,7 +1628,11 @@ class TrainingOrchestrator:
                     modality_importance = model_sel_dict.get("modality_importance", {})
                     if not isinstance(modality_importance, dict):
                         modality_importance = {}
-                    ctx.update_fusion(str(fusion_strategy), dict(modality_importance))
+                    ctx.update_fusion(
+                        str(fusion_strategy),
+                        dict(modality_importance),
+                        source="selector_recommendation",
+                    )
 
                 ctx.set_pipeline_stage("model_selection")
             except Exception as ctx_exc:
@@ -1656,6 +1919,40 @@ class TrainingOrchestrator:
             logger.error("Phase 1 failed: %s", str(e))
             raise
 
+    def _materialize_target_column(
+        self, target_col: str, max_rows: int = 5000
+    ) -> Optional[list]:
+        """Return target column values for problem type validation. Best-effort."""
+        try:
+            import pandas as _pd
+            for name in self.dataset_registry.list_datasets():
+                lazy_ref = self.dataset_registry.get(name)
+                if lazy_ref is None:
+                    continue
+                df: Optional[_pd.DataFrame] = None
+                try:
+                    import polars as _pl
+                    if isinstance(lazy_ref, _pl.LazyFrame):
+                        df = lazy_ref.head(max_rows).collect().to_pandas()
+                    elif isinstance(lazy_ref, _pl.DataFrame):
+                        df = lazy_ref.head(max_rows).to_pandas()
+                except Exception:
+                    pass
+                if df is None:
+                    try:
+                        import dask.dataframe as _dd
+                        if isinstance(lazy_ref, _dd.DataFrame):
+                            df = lazy_ref.head(max_rows, compute=True)
+                    except Exception:
+                        pass
+                if df is None and isinstance(lazy_ref, _pd.DataFrame):
+                    df = lazy_ref.head(max_rows)
+                if df is not None and target_col in df.columns:
+                    return df[target_col].dropna().tolist()
+        except Exception:
+            pass
+        return None
+
     def _execute_phase_2_schema_detection(self) -> None:
         """
         Phase 2: Schema Detection – infer column types, target, and problem type.
@@ -1696,6 +1993,43 @@ class TrainingOrchestrator:
 
             detector = MultiDatasetSchemaDetector()
             global_schema: GlobalSchema = detector.detect_global_schema(lazy_datasets)
+
+            # Value-level problem type validation — heuristics can misclassify
+            # binary targets (n_unique=2) as multiclass. Inspect actual values
+            # from the first dataset that has the target column.
+            _target_col = global_schema.primary_target
+            if _target_col:
+                try:
+                    _target_vals = self._materialize_target_column(_target_col)
+                    if _target_vals:
+                        import pandas as _pd
+                        _series = _pd.Series(_target_vals).dropna()
+                        _n_unique = int(_series.nunique())
+                        _dtype = str(_series.dtype).lower()
+                        if _n_unique == 2:
+                            _inferred = "classification_binary"
+                        elif ("float" in _dtype or "double" in _dtype) and _n_unique > 20:
+                            _inferred = "regression"
+                        elif _n_unique <= 50:
+                            _inferred = "classification_multiclass"
+                        else:
+                            _inferred = "regression"
+                        if _inferred != global_schema.global_problem_type:
+                            logger.info(
+                                "Phase 2: problem type corrected by value inspection: "
+                                "%s → %s (target='%s', n_unique=%d)",
+                                global_schema.global_problem_type,
+                                _inferred,
+                                _target_col,
+                                _n_unique,
+                            )
+                            global_schema = dataclasses_replace(
+                                global_schema, global_problem_type=_inferred
+                            )
+                except Exception as _val_exc:
+                    logger.debug(
+                        "Phase 2: value-level problem type check failed: %s", _val_exc
+                    )
 
             elapsed = time.time() - phase_start
             results: Dict[str, Any] = asdict(global_schema)
@@ -1742,6 +2076,11 @@ class TrainingOrchestrator:
         logger.info("\n" + "=" * 80)
         logger.info("PHASE 3: PREPROCESSING")
         logger.info("=" * 80)
+        logger.info(
+            "Phase 3: Materialising authoritative preprocessing plan. "
+            "An initial estimate was produced during schema detection — "
+            "this plan supersedes it with actual fitted transformers."
+        )
 
         phase_start = time.time()
         MAX_ROWS = 50_000  # memory-safe cap for materialisation
@@ -1804,6 +2143,20 @@ class TrainingOrchestrator:
                 pd.concat(frames, ignore_index=True) if frames
                 else pd.DataFrame()
             )
+
+            # Compute content hash for embedding cache invalidation (INT-10).
+            # Hash of first 1000 rows catches re-uploads of same filename with different data.
+            try:
+                import hashlib as _hashlib
+                _hash_sample = full_df.head(1000)
+                if not _hash_sample.empty:
+                    self._dataset_content_hash = _hashlib.sha256(
+                        pd.util.hash_pandas_object(_hash_sample, index=True).values.tobytes()
+                    ).hexdigest()[:16]
+                else:
+                    self._dataset_content_hash = ""
+            except Exception:
+                self._dataset_content_hash = ""
 
             if full_df.empty and image_datasets:
                 def _materialize_image_dataset(ds: Any, max_rows: int) -> pd.DataFrame:
@@ -2936,6 +3289,13 @@ class TrainingOrchestrator:
                         from automl.candidate_selector import CandidateSelector
 
                         _probe_selector = CandidateSelector()
+                        # ISSUE-10: inject existing probe cache from ctx so repeated
+                        # model-selection calls skip already-probed combos.
+                        _ctx_p4 = self._get_ctx()
+                        if _ctx_p4 is not None:
+                            _existing = getattr(_ctx_p4, "probe_scores_cache", None)
+                            if isinstance(_existing, dict) and _existing:
+                                _probe_selector._probe_cache = dict(_existing)
                         probe_y_arr = np.asarray(probe_y)
                         if probe_y_arr.ndim > 1 and probe_y_arr.shape[1] > 1:
                             probe_y_norm = np.argmax(probe_y_arr, axis=1)
@@ -2954,6 +3314,9 @@ class TrainingOrchestrator:
                             np.asarray(probe_y_norm),
                         )
                         confidence = _probe_selector.compute_selection_confidence(score_map)
+                        # Write probe cache back to ctx for reuse on next model-selection call
+                        if _ctx_p4 is not None and _probe_selector._probe_cache:
+                            _ctx_p4.probe_scores_cache = dict(_probe_selector._probe_cache)
                     except Exception as probe_meta_exc:
                         logger.debug(
                             "Phase 4: probe metadata computation skipped: %s",
@@ -3100,7 +3463,11 @@ class TrainingOrchestrator:
 
                 try:
                     if not getattr(ctx, "fusion_strategy", None):
-                        ctx.update_fusion(phase_result["fusion_strategy"], {})
+                        ctx.update_fusion(
+                            phase_result["fusion_strategy"],
+                            {},
+                            source="auto",
+                        )
                     if not getattr(ctx, "model_choices", None):
                         ctx.update_model_selection(
                             recommendations,
@@ -3182,19 +3549,31 @@ class TrainingOrchestrator:
         _dataset_n = len(self.torch_dataset) if self.torch_dataset is not None else 10_000
         _default_trials = 30 if _dataset_n > 50_000 else 20 if _dataset_n > 10_000 else 12
         N_TRIALS: int = int(_os_hpo.environ.get("APEX_N_TRIALS", str(_default_trials)))
-        VAL_SPLIT: float = 0.2
+        VAL_SPLIT: float  = 0.10   # 10% val — Optuna HPO objective
+        TEST_SPLIT: float = 0.10   # 10% held-out test — final unbiased eval
+        # Total: 80% train / 10% val / 10% test (80/10/10)
+        # Eliminates HPO selection bias from reported metrics.
 
         if hp_overrides:
-            # Use override as trial 0, then explore nearby with Optuna.
-            # Default 5 trials: trial 0 = exact override, trials 1-4 = TPE search around it.
-            # TPE learns from trial 0's val_loss and biases subsequent samples toward
-            # HP regions that performed well. Set APEX_N_TRIALS_MANUAL to override.
-            N_TRIALS = min(N_TRIALS, int(_os_hpo.environ.get("APEX_N_TRIALS_MANUAL", "5")))
+            # Trial 0 = exact override; remaining trials = adaptive TPE exploration.
+            # Previously capped at 5 (hardcoded), bypassing the adaptive controller
+            # in the most common real-world scenario (any UI-provided override).
+            _n_ula_extra_hp = (
+                4 if _canonical_fusion_strategy(
+                    str((hp_overrides or {}).get("fusion_strategy", ""))
+                ) == "ula" else 0
+            )
+            _adaptive_n = self.optuna_adaptive.suggest_trial_count(
+                dataset_size=_dataset_n,
+                gpu_available=(self.device.type == "cuda"),
+                n_extra_hpo_dims=_n_ula_extra_hp,
+            )
+            _manual_cap = int(_os_hpo.environ.get("APEX_N_TRIALS_MANUAL", str(_adaptive_n + 2)))
+            N_TRIALS = min(_adaptive_n + 2, _manual_cap)
             logger.info(
-                "  HP overrides provided — trial 0 uses exact values, "
-                "then %d total trials with Optuna TPE exploring nearby. "
-                "Set APEX_N_TRIALS_MANUAL env var to change total (min 1).",
-                N_TRIALS,
+                "  HP overrides: trial 0 = exact config, %d adaptive TPE trials (total=%d). "
+                "Set APEX_N_TRIALS_MANUAL to override.",
+                N_TRIALS - 1, N_TRIALS,
             )
 
         phase_start = time.time()
@@ -3266,13 +3645,15 @@ class TrainingOrchestrator:
             _aug_ds   = self.train_torch_dataset or self.torch_dataset
             _clean_ds = self.val_torch_dataset   or self.torch_dataset
             n_total: int = len(_aug_ds)
-            n_val: int = max(1, int(n_total * VAL_SPLIT))
-            n_train: int = n_total - n_val
+            # 80/10/10 three-way split: train / val (HPO objective) / test (held-out)
+            n_test:  int = max(1, int(n_total * TEST_SPLIT))
+            n_val:   int = max(1, int(n_total * VAL_SPLIT))
+            n_train: int = n_total - n_val - n_test
 
             from torch.utils.data import Subset as _Subset
 
             # Stratified split for classification; random for regression.
-            # Preserves class balance in both train and val subsets.
+            # Two-stage: first carve test (10%), then split remainder 8:1 → train/val.
             all_indices = list(range(n_total))
             _use_stratify = problem_type.startswith("classification") or problem_type == "multilabel_classification"
             _use_stratified_kfold = False
@@ -3319,23 +3700,36 @@ class TrainingOrchestrator:
                             splitter.split(np.zeros(n_total), _targets_for_strat)
                         )
                         train_indices = list(train_indices)
-                        val_indices = list(val_indices)
+                        val_indices   = list(val_indices)
+                        test_indices  = []   # no held-out test for long-tail (too few samples)
                         logger.info(
-                            "  StratifiedKFold split (long-tail target): train=%d  val=%d",
-                            len(train_indices),
-                            len(val_indices),
+                            "  StratifiedKFold split (long-tail): train=%d  val=%d  test=0",
+                            len(train_indices), len(val_indices),
                         )
                     else:
-                        train_indices, val_indices = _split(
+                        # Stage 1: carve off test set (10%)
+                        _trainval_indices, test_indices = _split(
                             all_indices,
-                            test_size=VAL_SPLIT,
+                            test_size=TEST_SPLIT,
                             random_state=self.config.seed,
                             stratify=_targets_for_strat,
                         )
-                        logger.info("  Stratified split: train=%d  val=%d", len(train_indices), len(val_indices))
+                        _trainval_strat = [_targets_for_strat[i] for i in _trainval_indices]
+                        # Stage 2: split remaining 90% into train/val (val = 10/90 ≈ 11.1%)
+                        _val_frac = VAL_SPLIT / (1.0 - TEST_SPLIT)
+                        train_indices, val_indices = _split(
+                            _trainval_indices,
+                            test_size=_val_frac,
+                            random_state=self.config.seed,
+                            stratify=_trainval_strat,
+                        )
+                        logger.info(
+                            "  Stratified 80/10/10 split: train=%d  val=%d  test=%d",
+                            len(train_indices), len(val_indices), len(test_indices),
+                        )
                 except Exception as strat_exc:
                     logger.warning(
-                        "  Stratified split failed (%s), falling back to random split",
+                        "  Stratified split failed (%s), falling back to random 80/10/10",
                         strat_exc,
                     )
                     perm = torch.randperm(
@@ -3343,24 +3737,32 @@ class TrainingOrchestrator:
                         generator=torch.Generator().manual_seed(self.config.seed),
                     ).tolist()
                     train_indices = perm[:n_train]
-                    val_indices   = perm[n_train:]
+                    val_indices   = perm[n_train:n_train + n_val]
+                    test_indices  = perm[n_train + n_val:]
             else:
                 perm = torch.randperm(
                     n_total,
                     generator=torch.Generator().manual_seed(self.config.seed),
                 ).tolist()
                 train_indices = perm[:n_train]
-                val_indices   = perm[n_train:]
+                val_indices   = perm[n_train:n_train + n_val]
+                test_indices  = perm[n_train + n_val:]
 
             n_train = len(train_indices)
             n_val   = len(val_indices)
+            n_test  = len(test_indices)
 
             train_ds = _Subset(_aug_ds,   train_indices)
             val_ds   = _Subset(_clean_ds, val_indices)
+            test_ds  = _Subset(_clean_ds, test_indices) if test_indices else None
 
             # Report data split to progress callback
             if progress_callback is not None:
                 progress_callback.set_data_split(n_train, n_val, n_total)
+            logger.info(
+                "  80/10/10 split: train=%d  val=%d  test=%d  (total=%d)",
+                n_train, n_val, n_test, n_total,
+            )
 
             # Resolve execution context for class-weight / encoder-plan reads
             ctx = self._get_ctx()
@@ -3515,10 +3917,82 @@ class TrainingOrchestrator:
             except Exception as _hpo_exc:
                 logger.debug("Modality-specific HPO merge failed (non-fatal): %s", _hpo_exc)
 
+            # Derive alignment_weight lower bound from schema's measured alignment signal.
+            # For ULA fusion with text+image, contrastive loss is architecturally
+            # meaningful — ensure it can't be fully disabled by Optuna sampling 0.
+            # Floor is proportional to alignment_strength (zero when unmeasured → honest).
+            if "alignment_weight" in hpo_space:
+                try:
+                    _mm_sigs   = dict((schema_info.get("multimodal_signals") or {}))
+                    _align_str = float(_mm_sigs.get("alignment_strength", 0.0) or 0.0)
+                    _is_ula    = str(model_sel.get("fusion_strategy", "")).lower() == "ula"
+                    if _align_str > 0.0 or _is_ula:
+                        _cw_low = float(
+                            hpo_space.get("contrastive_weight", {}).get("low", 0.0) or 0.0
+                        )
+                        _align_floor = max(_align_str * 0.1, _cw_low / 5.0)
+                        # For ULA + text+image, enforce a hard floor independent of
+                        # measured alignment_strength (which is 0 for synthetic/new data).
+                        # NT-Xent is architecturally mandated for cross-modal ULA — 0.05
+                        # matches CLIP literature minimum for meaningful alignment signal.
+                        _active_mods_align = [
+                            str(m).lower()
+                            for m in schema_info.get("global_modalities", [])
+                        ]
+                        if (
+                            _is_ula
+                            and "text" in _active_mods_align
+                            and "image" in _active_mods_align
+                        ):
+                            # C7: floor=0.01 (was 0.05). C2 Uncertainty Weighting now handles
+                            # the dynamic balance — 0.05 blocked the known optimum (0.009–0.018).
+                            _align_floor = max(_align_floor, 0.01)
+                        if _align_floor > 0.0:
+                            hpo_space["alignment_weight"]["low"] = max(
+                                hpo_space["alignment_weight"].get("low", 0.0), _align_floor,
+                            )
+                            logger.info(
+                                "Phase 5: alignment_weight floor → %.4f "
+                                "(align_str=%.2f, ula=%s)",
+                                _align_floor, _align_str, _is_ula,
+                            )
+                except Exception as _af_exc:
+                    logger.debug("alignment_weight floor derivation failed: %s", _af_exc)
+
+            # Pre-scale LR HPO bounds for ULA+LoRA: Goyal scaling halves lr at
+            # bs=16 (LoRA VRAM cap), so sampled lr ≠ training lr without this.
+            # Post-fix: Optuna banner lr == actual training lr; next_trial_overrides
+            # lr_center is directly usable without manual halving.
+            if "learning_rate" in hpo_space:
+                try:
+                    _fus_for_lr = str(model_sel.get("fusion_strategy", "")).lower()
+                    if _canonical_fusion_strategy(_fus_for_lr) == "ula":
+                        _lora_scale = min(16, batch_size) / 32.0
+                        _lr_spec = hpo_space["learning_rate"]
+                        hpo_space["learning_rate"] = {
+                            **_lr_spec,
+                            "low":  float(_lr_spec.get("low",  1e-6)) * _lora_scale,
+                            "high": float(_lr_spec.get("high", 0.1))  * _lora_scale,
+                        }
+                        logger.info(
+                            "Phase 5: ULA+LoRA lr bounds ×%.2f → [%.2e, %.2e]",
+                            _lora_scale,
+                            hpo_space["learning_rate"]["low"],
+                            hpo_space["learning_rate"]["high"],
+                        )
+                except Exception as _lr_scale_exc:
+                    logger.debug("ULA lr pre-scale failed (non-fatal): %s", _lr_scale_exc)
+
             if not hp_overrides:
+                _n_ula_extra = (
+                    4 if _canonical_fusion_strategy(
+                        str(model_sel.get("fusion_strategy", ""))
+                    ) == "ula" else 0
+                )
                 N_TRIALS = self.optuna_adaptive.suggest_trial_count(
                     dataset_size=n_total,
                     gpu_available=(self.device.type == "cuda"),
+                    n_extra_hpo_dims=_n_ula_extra,
                 )
                 logger.info("  Adaptive HPO policy: trials=%d", N_TRIALS)
 
@@ -3543,8 +4017,54 @@ class TrainingOrchestrator:
             _persistent = _n_workers > 0 and _sys.platform != "win32"
             _pin = self.device.type == "cuda" and _n_workers > 0
 
+            # Sequential data (time series / forecasting) must NOT be shuffled —
+            # shuffling destroys temporal order and forces the model to learn noise.
+            _active_mods_ph5 = [
+                str(m).lower()
+                for m in schema_info.get("global_modalities", self.config.modalities)
+            ]
+            _is_sequential = (
+                "forecasting" in str(problem_type).lower()
+                or "timeseries" in str(problem_type).lower()
+                or "timeseries" in _active_mods_ph5
+            )
+            if _is_sequential:
+                logger.info(
+                    "Phase 5: detected sequential problem_type='%s' — "
+                    "DataLoader shuffle=False to preserve temporal order.",
+                    problem_type,
+                )
+
+            # Build WeightedRandomSampler from label-noise weights (train indices only).
+            # When noise detected, down-weighted suspicious samples are drawn less
+            # often — equivalent to soft label cleaning without removing samples.
+            _train_sampler: Optional[Any] = None
+            if _noise_sample_weights is not None:
+                try:
+                    _ws = torch.tensor(
+                        _noise_sample_weights[train_indices], dtype=torch.float32
+                    )
+                    _train_sampler = torch.utils.data.WeightedRandomSampler(
+                        weights=_ws,
+                        num_samples=len(_ws),
+                        replacement=True,
+                    )
+                    logger.info(
+                        "  Label noise: WeightedRandomSampler active "
+                        "(%d suspicious → w=0.2)", _noise_sample_weights[train_indices].tolist().count(0.2)
+                        if hasattr(_noise_sample_weights[train_indices], "tolist") else "?"
+                    )
+                except Exception as _ws_exc:
+                    logger.debug("WeightedRandomSampler build failed: %s", _ws_exc)
+                    _train_sampler = None
+
+            # sampler and shuffle are mutually exclusive in PyTorch DataLoader
+            _use_shuffle = (not _is_sequential) and (_train_sampler is None)
+
             train_loader = DataLoader(
-                train_ds, batch_size=batch_size, shuffle=True,
+                train_ds, batch_size=batch_size,
+                sampler=_train_sampler,
+                shuffle=_use_shuffle,
                 num_workers=_n_workers, pin_memory=_pin,
                 persistent_workers=_persistent,
             )
@@ -3555,10 +4075,32 @@ class TrainingOrchestrator:
             )
 
             logger.info(
-                "  dataset=%d  train=%d  val=%d  batch_size=%d  "
-                "input_dims=%s  num_classes=%d",
-                n_total, n_train, n_val, batch_size, input_dims, num_classes,
+                "  dataset=%d  train=%d  val=%d  test=%d  batch_size=%d  "
+                "input_dims=%s  num_classes=%d  noise_sampler=%s",
+                n_total, n_train, n_val, n_test, batch_size, input_dims, num_classes,
+                "yes" if _train_sampler else "no",
             )
+
+            def _make_trial_loaders(bs: int):
+                """Create fresh DataLoaders for a single Optuna trial.
+
+                Uses num_workers=0 to avoid cross-process pickling overhead on
+                Windows (spawn) and to stay safe with per-trial recreation.
+                Preserves WeightedRandomSampler from label-noise detection.
+                """
+                _trial_shuffle = (not _is_sequential) and (_train_sampler is None)
+                _trial_sampler = _train_sampler   # reuse noise sampler if present
+                return (
+                    DataLoader(
+                        train_ds, batch_size=bs,
+                        sampler=_trial_sampler, shuffle=_trial_shuffle,
+                        num_workers=0, pin_memory=False, persistent_workers=False,
+                    ),
+                    DataLoader(
+                        val_ds, batch_size=bs, shuffle=False,
+                        num_workers=0, pin_memory=False, persistent_workers=False,
+                    ),
+                )
 
             # ----------------------------------------------------------------
             # 5  Optuna study
@@ -3630,17 +4172,9 @@ class TrainingOrchestrator:
                 _preferred_text   = _enc_overrides.get("preferred_text_encoder")  or _preferred_text
                 _preferred_tabular= _enc_overrides.get("preferred_tabular_encoder") or _preferred_tabular
                 logger.info("Phase 5: user encoder overrides applied: %s", _enc_overrides)
-            # Read schema-derived output dims from ExecutionContext so the JIT
-            # selector can pick an encoder whose output_dim matches the head.
-            _ctx_enc_dims = {}
-            try:
-                _ctx_enc_dims = dict(getattr(self._get_ctx(), "encoder_output_dims", {}) or {})
-            except Exception:
-                pass
-
             _jit_result = _jit_selector.select(
                 modalities=schema_info.get("global_modalities", self.config.modalities),
-                device=self.device if self.device.type == "cuda" else None,
+                device=self.device,
                 preferred_tabular=_preferred_tabular,
                 preferred_text=_preferred_text,
                 preferred_image=_preferred_image,
@@ -3657,15 +4191,57 @@ class TrainingOrchestrator:
                     },
                 )
 
-            # Apply ctx encoder_output_dims as output-dim overrides when the
-            # selected encoder supports runtime reconfiguration.
-            for _mod, _dim in _ctx_enc_dims.items():
-                try:
-                    enc = getattr(_jit_result, f"{_mod}_encoder", None)
-                    if enc is not None and hasattr(enc, "output_dim"):
-                        enc.output_dim = int(_dim)
-                except Exception:
-                    pass
+            # Runtime family invariant: CLIP must pair with CLIP text, SigLIP with SigLIP text.
+            # Cross-family pairing means the alignment loss starts at maximum distance.
+            if _jit_result.image_encoder is not None and _jit_result.text_encoder is not None:
+                _img_fam = getattr(_jit_result.image_encoder, "ENCODER_FAMILY", "generic")
+                _txt_fam = getattr(_jit_result.text_encoder, "ENCODER_FAMILY", "generic")
+                if _img_fam != "generic" and _txt_fam != "generic" and _img_fam != _txt_fam:
+                    logger.warning(
+                        "LATENT SPACE MISMATCH: image encoder family=%r != text encoder family=%r. "
+                        "(%s, %s) — cross-family pairing will degrade alignment loss. "
+                        "Falling back to BERT+ViT generic encoders.",
+                        _img_fam, _txt_fam,
+                        _jit_result.image_encoder_name, _jit_result.text_encoder_name,
+                    )
+                    # Force fallback to generic (BERT+ViT) to avoid wasted training
+                    from automl.jit_encoder_selector import JITEncoderSelector as _JITSel
+                    _fallback_result = _JITSel()._cpu_fallback(
+                        need_image="image" in schema_info.get("global_modalities", []),
+                        need_text="text" in schema_info.get("global_modalities", []),
+                        device=None,  # CPU-safe generic fallback
+                    )
+                    _jit_result = _fallback_result
+
+            # Sync context dimensions from the JIT-selected encoders. The
+            # selected encoder is the source of truth; stale context defaults
+            # must not override SigLIP/CLIP/DINO or compact text dimensions.
+            try:
+                _ctx_after_jit = self._get_ctx()
+                if _ctx_after_jit is not None:
+                    _dims = dict(getattr(_ctx_after_jit, "encoder_output_dims", {}) or {})
+                    if _jit_result.image_encoder is not None:
+                        _img_dim = getattr(
+                            _jit_result.image_encoder,
+                            "get_output_dim",
+                            lambda: getattr(_jit_result, "image_output_dim", 0),
+                        )()
+                        if _img_dim:
+                            _dims["image"] = int(_img_dim)
+                    if _jit_result.text_encoder is not None:
+                        _txt_dim = getattr(
+                            _jit_result.text_encoder,
+                            "get_output_dim",
+                            lambda: getattr(_jit_result, "text_output_dim", 0),
+                        )()
+                        if _txt_dim:
+                            _dims["text"] = int(_txt_dim)
+                    if _jit_result.tabular_encoder_class is not None:
+                        _dims["tabular"] = int(_jit_result.tabular_encoder_output_dim)
+                    _ctx_after_jit.encoder_output_dims = _dims
+                    logger.info("Phase 5: encoder_output_dims synced from JIT -> %s", _dims)
+            except Exception as _dim_exc:
+                logger.debug("Phase 5: encoder_output_dims sync skipped: %s", _dim_exc)
 
             _image_encoder = _jit_result.image_encoder
             _text_encoder = _jit_result.text_encoder
@@ -3709,7 +4285,7 @@ class TrainingOrchestrator:
                     _text_prep_fitted._tokenizer = None  # force lazy reload
                     # Use wider context window for encoders that support it
                     _natural_max = 512 if any(k in _text_enc_name for k in ("deberta", "roberta", "xlm")) else 128
-                    _text_prep_fitted.max_length = max(_text_prep_fitted.max_length, min(256, _natural_max))
+                    _text_prep_fitted.max_length = max(_text_prep_fitted.max_length, min(128, _natural_max))
                     logger.info(
                         "Phase 5: text tokenizer synced '%s' → '%s'  max_length=%d",
                         _old_tok, _matched_tok, _text_prep_fitted.max_length,
@@ -3727,12 +4303,35 @@ class TrainingOrchestrator:
                 except Exception as cfg_exc:
                     logger.debug("  Image encoder configure failed: %s", cfg_exc)
 
-            # Also update the fitted ImagePreprocessor normalization to match the
-            # JIT-selected encoder (SigLIP/CLIP need CLIP stats, not ImageNet).
+            # Sync fitted ImagePreprocessor with JIT-selected encoder:
+            # (a) normalization stats  (b) target_size for patch-count-sensitive ViT encoders.
             _image_prep_fitted = self.fitted_transformers.get("image")
             if _image_prep_fitted is not None and _jit_result.image_encoder_name:
+                _enc_lower = _jit_result.image_encoder_name.lower()
                 _old_norm = getattr(_image_prep_fitted, "normalize_mode", "imagenet")
-                _image_prep_fitted.configure({"selected_image_encoder": _jit_result.image_encoder_name})
+
+                # Derive required resolution from encoder name.
+                # ViT-L/16-384, SigLIP-384, etc. embed the resolution in the name.
+                _required_res: int = 224  # safe default
+                for _res_token in ("512", "384", "336"):
+                    if _res_token in _enc_lower:
+                        _required_res = int(_res_token)
+                        break
+
+                _current_size = getattr(_image_prep_fitted, "target_size", (224, 224))
+                _current_res = _current_size[0] if isinstance(_current_size, (tuple, list)) else 224
+
+                _sync_plan: dict = {"selected_image_encoder": _jit_result.image_encoder_name}
+                if _required_res != _current_res:
+                    logger.warning(
+                        "Phase 5: image encoder '%s' requires %dx%d but preprocessor has %dx%d. "
+                        "Updating target_size — existing cached embeddings will be re-generated.",
+                        _jit_result.image_encoder_name,
+                        _required_res, _required_res, _current_res, _current_res,
+                    )
+                    _sync_plan["target_size"] = [_required_res, _required_res]
+
+                _image_prep_fitted.configure(_sync_plan)
                 _new_norm = getattr(_image_prep_fitted, "normalize_mode", "imagenet")
                 if _old_norm != _new_norm:
                     logger.info(
@@ -3803,6 +4402,9 @@ class TrainingOrchestrator:
                 "modalities": sorted(schema_info.get("global_modalities", self.config.modalities)),
                 "rows": n_total,
                 "seed": self.config.seed,
+                # Content hash computed in Phase 3 — invalidates cache when data changes
+                # even if filename and row count are identical (re-upload detection).
+                "content_hash": getattr(self, "_dataset_content_hash", ""),
             }
 
             _ctx_for_cache = self._get_ctx()
@@ -3893,6 +4495,7 @@ class TrainingOrchestrator:
                     "modality": "image_val",
                     "encoder": _jit_result.image_encoder_name,
                     "split": "val_clean",
+                    "target_size": list(getattr(_image_prep_fitted, "target_size", [224, 224])),
                 })
                 _precomputed_image_val = self.embedding_cache.get(image_cache_key)
                 if _precomputed_image_val is None or _precomputed_image_val.shape[0] != n_total:
@@ -3939,6 +4542,226 @@ class TrainingOrchestrator:
                     )
             else:
                 _precomputed_image_val = None
+
+            # ================================================================
+            # ULA token-mode: compute full token/patch sequence caches
+            # Only when schema_derived_fusion == "ula" AND both ViT+BERT-family
+            # encoders selected — enables true cross-modal patch/token attention.
+            # ================================================================
+            _ula_token_mode_global: bool = (
+                _canonical_fusion_strategy(self.state.get_slot("schema_derived_fusion") or "") == "ula"
+                and any(k in (_jit_result.image_encoder_name or "").lower()
+                        for k in ("vit", "siglip", "clip", "dino"))
+                and any(k in (_jit_result.text_encoder_name or "").lower()
+                        for k in ("bert", "deberta", "roberta"))
+            )
+            _precomputed_text_seq: Optional[torch.Tensor] = None
+            _precomputed_image_seq: Optional[torch.Tensor] = None
+
+            if _ula_token_mode_global and _text_encoder is not None and _precomputed_text is not None:
+                if progress_callback is not None:
+                    progress_callback.set_substage("text_seq_cache")
+                    progress_callback.set_phase(5, "Preparing text token sequence cache...", 62)
+                _text_seq_key = self.embedding_cache.build_key({
+                    **dataset_fingerprint,
+                    "modality": "text_seq",
+                    "encoder": _jit_result.text_encoder_name,
+                    "max_length": 128,
+                })
+                _precomputed_text_seq = self.embedding_cache.get(_text_seq_key)
+                if _precomputed_text_seq is None or _precomputed_text_seq.shape[0] != n_total:
+                    logger.info("  Pre-computing text token sequences (%d samples)...", n_total)
+                    # Temporarily clear pooled text cache so __getitem__ exposes raw
+                    # input_ids/attention_mask path (Bug fix: pooled cache blocks tokenizer).
+                    _aug_ds._precomputed_text = None
+                    _clean_ds._precomputed_text = None
+                    try:
+                        _precomputed_text_seq = _precompute_text_token_sequences(
+                            _clean_ds, _text_encoder, self.device,
+                            max_length=128, batch_size=batch_size,
+                        )
+                    finally:
+                        _aug_ds._precomputed_text = _precomputed_text
+                        _clean_ds._precomputed_text = _precomputed_text
+                    self.embedding_cache.set(
+                        _text_seq_key, _precomputed_text_seq,
+                        meta={"modality": "text_seq", "rows": n_total},
+                    )
+                else:
+                    logger.info(
+                        "  Loaded text token sequences from cache: shape=%s",
+                        list(_precomputed_text_seq.shape),
+                    )
+                _aug_ds._precomputed_text_seq = _precomputed_text_seq
+                _clean_ds._precomputed_text_seq = _precomputed_text_seq
+                logger.info("  Text token sequences ready: shape=%s", list(_precomputed_text_seq.shape))
+                if progress_callback is not None:
+                    progress_callback.push_trial_event(
+                        None, "embedding_ready", "Text token sequences ready",
+                        {
+                            "modality": "text_seq",
+                            "rows": int(_precomputed_text_seq.shape[0]),
+                            "seq_len": int(_precomputed_text_seq.shape[1]),
+                            "dim": int(_precomputed_text_seq.shape[2]),
+                        },
+                    )
+
+            if _ula_token_mode_global and _image_encoder is not None and _precomputed_image_val is not None:
+                if progress_callback is not None:
+                    progress_callback.set_substage("image_seq_cache")
+                    progress_callback.set_phase(5, "Preparing image patch sequence cache...", 63)
+                _img_seq_key = self.embedding_cache.build_key({
+                    **dataset_fingerprint,
+                    "modality": "image_seq",
+                    "encoder": _jit_result.image_encoder_name,
+                    "target_size": list(getattr(_image_prep_fitted, "target_size", [224, 224])),
+                    "pool_to": 7,
+                })
+                _precomputed_image_seq = self.embedding_cache.get(_img_seq_key)
+                if _precomputed_image_seq is None or _precomputed_image_seq.shape[0] != n_total:
+                    logger.info("  Pre-computing image patch sequences (%d samples)...", n_total)
+                    # Temporarily clear pooled image cache so __getitem__ exposes raw
+                    # image tensor path (Bug fix: pooled cache blocks image loading).
+                    _clean_ds._precomputed_image = None
+                    try:
+                        _precomputed_image_seq = _precompute_image_patch_sequences(
+                            _clean_ds, _image_encoder, self.device,
+                            pool_to=7, batch_size=batch_size,
+                        )
+                    finally:
+                        _clean_ds._precomputed_image = _precomputed_image_val
+                    self.embedding_cache.set(
+                        _img_seq_key, _precomputed_image_seq,
+                        meta={"modality": "image_seq", "rows": n_total},
+                    )
+                else:
+                    logger.info(
+                        "  Loaded image patch sequences from cache: shape=%s",
+                        list(_precomputed_image_seq.shape),
+                    )
+                _aug_ds._precomputed_image_seq = None      # train: raw encoder path preserves grad
+                _clean_ds._precomputed_image_seq = _precomputed_image_seq
+                logger.info("  Image patch sequences ready: shape=%s", list(_precomputed_image_seq.shape))
+                if progress_callback is not None:
+                    progress_callback.push_trial_event(
+                        None, "embedding_ready", "Image patch sequences ready",
+                        {
+                            "modality": "image_seq",
+                            "rows": int(_precomputed_image_seq.shape[0]),
+                            "n_patches": int(_precomputed_image_seq.shape[1]),
+                            "dim": int(_precomputed_image_seq.shape[2]),
+                        },
+                    )
+
+            # ================================================================
+            # Tier 2: Reasoning token-sequence precompute (frozen DeBERTa)
+            # Always cached — never cleared during LoRA trials (reasoning encoder frozen).
+            # Only activates when dataset has a `reasoning_text` column.
+            # ================================================================
+            _reasoning_col = (
+                "reasoning_text"
+                if "reasoning_text" in (_clean_ds.df.columns if hasattr(_clean_ds, "df") else [])
+                else None
+            )
+            if _reasoning_col is not None:
+                logger.info("Phase 5: precomputing reasoning token sequences (DeBERTa, frozen)...")
+                try:
+                    from modelss.encoders.text import TextEncoder as _TextEncoderCls
+                    _reasoning_encoder = _TextEncoderCls(
+                        model_name="microsoft/deberta-v3-base",
+                        max_length=512,
+                        freeze_backbone=True,
+                    )
+                    _reasoning_encoder = _reasoning_encoder.to(self.device).eval()
+
+                    _r_seq, _r_mask = _precompute_reasoning_token_sequences(
+                        df=_clean_ds.df,
+                        reasoning_col=_reasoning_col,
+                        text_encoder=_reasoning_encoder,
+                        device=self.device,
+                        batch_size=batch_size,
+                    )
+                    # Store on both splits — reasoning never augmented or cleared
+                    _aug_ds._precomputed_reasoning_seq   = _r_seq
+                    _aug_ds._precomputed_reasoning_mask  = _r_mask
+                    _clean_ds._precomputed_reasoning_seq  = _r_seq
+                    _clean_ds._precomputed_reasoning_mask = _r_mask
+
+                    # Add reasoning_tokens to input_dims so _MultimodalHead
+                    # includes it in the ULA sequence. Dim = 768 (DeBERTa hidden size).
+                    _reasoning_hidden = int(_r_seq.shape[2])
+                    input_dims["reasoning_tokens"] = _reasoning_hidden
+
+                    logger.info(
+                        "  Reasoning token sequences ready: shape=%s  mask=%s  "
+                        "input_dims[reasoning_tokens]=%d",
+                        list(_r_seq.shape), list(_r_mask.shape), _reasoning_hidden,
+                    )
+                    del _reasoning_encoder
+                    import gc; gc.collect()
+                except Exception as _re:
+                    logger.warning(
+                        "Phase 5: reasoning precompute failed (non-fatal): %s. "
+                        "Training continues without reasoning scaffold.",
+                        _re,
+                    )
+
+            # ================================================================
+            # ULA pre-Optuna warm-up: train fusion head on training-split
+            # cached sequences (no LoRA, text+image only).
+            # CRITICAL: use train_indices to avoid val-label leakage.
+            # ================================================================
+            _warmed_ula_head_state: Optional[Dict[str, Any]] = None
+            if (
+                _ula_token_mode_global
+                and _precomputed_text_seq is not None
+                and _precomputed_image_seq is not None
+            ):
+                _wu_targets = torch.tensor(
+                    _aug_ds.targets[train_indices]
+                    if hasattr(_aug_ds.targets, "__getitem__")
+                    else [_aug_ds.targets[i] for i in train_indices]
+                )
+                _wu_text  = _precomputed_text_seq[train_indices]
+                _wu_image = _precomputed_image_seq[train_indices]
+                logger.info(
+                    "Phase 5: running ULA warm-up (%d train samples, %d epochs)...",
+                    len(train_indices), 10,
+                )
+                if progress_callback is not None:
+                    progress_callback.set_substage("ula_warmup")
+                    progress_callback.set_phase(
+                        5, f"ULA warm-up: pre-training fusion head ({len(train_indices)} samples)...", 64,
+                    )
+                    progress_callback.push_trial_event(
+                        None, "substage", "ULA warm-up started",
+                        {"substage": "ula_warmup", "n_samples": len(train_indices), "epochs": 10},
+                    )
+                _warmed_ula_head_state = _run_ula_warmup(
+                    text_seq=_wu_text,
+                    image_seq=_wu_image,
+                    targets=_wu_targets,
+                    input_dims=input_dims,
+                    num_classes=num_classes,
+                    problem_type=problem_type,
+                    latent_dim=int(self.state.get_slot("ula_latent_dim") or 256),
+                    n_heads=8,
+                    device=self.device,
+                    warm_epochs=10,
+                    accelerator=accelerator,
+                )
+                logger.info(
+                    "Phase 5: ULA warm-up done (%d state keys)",
+                    len(_warmed_ula_head_state or {}),
+                )
+                if progress_callback is not None:
+                    progress_callback.push_trial_event(
+                        None, "substage", "ULA warm-up complete",
+                        {
+                            "substage": "ula_warmup_done",
+                            "state_keys": len(_warmed_ula_head_state or {}),
+                        },
+                    )
 
             def _sample(trial: optuna.Trial, key: str, default: Any) -> Any:
                 """Sample a value from hpo_space or return the default."""
@@ -4028,6 +4851,39 @@ class TrainingOrchestrator:
                     or "concatenation"
                 )
                 trial_fusion  = _sample(trial, "fusion_strategy", _hp.get("fusion_strategy", _schema_fusion_default))
+                # Fusion diversity: force startup trials (except trial 0 which uses
+                # user overrides or the schema default) to cycle through non-default
+                # fusion choices. Prevents TPE from locking on the first strategy
+                # before it has observed any alternatives.
+                _fus_choices = hpo_space.get("fusion_strategy", {}).get("choices", [])
+                if (
+                    len(_fus_choices) > 1
+                    and 0 < trial.number < _n_startup_trials
+                    and not (_hp and "fusion_strategy" in _hp)
+                ):
+                    _non_default = [c for c in _fus_choices if c != _schema_fusion_default]
+                    if _non_default:
+                        trial_fusion = _non_default[(trial.number - 1) % len(_non_default)]
+                        logger.info(
+                            "  Trial %d: fusion forced to %r for diversity (startup exploration)",
+                            trial.number, trial_fusion,
+                        )
+                # Validate sampled fusion against runtime active modalities.
+                # "uncertainty"/"uncertainty_graph" require tabular for epistemic
+                # uncertainty estimation; without tabular they degrade to concatenation,
+                # wasting the trial. Redirect to schema-derived default.
+                if trial_fusion in ("uncertainty", "uncertainty_graph") and "tabular" not in _active_mods_ph5:
+                    _redir = (
+                        _schema_fusion_default
+                        if _schema_fusion_default not in ("uncertainty", "uncertainty_graph")
+                        else "ula"
+                    )
+                    logger.info(
+                        "Phase 5: fusion=%r requires tabular (absent in %s) "
+                        "— redirected to schema-derived %r",
+                        trial_fusion, sorted(_active_mods_ph5), _redir,
+                    )
+                    trial_fusion = _redir
                 trial_alignment = _sample(trial, "alignment_weight", _hp.get("alignment_weight", 0.0))
                 # Params not in hpo_space: fixed from override or default for all trials
                 trial_modality_dropout = _hp.get("modality_dropout_prob", 0.15)
@@ -4053,6 +4909,21 @@ class TrainingOrchestrator:
                         _ep_min = int(hpo_space.get("epochs", {}).get("low", 3))
                         _ep_max = int(hpo_space.get("epochs", {}).get("high", 40))
                         trial_epochs = max(_ep_min, min(_ep_max, _ep_override))
+
+                # ULA fusion: clamp adaptive epoch override in the dict itself.
+                # Without this, AdaptiveOptunaController reads the stale 24-epoch
+                # value on the next iteration and re-issues the same bad override.
+                if (
+                    "epochs" in adaptive_trial_overrides
+                    and _canonical_fusion_strategy(trial_fusion) == "ula"
+                ):
+                    adaptive_trial_overrides["epochs"] = min(adaptive_trial_overrides["epochs"], 3)
+                    trial_epochs = min(trial_epochs, 3)
+                    logger.info("ULA: adaptive epoch override clamped to 3 epochs in dict")
+
+                # Log after ULA clamp so the logged dict reflects actual values used,
+                # not the pre-clamp 24-epoch value that was misleading in logs.
+                if adaptive_trial_overrides and trial.number > 0:
                     logger.info(
                         "  Trial %d adaptive overrides applied: %s",
                         trial.number,
@@ -4068,35 +4939,71 @@ class TrainingOrchestrator:
 
                 if trial_fusion in ("ula", "unified_latent", "unified_latent_alignment"):
                     _base_latent = int(self.state.get_slot("ula_latent_dim") or 256)
-                    _latent_choices = sorted(set([max(64, _base_latent // 2), _base_latent, min(512, _base_latent * 2)]))
+                    # Pin latent_dim to warm-up value when pre-warmed head is loaded.
+                    # A mismatch would make strict=False silently drop all warm weights,
+                    # giving Optuna a false signal that the sampled dim is bad (Risk 1 fix).
+                    _latent_choices = (
+                        [_base_latent]
+                        if _warmed_ula_head_state
+                        else sorted(set([max(64, _base_latent // 2), _base_latent, min(512, _base_latent * 2)]))
+                    )
                     # Always sample ULA params via Optuna — trial 0 uses enqueued/default values,
                     # subsequent trials explore via TPE.
                     _ula_latent_dim = trial.suggest_categorical("ula_latent_dim", _latent_choices)
                     _ula_n_layers   = trial.suggest_int("ula_n_layers", 1, 4)
                     _ula_n_heads    = trial.suggest_categorical("ula_n_heads", [2, 4, 8])
                     _lora_r         = trial.suggest_categorical("lora_r", [4, 8, 16])
-                    _lora_alpha     = int(_lora_r * 2)
+                    # C6: independent lora_alpha (not always 2×r) — large alpha + small r
+                    # often outperforms matched pair; let Optuna discover this.
+                    _lora_alpha     = trial.suggest_categorical("lora_alpha", [8, 16, 32])
+                    # C6: last_n_layers sampled [2,3] — test whether 3 layers helps
+                    _lora_last_n    = trial.suggest_int("lora_last_n_layers", 2, 3)
+                    # C6: lr_mult sampled — LoRA adapters may need different LR than backbone
+                    _lora_lr_mult   = trial.suggest_categorical("lora_lr_mult", [0.05, 0.1, 0.2])
                     # For trial 0 with hp_overrides: apply user-specified ULA values on top
                     if hp_overrides and trial.number == 0:
                         _ula_latent_dim = int(_hp.get("ula_latent_dim", _ula_latent_dim))
                         _ula_n_layers   = int(_hp.get("ula_n_layers", _ula_n_layers))
                         _ula_n_heads    = int(_hp.get("ula_n_heads", _ula_n_heads))
                         _lora_r         = int(_hp.get("lora_r", _lora_r))
-                        _lora_alpha     = int(_hp.get("lora_alpha", _lora_r * 2))
+                        _lora_alpha     = int(_hp.get("lora_alpha", _lora_alpha))
+                        _lora_last_n    = int(_hp.get("lora_last_n_layers", _lora_last_n))
+                        _lora_lr_mult   = float(_hp.get("lora_lr_mult", _lora_lr_mult))
+
+                    # token_mode enables true cross-modal attention between ViT patch
+                    # tokens and BERT word tokens (ImageBind-style). Without it, ULA
+                    # receives pooled (N, D) embeddings — equivalent to AttentionFusion.
+                    _img_enc_lower = (_jit_result.image_encoder_name or "").lower()
+                    _txt_enc_lower = (_jit_result.text_encoder_name or "").lower()
+                    _ula_token_mode = (
+                        any(k in _img_enc_lower for k in ("vit", "siglip", "clip", "dino"))
+                        and any(k in _txt_enc_lower for k in ("bert", "deberta", "roberta"))
+                    )
+                    if _ula_token_mode:
+                        logger.info(
+                            "  ULA token_mode=True: %s (ViT) × %s (BERT-family) "
+                            "→ true cross-modal patch/token attention",
+                            _jit_result.image_encoder_name, _jit_result.text_encoder_name,
+                        )
 
                     _ula_fusion_cfg = {
-                        "latent_dim": _ula_latent_dim,
-                        "n_layers":   _ula_n_layers,
-                        "n_heads":    _ula_n_heads,
+                        "latent_dim":           _ula_latent_dim,
+                        "n_layers":             _ula_n_layers,
+                        "n_heads":              _ula_n_heads,
+                        "token_mode":           _ula_token_mode,
+                        "nt_xent_temperature":  None,  # C8: None → use learnable log_temperature
                     }
                     _trial_lora_config = {
-                        "r":       _lora_r,
-                        "alpha":   float(_lora_alpha),
-                        "lr_mult": 0.1,
+                        "r":             _lora_r,
+                        "alpha":         float(_lora_alpha),
+                        "lr_mult":       float(_lora_lr_mult),   # C6: sampled
+                        "last_n_layers": _lora_last_n,           # C6: sampled [2,3]
                     }
                     logger.info(
-                        "  Trial %d ULA config: latent=%d layers=%d heads=%d lora_r=%d",
-                        trial.number, _ula_latent_dim, _ula_n_layers, _ula_n_heads, _lora_r,
+                        "  Trial %d ULA config: latent=%d layers=%d heads=%d "
+                        "lora_r=%d lora_alpha=%d lora_last_n=%d lora_lr_mult=%.2f",
+                        trial.number, _ula_latent_dim, _ula_n_layers, _ula_n_heads,
+                        _lora_r, _lora_alpha, _lora_last_n, _lora_lr_mult,
                     )
 
                 trial_graph_sparsity = max(0.0, float(trial_graph_sparsity))
@@ -4177,7 +5084,11 @@ class TrainingOrchestrator:
 
                 if _canonical_fusion_strategy(trial_fusion) == "ula" and not _ula_fusion_cfg:
                     _base_latent = int(self.state.get_slot("ula_latent_dim") or 256)
-                    _latent_choices = sorted(set([max(64, _base_latent // 2), _base_latent, min(512, _base_latent * 2)]))
+                    _latent_choices = (
+                        [_base_latent]
+                        if _warmed_ula_head_state
+                        else sorted(set([max(64, _base_latent // 2), _base_latent, min(512, _base_latent * 2)]))
+                    )
                     _ula_latent_dim = trial.suggest_categorical("ula_latent_dim", _latent_choices)
                     _ula_n_layers = trial.suggest_int("ula_n_layers", 1, 4)
                     _ula_n_heads = trial.suggest_categorical("ula_n_heads", [2, 4, 8])
@@ -4190,9 +5101,10 @@ class TrainingOrchestrator:
                     }
                     fusion_config.update(_ula_fusion_cfg)
                     _trial_lora_config = {
-                        "r": _lora_r,
-                        "alpha": float(_lora_alpha),
-                        "lr_mult": 0.1,
+                        "r":             _lora_r,
+                        "alpha":         float(_lora_alpha),
+                        "lr_mult":       0.1,
+                        "last_n_layers": 2,
                     }
                 elif _canonical_fusion_strategy(trial_fusion) != "ula":
                     _trial_lora_config = None
@@ -4281,8 +5193,25 @@ class TrainingOrchestrator:
                 _trial_text_encoder = _text_encoder
                 _trial_image_encoder = _image_encoder
                 _cache_snapshot: List[Tuple[Any, str, Any]] = []
-                _fit_train_loader = train_loader
-                _fit_val_loader = val_loader
+
+                # Sample batch_size from HPO space and create trial-specific loaders.
+                # DataLoader MUST be created inside the objective so the sampled batch
+                # size actually affects training. A fixed outer loader defeats batch HPO.
+                _trial_bs = int(_sample(trial, "batch_size", batch_size))
+                if _trial_uses_lora:
+                    # Hard VRAM cap: raw encoder forward + LoRA grads saturate VRAM at bs>16
+                    _trial_bs = min(_trial_bs, 16)
+                    # Epoch cap: default 6 (C4 convergence predictor stops early when converged).
+                    # Override via APEX_LORA_MAX_EPOCHS env var.
+                    _lora_max_ep = int(_os_hpo.environ.get("APEX_LORA_MAX_EPOCHS", "6"))
+                    trial_epochs = min(trial_epochs, _lora_max_ep)
+                _fit_train_loader, _fit_val_loader = _make_trial_loaders(_trial_bs)
+
+                # Linear LR scaling rule (Goyal et al. 2017):
+                # LR scales proportionally with batch size relative to baseline bs=32.
+                # Clamped to [1e-6, 0.1] to prevent gradient explosion.
+                trial_lr = max(1e-6, min(0.1, float(trial_lr) * (_trial_bs / 32.0)))
+
                 if _trial_uses_lora:
                     try:
                         import copy as _copy
@@ -4291,12 +5220,12 @@ class TrainingOrchestrator:
                         _cache_snapshot = _snapshot_embedding_caches(_aug_ds, _clean_ds)
                         _clear_embedding_caches(_aug_ds, _clean_ds)
                         _fit_train_loader = DataLoader(
-                            train_ds, batch_size=batch_size, shuffle=True,
+                            train_ds, batch_size=_trial_bs, shuffle=True,
                             num_workers=0, pin_memory=False,
                             persistent_workers=False,
                         )
                         _fit_val_loader = DataLoader(
-                            val_ds, batch_size=batch_size, shuffle=False,
+                            val_ds, batch_size=_trial_bs, shuffle=False,
                             num_workers=0, pin_memory=False,
                             persistent_workers=False,
                         )
@@ -4345,6 +5274,58 @@ class TrainingOrchestrator:
                     lora_config=_trial_lora_config,
                     tabular_tokenizer=self.fitted_transformers.get("tabular_tokenizer"),
                 )
+
+                # Push model architecture event to frontend on trial 0 (before fit()).
+                # Available in the "Running" view — not just after training completes.
+                if trial.number == 0 and progress_callback is not None:
+                    try:
+                        _pre_total = sum(p.numel() for p in lightning_module.parameters())
+                        _pre_train = sum(p.numel() for p in lightning_module.parameters() if p.requires_grad)
+                        _pre_layers = [
+                            {
+                                "name": _ln,
+                                "type": type(_lc).__name__,
+                                "params": sum(p.numel() for p in _lc.parameters()),
+                            }
+                            for _ln, _lc in lightning_module.named_children()
+                        ]
+                        progress_callback.push_trial_event(
+                            None,
+                            "model_architecture",
+                            f"Model: {_pre_total / 1e6:.2f}M total "
+                            f"({_pre_train / 1e6:.2f}M trainable)",
+                            {
+                                "total_params":   _pre_total,
+                                "trainable_params": _pre_train,
+                                "total_params_m": round(_pre_total / 1e6, 2),
+                                "size_mb":        round(_pre_train * 4 / 1024 / 1024, 1),
+                                "layers":         _pre_layers,
+                            },
+                        )
+                    except Exception as _arch_exc:
+                        logger.debug("model architecture capture failed: %s", _arch_exc)
+
+                # ULA pre-warmed head: load fusion state from global warm-up into this trial.
+                # latent_dim is pinned (see Fix F) so strict=False is a safety net only.
+                if _warmed_ula_head_state:
+                    _fusion_obj = (
+                        getattr(lightning_module, "_fusion", None)
+                        or getattr(lightning_module, "fusion", None)
+                    )
+                    if _fusion_obj is not None:
+                        try:
+                            _missing, _ = _fusion_obj.load_state_dict(
+                                _warmed_ula_head_state, strict=False
+                            )
+                            if _missing:
+                                logger.warning(
+                                    "Trial %d: warm head %d missing keys — latent_dim mismatch?",
+                                    trial.number, len(_missing),
+                                )
+                            else:
+                                logger.info("Trial %d: warmed ULA head fully loaded", trial.number)
+                        except Exception as _wh:
+                            logger.debug("Warmed head load skipped: %s", _wh)
 
                 # Part A.3 — LoRA warm-start: load previous best LoRA A/B weights
                 # into encoders before training begins, giving each trial a head start.
@@ -4426,17 +5407,152 @@ class TrainingOrchestrator:
                             )
                     _pl_callbacks.append(_EpochReporter())
 
-                # EarlyStopping: halt training if val_loss stalls for 5 epochs.
-                # restore_best_weights via ModelCheckpoint is implicit — Lightning
-                # keeps the in-memory model at the last epoch, and we track the
-                # best module ourselves via _best_val / _best_module_ref.
-                from pytorch_lightning.callbacks import EarlyStopping as _EarlyStopping
-                _pl_callbacks.append(_EarlyStopping(
-                    monitor="val_loss",
-                    mode="min",
-                    patience=max(1, int(early_stop_patience)),
-                    verbose=False,
-                ))
+                # _AdaptiveStoppingCallback: convergence policy from training dynamics.
+                #
+                # Plateau detection: compare current epoch's improvement against the
+                # BEST single-epoch improvement seen so far in this trial.  When
+                # improvement drops to < (best_delta / lookback), the loss curve has
+                # genuinely flattened (diminishing-returns signal from the trial itself).
+                # This self-calibrates — a model with steep early learning sets a high
+                # bar; a model with shallow learning sets a proportionally lower bar.
+                #
+                # Underfitting guard: if val_loss is still decreasing this epoch,
+                # the model is learning — don't trigger plateau regardless of rate.
+                #
+                # Overfitting detection: val/train gap grows as training progresses
+                # naturally.  Allow gap = init_gap × (1 + elapsed_fraction) — linear
+                # growth budget from 1× at epoch 0 to 2× at epoch max.  Data-gated:
+                # only active after the model has first beaten its epoch-0 val_loss.
+                class _AdaptiveStoppingCallback(pl.Callback):
+                    def __init__(self, max_epochs: int) -> None:
+                        self._max_epochs = max_epochs
+                        self._val_hist:  list = []
+                        self._trn_hist:  list = []
+                        self._init_gap:  Optional[float] = None
+                        self._first_improve_ep: Optional[int] = None
+
+                    def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
+                        m   = trainer.callback_metrics
+                        val = float(m.get("val_loss",   float("inf")))
+                        trn = float(m.get("train_loss", float("inf")))
+                        ep  = int(trainer.current_epoch)
+                        self._val_hist.append(val)
+                        self._trn_hist.append(trn)
+
+                        if self._init_gap is None:
+                            self._init_gap = max(abs(val - trn), 1e-6)
+                        # Gate overfitting detection to after first real improvement
+                        if self._first_improve_ep is None and len(self._val_hist) > 1:
+                            if val < self._val_hist[0]:
+                                self._first_improve_ep = ep
+                        if ep < 2:
+                            return
+
+                        # Lookback window = half remaining budget, min 2 (structural minimum
+                        # — need 2 comparison points)
+                        _lookback = max(2, min(
+                            (self._max_epochs - ep) // 2,
+                            len(self._val_hist) - 1,
+                        ))
+
+                        # Plateau signal: best single-epoch improvement seen in this trial
+                        _best_delta = max(
+                            (self._val_hist[i - 1] - self._val_hist[i])
+                            for i in range(1, len(self._val_hist))
+                        )
+                        _curr_delta = (
+                            self._val_hist[-2] - self._val_hist[-1]
+                            if len(self._val_hist) >= 2 else 0.0
+                        )
+                        # Diminishing returns threshold: plateau if current improvement
+                        # < (best_delta / lookback).  If best was 0.018 and lookback=5,
+                        # threshold=0.0036 — catches genuine flattening without false
+                        # alarms during the steep early-learning phase.
+                        _plateau_thr = max(0, _best_delta) / _lookback
+                        # Underfitting guard: val still decreasing → model is learning
+                        _still_learning = _curr_delta > 0
+
+                        if _curr_delta < _plateau_thr and not _still_learning:
+                            logger.info(
+                                "  _AdaptiveStop: plateau ep=%d curr_delta=%.5f "
+                                "< best/lookback=%.5f/%d=%.5f",
+                                ep, _curr_delta, _best_delta, _lookback, _plateau_thr,
+                            )
+                            trainer.should_stop = True
+                            return
+
+                        # Overfitting: gap grows beyond initial × (1 + elapsed fraction)
+                        if self._first_improve_ep is not None:
+                            gap      = val - trn
+                            _elapsed = ep / self._max_epochs
+                            _gap_thr = self._init_gap * (1.0 + _elapsed)
+                            if gap > _gap_thr:
+                                logger.info(
+                                    "  _AdaptiveStop: overfitting ep=%d "
+                                    "gap=%.4f > (1+%.2f)×init_gap=%.4f",
+                                    ep, gap, _elapsed, self._init_gap,
+                                )
+                                trainer.should_stop = True
+                                return
+
+                        # C4: Power-law convergence predictor.
+                        # EMA-smooth val_hist to handle non-monotonic high-dropout curves,
+                        # then fit a^(-b) + c. If predicted gain over next 5 epochs < 1%
+                        # of current loss, the trial has converged → stop early.
+                        if len(self._val_hist) >= 3:
+                            _conv_ep = self._predict_convergence(self._val_hist)
+                            if _conv_ep is not None:
+                                logger.info(
+                                    "  _AdaptiveStop: power-law convergence predicted "
+                                    "at ep≈%d (current ep=%d) — stopping",
+                                    _conv_ep, ep,
+                                )
+                                try:
+                                    trainer.fit_loop.running_stage._current_trial = getattr(
+                                        trainer, "_optuna_trial", None
+                                    )
+                                    _t = getattr(trainer, "_optuna_trial", None)
+                                    if _t is not None:
+                                        _t.set_user_attr("predicted_convergence_epoch", int(_conv_ep))
+                                except Exception:
+                                    pass
+                                trainer.should_stop = True
+
+                    @staticmethod
+                    def _predict_convergence(val_losses: list, horizon: int = 50) -> Optional[int]:
+                        """EMA-smooth then power-law fit. Returns predicted convergence epoch or None."""
+                        try:
+                            import warnings as _w
+                            import numpy as np
+                            from scipy.optimize import curve_fit, OptimizeWarning
+
+                            # EMA smoothing (alpha=0.4) — handles non-monotonic bounces
+                            smoothed = [float(val_losses[0])]
+                            for v in val_losses[1:]:
+                                smoothed.append(0.4 * float(v) + 0.6 * smoothed[-1])
+
+                            t = np.arange(1, len(smoothed) + 1, dtype=float)
+
+                            def _power(t: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
+                                return a * np.power(t, -b) + c
+
+                            with _w.catch_warnings():
+                                _w.simplefilter("error", OptimizeWarning)
+                                popt, _ = curve_fit(
+                                    _power, t, smoothed,
+                                    p0=[max(0.0, smoothed[0] - smoothed[-1]), 0.5, smoothed[-1]],
+                                    bounds=([0, 0.01, 0], [np.inf, 10, smoothed[-1] + 0.01]),
+                                    maxfev=200,
+                                )
+                            predicted_final = float(_power(float(horizon), *popt))
+                            delta = abs(smoothed[-1] - predicted_final)
+                            if delta < 0.01 * abs(smoothed[-1] + 1e-8):
+                                return len(val_losses) + 2  # converged
+                            return None
+                        except (RuntimeError, Exception):
+                            return None
+
+                _pl_callbacks.append(_AdaptiveStoppingCallback(max_epochs=trial_epochs))
 
                 # PCGrad — Gradient Surgery (Yu et al., NeurIPS 2020)
                 # Prevents destructive gradient interference between modality encoders.
@@ -4516,7 +5632,7 @@ class TrainingOrchestrator:
                 try:
                     from pytorch_lightning.callbacks import StochasticWeightAveraging as _SWA
                     _swa_start = max(0, int(trial_epochs * 0.9) - 1)  # last 10% of epochs
-                    if trial_epochs >= 5:
+                    if trial_epochs >= 5 and not _trial_uses_lora:
                         _pl_callbacks.append(_SWA(
                             swa_lrs=float(trial_lr) * 0.5,
                             swa_epoch_start=_swa_start,
@@ -4530,6 +5646,9 @@ class TrainingOrchestrator:
                 except Exception as _swa_exc:
                     logger.debug("SWA not available: %s", _swa_exc)
 
+                if accelerator == "gpu":
+                    torch.set_float32_matmul_precision("medium")
+
                 pl_trainer = pl.Trainer(
                     max_epochs=trial_epochs,
                     accelerator=accelerator,
@@ -4539,6 +5658,10 @@ class TrainingOrchestrator:
                     precision="16-mixed" if accelerator == "gpu" else "32-true",
                     enable_checkpointing=False,
                     enable_progress_bar=False,
+                    # Model summary captured via push_trial_event at trial 0 build time
+                    # and displayed in the frontend. Disable Lightning's built-in summary
+                    # to eliminate the Triton/FLOPs warning and redundant stdout output.
+                    enable_model_summary=False,
                     num_sanity_val_steps=0,
                     logger=False,
                     callbacks=_pl_callbacks,
@@ -4570,6 +5693,13 @@ class TrainingOrchestrator:
                             "num_classes":   num_classes,
                         })
 
+                        # Suppress Lightning INFO-level per-step events that fire before
+                        # the first real validation epoch — these create fake step-0
+                        # metric entries ("lying graph") in the frontend loss chart.
+                        import logging as _lm_log
+                        _pl_root = _lm_log.getLogger("pytorch_lightning")
+                        _prev_pl_level = _pl_root.level
+                        _pl_root.setLevel(_lm_log.WARNING)
                         try:
                             pl_trainer.fit(lightning_module, _fit_train_loader, _fit_val_loader)
                             # Retrieve best val_loss logged during training
@@ -4580,7 +5710,8 @@ class TrainingOrchestrator:
                             trial_train_acc = float(cb_metrics.get("train_acc", 0))
                         except optuna.exceptions.TrialPruned:
                             logger.info("  Trial %d PRUNED by Optuna", trial.number)
-                            _pruned_step = len(trial.intermediate_values)
+                            _intermediate = dict(getattr(trial, "intermediate_values", {}) or {})
+                            _pruned_step = len(_intermediate)
                             if progress_callback is not None:
                                 progress_callback.add_message(
                                     5, "pruned",
@@ -4635,10 +5766,7 @@ class TrainingOrchestrator:
                                     ),
                                 )
                             # Capture pruning metadata for warm-start guidance
-                            _best_inter  = (
-                                min(trial.intermediate_values.values())
-                                if trial.intermediate_values else float("inf")
-                            )
+                            _best_inter = min(_intermediate.values()) if _intermediate else float("inf")
                             try:
                                 trial.set_user_attr("pruned_at_step", _pruned_step)
                                 trial.set_user_attr("best_intermediate_loss", _best_inter)
@@ -4646,6 +5774,7 @@ class TrainingOrchestrator:
                                 trial.set_user_attr("fusion_at_prune", trial_fusion)
                             except Exception:
                                 pass
+                            _pl_root.setLevel(_prev_pl_level)  # restore before re-raise
                             raise  # re-raise so Optuna marks the trial as pruned
                         except Exception as trial_exc:
                             try:
@@ -4671,6 +5800,7 @@ class TrainingOrchestrator:
                                     {"error": str(trial_exc)},
                                 )
 
+                        _pl_root.setLevel(_prev_pl_level)  # restore Lightning log level
                         mlflow.log_metric("val_loss", best_val_loss)
 
                     if progress_callback is not None:
@@ -4868,18 +5998,90 @@ class TrainingOrchestrator:
                         torch.cuda.empty_cache()
 
             with mlflow.start_run(run_name="phase5_optuna"):
-                # HyperbandPruner: aggressively prunes underperforming trials
-                # at intermediate epochs, saving GPU compute.
-                _pruner = optuna.pruners.HyperbandPruner(
-                    min_resource=1,
-                    max_resource=hpo_space.get("epochs", {}).get("high", model_sel.get("epochs", 10)),
-                    reduction_factor=3,
+                # Pruner: MedianPruner wrapped in PatientPruner for noise resilience.
+                # For ULA+LoRA runs (epoch cap=3) use runtime-aware warmup/patience:
+                #   warmup=1 (not 2) → step 1 and 2 are both eligible.
+                #   patience=0 → prune immediately on the first below-median step.
+                # This lets the pruner catch class-collapse trials at epoch 1 instead
+                # of requiring 2 consecutive bad steps that can't fit in 3 epochs.
+                _ep_low_pruner    = hpo_space.get("epochs", {}).get("low", 8)
+                _ula_expected     = "ula" in str(
+                    hpo_space.get("fusion_strategy", {}).get("choices", [])
+                )
+                _ep_effective     = 3 if _ula_expected else _ep_low_pruner
+                _n_warmup_steps   = (
+                    max(0, _ep_effective // 3) if _ula_expected
+                    else max(2, _ep_low_pruner // 3)
+                )
+                _pruner_patience  = 0 if _ula_expected else 1
+                _n_startup_trials = max(1, int(N_TRIALS ** 0.5))
+                _pruner = optuna.pruners.PatientPruner(
+                    wrapped_pruner=optuna.pruners.MedianPruner(
+                        n_startup_trials=_n_startup_trials,
+                        n_warmup_steps=_n_warmup_steps,
+                        interval_steps=1,
+                    ),
+                    patience=_pruner_patience,
                 ) if N_TRIALS > 1 else optuna.pruners.NopPruner()
+                logger.info(
+                    "Phase 5: pruner=PatientPruner(MedianPruner) "
+                    "n_warmup_steps=%d n_startup_trials=%d patience=%d (ula_mode=%s)",
+                    _n_warmup_steps, _n_startup_trials, _pruner_patience, _ula_expected,
+                )
+
+                # Persistent SQLite storage: if Phase 5 crashes at trial N, the next
+                # run resumes from trial N instead of restarting from scratch.
+                # Study name is deterministic per (session, dataset_size, problem_type)
+                # so retries automatically find the same study.
+                import os as _os_opt
+                from pathlib import Path as _Path_opt
+                _opt_dir = _Path_opt(_os_opt.environ.get("APEX_OPTUNA_DIR", ".apex_optuna"))
+                _opt_dir.mkdir(parents=True, exist_ok=True)
+                _ctx_for_sid = self._get_ctx()
+                _session_sid = (
+                    getattr(_ctx_for_sid, "session_id", None)
+                    if _ctx_for_sid is not None else None
+                ) or "default"
+                _study_name = f"apex_phase5_{_session_sid}_{n_total}_{problem_type[:12]}"
+                _study_db = _opt_dir / f"{_study_name}.db"
+                _study_storage = f"sqlite:///{_study_db.resolve()}"
+
+                # APEX_FRESH_STUDY=1: wipe stale DB before creating study.
+                # Use when a previous crashed run left a biased study (e.g. all
+                # trials sampled the same fusion strategy, locking TPE).
+                if _os_opt.environ.get("APEX_FRESH_STUDY", "0") == "1" and _study_db.exists():
+                    _study_db.unlink()
+                    logger.info("APEX_FRESH_STUDY=1: deleted stale study DB %s", _study_db)
+
                 study = optuna.create_study(
+                    study_name=_study_name,
                     direction="minimize",
                     pruner=_pruner,
                     sampler=optuna.samplers.TPESampler(seed=_APEX_SEED),
+                    storage=_study_storage,
+                    load_if_exists=True,  # Resume from crash if study already exists
                 )
+                _n_existing = len(study.trials)
+                if _n_existing:
+                    logger.info(
+                        "  Resuming Optuna study '%s' with %d existing trials "
+                        "(crash recovery — remaining budget: %d trials)",
+                        _study_name, _n_existing, max(0, N_TRIALS - _n_existing),
+                    )
+                    N_TRIALS = max(1, N_TRIALS - _n_existing)
+                    # Detect stale study contamination: if all loaded trials share
+                    # the same fusion strategy, TPE will be strongly biased toward it.
+                    _prev_fusions = [
+                        t.params.get("fusion_strategy")
+                        for t in study.trials
+                        if t.state.is_finished() and t.params.get("fusion_strategy")
+                    ]
+                    if _prev_fusions and len(set(_prev_fusions)) == 1:
+                        logger.warning(
+                            "Loaded study has %d trials all using fusion=%r — "
+                            "TPE will be biased. Set APEX_FRESH_STUDY=1 to reset.",
+                            len(_prev_fusions), _prev_fusions[0],
+                        )
 
                 # If manual overrides provided, enqueue them as trial 0 so TPE can
                 # learn from the user's starting point and explore around it.
@@ -4906,6 +6108,15 @@ class TrainingOrchestrator:
                     )
 
                 study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=False)
+
+                # Remove the SQLite study file — crash-resume window has closed.
+                # File survives crashes (enabling resume); deleted after success so
+                # the next training run starts a fresh study, not an accumulated one.
+                try:
+                    _study_db.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
                 if progress_callback is not None:
                     progress_callback.set_substage("phase5_summary")
                     progress_callback.set_pruning_status(
@@ -5022,6 +6233,87 @@ class TrainingOrchestrator:
             # Persist best model reference so Phase 7 can serialise weights
             if _best_module_ref:
                 self.best_lightning_module = _best_module_ref[0]
+
+            # ── Held-out test evaluation (80/10/10 unbiased eval) ────────────
+            # Val metrics carry HPO selection bias (best trial chosen by val_loss).
+            # Test metrics are unbiased — never seen during HPO.
+            _test_metrics: Dict[str, Any] = {}
+            if self.best_lightning_module is not None and test_ds is not None and len(test_ds) > 0:
+                try:
+                    _test_loader = DataLoader(
+                        test_ds, batch_size=batch_size, shuffle=False,
+                        num_workers=0, pin_memory=False,
+                    )
+                    _test_trainer = pl.Trainer(
+                        accelerator=accelerator,
+                        devices=1,
+                        precision="16-mixed" if accelerator == "gpu" else "32-true",
+                        enable_checkpointing=False,
+                        enable_progress_bar=False,
+                        enable_model_summary=False,
+                        num_sanity_val_steps=0,
+                        logger=False,
+                    )
+                    # validate() runs validation_step + epoch_end on test_ds
+                    _test_cb = _test_trainer.validate(
+                        self.best_lightning_module, _test_loader, verbose=False
+                    )
+                    _raw = _test_cb[0] if _test_cb else {}
+                    _test_metrics = {
+                        "test_loss":  float(_raw.get("val_loss",  float("inf"))),
+                        "test_acc":   float(_raw.get("val_acc",   0.0)),
+                        "test_f1":    float(_raw.get("val_f1",    0.0)),
+                        "test_auroc": float(_raw.get("val_auroc", 0.0)),
+                        "n_test":     int(len(test_ds)),
+                    }
+                    logger.info(
+                        "Phase 5: held-out test — loss=%.4f  acc=%.4f  f1=%.4f  auroc=%.4f  n=%d",
+                        _test_metrics["test_loss"],
+                        _test_metrics["test_acc"],
+                        _test_metrics["test_f1"],
+                        _test_metrics["test_auroc"],
+                        _test_metrics["n_test"],
+                    )
+                    if progress_callback is not None:
+                        progress_callback.push_trial_event(
+                            None,
+                            "test_eval",
+                            "Held-out test evaluation complete",
+                            _test_metrics,
+                        )
+                except Exception as _te_exc:
+                    logger.warning("Held-out test evaluation failed: %s", _te_exc)
+                    _test_metrics = {"error": str(_te_exc)}
+
+            # ── Model summary (param counts + per-child layer breakdown) ────────
+            _model_summary: Dict[str, Any] = {}
+            if self.best_lightning_module is not None:
+                try:
+                    _mod = self.best_lightning_module
+                    _total_p = sum(p.numel() for p in _mod.parameters())
+                    _train_p = sum(p.numel() for p in _mod.parameters() if p.requires_grad)
+                    _layers = []
+                    for _lname, _lchild in _mod.named_children():
+                        _lp = sum(p.numel() for p in _lchild.parameters())
+                        _layers.append({
+                            "name": _lname,
+                            "type": type(_lchild).__name__,
+                            "params": _lp,
+                        })
+                    _model_summary = {
+                        "total_params": _total_p,
+                        "trainable_params": _train_p,
+                        "total_params_m": round(_total_p / 1e6, 2),
+                        "size_mb": round(_train_p * 4 / 1024 / 1024, 1),
+                        "layers": _layers,
+                    }
+                    logger.info(
+                        "Phase 5: model summary — total=%dM trainable=%dM size=%.1fMB layers=%d",
+                        _total_p // 1_000_000, _train_p // 1_000_000,
+                        _model_summary["size_mb"], len(_layers),
+                    )
+                except Exception as _ms_exc:
+                    logger.debug("model summary capture failed: %s", _ms_exc)
 
             # ── Validity guard: fail fast when every trial errored or was pruned ──
             # Proceeding into the registry with best_val_loss=inf and no trained
@@ -5214,6 +6506,10 @@ class TrainingOrchestrator:
             )
             if fusion_summary:
                 fusion_summary["strategy"] = best_fusion_strategy
+            # Write winning strategy back to model_sel so downstream code reading
+            # model_sel.get("fusion_strategy") gets the HPO-winning value, not the
+            # pre-HPO Phase 4 schema-derived default.
+            model_sel["fusion_strategy"] = best_fusion_strategy
             best_lora_config = dict(_best_lora_config or {})
 
             # ----------------------------------------------------------------
@@ -5295,6 +6591,33 @@ class TrainingOrchestrator:
 
             elapsed = time.time() - phase_start
 
+            # ── Adaptive diagnostics (self-adapting training signals, C1–C9) ──
+            _adaptive_diag: Dict[str, Any] = {}
+            if self.best_lightning_module is not None:
+                _lm = self.best_lightning_module
+                try:
+                    if (hasattr(_lm, "model") and hasattr(_lm.model, "fusion")
+                            and hasattr(_lm.model.fusion, "log_temperature")):
+                        _tau = _lm.model.fusion.log_temperature.clamp(-4.6, 4.6).exp().item()
+                        _adaptive_diag["final_temperature"] = round(float(_tau), 6)
+                    if hasattr(_lm, "log_sigma_cls"):
+                        _adaptive_diag["final_sigma_cls"] = round(float(_lm.log_sigma_cls.exp().item()), 6)
+                    if hasattr(_lm, "log_sigma_con"):
+                        _adaptive_diag["final_sigma_con"] = round(float(_lm.log_sigma_con.exp().item()), 6)
+                    _targets_cached = getattr(_lm, "_cached_last_targets", None) is not None
+                    _adaptive_diag["contrastive_loss_mode"] = (
+                        "supcon" if (_targets_cached and str(problem_type).startswith("classification"))
+                        else "nt_xent"
+                    )
+                    _adaptive_diag["lora_diagnostics"] = dict(best_lora_config) if best_lora_config else {}
+                    if (hasattr(_lm, "model") and hasattr(_lm.model, "fusion")
+                            and hasattr(_lm.model.fusion, "_emb_buffer")):
+                        _buf_len = len(_lm.model.fusion._emb_buffer)
+                        _adaptive_diag["effective_negatives"] = (2 if _buf_len > 0 else 1) * batch_size
+                except Exception as _diag_exc:
+                    logger.warning("Adaptive diagnostics collection failed (non-fatal): %s", _diag_exc)
+                    _adaptive_diag["error"] = str(_diag_exc)
+
             results: Dict[str, Any] = {
                 "best_trial":        best.number,
                 "best_params":       best.params,
@@ -5313,7 +6636,8 @@ class TrainingOrchestrator:
                 "next_run_feedback": next_run_feedback,
                 "adaptive_feedback_state": dict(adaptive_feedback_state),
                 "batch_size":        batch_size,
-                "data_split":        {"train": n_train, "val": n_val, "total": n_total},
+                "data_split":        {"train": n_train, "val": n_val, "test": n_test, "total": n_total},
+                "test_metrics":      _test_metrics,
                 "problem_type":      problem_type,
                 "num_classes":       num_classes,
                 "input_dims":        input_dims,
@@ -5345,6 +6669,8 @@ class TrainingOrchestrator:
                 "fusion_aux_weights": fusion_aux_weights,
                 "calibration": calibration,
                 "xai": xai_artifacts,
+                "model_summary": _model_summary,
+                "adaptive_diagnostics": _adaptive_diag,
             }
 
             results["evaluation"] = self.evaluation_adapter.evaluate_training(
@@ -5501,6 +6827,33 @@ class TrainingOrchestrator:
                                 if isinstance(col, str) and col not in bucket:
                                     bucket.append(col)
 
+            def _collect_text_values(df: pd.DataFrame, columns: List[str]) -> List[str]:
+                values: List[str] = []
+                for col in columns or []:
+                    if col not in df.columns:
+                        continue
+                    series = df[col].dropna().astype(str)
+                    values.extend(
+                        text
+                        for text in series.tolist()
+                        if text and text.strip()
+                    )
+                return values
+
+            def _collect_image_values(df: pd.DataFrame, columns: List[str]) -> List[Any]:
+                values: List[Any] = []
+                for col in columns or []:
+                    if col not in df.columns:
+                        continue
+                    series = df[col].dropna()
+                    values.extend(series.tolist())
+                return values
+
+            ref_texts = _collect_text_values(ref_df, modality_columns.get("text", []))
+            prod_texts = _collect_text_values(prod_df, modality_columns.get("text", []))
+            ref_images = _collect_image_values(ref_df, modality_columns.get("image", []))
+            prod_images = _collect_image_values(prod_df, modality_columns.get("image", []))
+
             # ----------------------------------------------------------------
             # 3  Derive feature names from tabular preprocessor (best-effort)
             # ----------------------------------------------------------------
@@ -5547,11 +6900,26 @@ class TrainingOrchestrator:
                     retraining_orchestrator=retrain_orchestrator,
                     cooldown_seconds=3600,
                 )
+                detect_kwargs: Dict[str, Any] = {"dataset_id": "phase6_default"}
+                if ref_texts or prod_texts:
+                    detect_kwargs.update(
+                        {
+                            "reference_texts": ref_texts,
+                            "production_texts": prod_texts,
+                        }
+                    )
+                if ref_images or prod_images:
+                    detect_kwargs.update(
+                        {
+                            "reference_images": ref_images,
+                            "production_images": prod_images,
+                        }
+                    )
                 report = detector.detect(
                     ref_array,
                     prod_array,
                     feature_names,
-                    dataset_id="phase6_default",
+                    **detect_kwargs,
                 )
                 self._phase6_reference_sample = getattr(report, "reference_sample", None)
                 if modality_columns:
@@ -5615,6 +6983,8 @@ class TrainingOrchestrator:
                 "per_feature_ks":  report.per_feature_ks,
                 "per_feature_psi": report.per_feature_psi,
                 "modality_drift": modality_drift,
+                "text_drift": dict(getattr(report, "text_drift", {}) or {}),
+                "image_drift": dict(getattr(report, "image_drift", {}) or {}),
                 "n_reference":     report.n_reference,
                 "n_production":    report.n_production,
                 "n_features":      report.n_features,

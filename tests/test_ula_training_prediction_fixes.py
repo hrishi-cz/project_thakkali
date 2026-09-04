@@ -256,6 +256,9 @@ def test_predict_http_surfaces_return_canonical_ula() -> None:
     assert task_body["result"]["input_contract"]["fusion"]["strategy"] == "ula"
 
 
+import pytest as _pytest
+
+@_pytest.mark.skip(reason="/ws/predict WebSocket endpoint removed 2026-05-17 (unused, no frontend calls)")
 def test_predict_websocket_returns_canonical_ula() -> None:
     import api.run_api as run_api
 

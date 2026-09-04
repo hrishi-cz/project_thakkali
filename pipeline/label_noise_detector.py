@@ -133,7 +133,24 @@ class LabelNoiseDetector:
             # Track per-sample disagreement count
             disagree_counts = np.zeros(N, dtype=np.int32)
 
-            skf = StratifiedKFold(n_splits=self.n_folds, shuffle=True, random_state=42)
+            # Dynamic n_splits: StratifiedKFold requires at least n_splits members in
+            # the rarest class. With 210 samples and a class of 2, n_splits=5 crashes.
+            import pandas as _pd_lnd
+            _min_class = int(_pd_lnd.Series(y_enc).value_counts().min())
+            _n_splits = min(self.n_folds, max(2, _min_class))
+            if _n_splits < self.n_folds:
+                logger.info(
+                    "LabelNoiseDetector: rarest class has %d samples — "
+                    "reducing n_splits from %d to %d",
+                    _min_class, self.n_folds, _n_splits,
+                )
+            if _n_splits < 2:
+                logger.warning(
+                    "LabelNoiseDetector: rarest class has %d sample(s) — "
+                    "cannot run cross-validation; returning empty report", _min_class,
+                )
+                return _empty
+            skf = StratifiedKFold(n_splits=_n_splits, shuffle=True, random_state=42)
             rf_kwargs: Dict[str, Any] = {
                 "n_estimators": 50,
                 "max_depth": 8,
@@ -157,7 +174,7 @@ class LabelNoiseDetector:
                 except Exception as fold_exc:
                     logger.debug("  Fold %d failed: %s", fold_idx + 1, fold_exc)
 
-            disagree_rates = disagree_counts.astype(np.float32) / self.n_folds
+            disagree_rates = disagree_counts.astype(np.float32) / _n_splits
             suspicious_mask = disagree_rates >= self.noise_threshold
             suspicious_indices = np.where(suspicious_mask)[0].tolist()
 

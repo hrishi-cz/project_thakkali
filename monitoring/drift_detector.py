@@ -95,6 +95,8 @@ class DriftReport:
     composite_score: float = 0.0
     retrain_triggered: bool = False
     retrain_info: Dict[str, Any] = field(default_factory=dict)
+    text_drift: Dict[str, Any] = field(default_factory=dict)
+    image_drift: Dict[str, Any] = field(default_factory=dict)
     reference_sample: Optional[np.ndarray] = None
 
 
@@ -137,6 +139,10 @@ class DriftDetector:
         production: np.ndarray,
         feature_names: Optional[List[str]] = None,
         dataset_id: str = "default",
+        reference_texts: Optional[List[str]] = None,
+        production_texts: Optional[List[str]] = None,
+        reference_images: Optional[List[Any]] = None,
+        production_images: Optional[List[Any]] = None,
     ) -> DriftReport:
         """
         Run KS, PSI, and FDD tests between *reference* and *production*.
@@ -193,6 +199,23 @@ class DriftDetector:
             "ks_statistic": ks_statistic > KS_THRESHOLD,
             "fdd":          fdd          > FDD_THRESHOLD,
         }
+
+        text_drift: Dict[str, Any] = {}
+        if reference_texts is not None or production_texts is not None:
+            text_drift = self._detect_text_drift(
+                list(reference_texts or []),
+                list(production_texts or []),
+            )
+            status["text_drift"] = bool(text_drift.get("drift_detected", False))
+
+        image_drift: Dict[str, Any] = {}
+        if reference_images is not None or production_images is not None:
+            image_drift = self._detect_image_drift(
+                list(reference_images or []),
+                list(production_images or []),
+            )
+            status["image_drift"] = bool(image_drift.get("drift_detected", False))
+
         drift_detected: bool = any(status.values())
         composite_score: float = self._compute_composite_score(
             psi=psi,
@@ -212,6 +235,8 @@ class DriftDetector:
                     "fdd": fdd,
                 },
                 "status": status,
+                "text_drift": text_drift,
+                "image_drift": image_drift,
             }
             try:
                 if self.retraining_orchestrator.should_retrain(drift_payload):
@@ -276,6 +301,8 @@ class DriftDetector:
             composite_score=composite_score,
             retrain_triggered=retrain_triggered,
             retrain_info=retrain_info,
+            text_drift=text_drift,
+            image_drift=image_drift,
             reference_sample=reference_sample,
         )
 
@@ -368,6 +395,189 @@ class DriftDetector:
             }
 
         return modality_report
+
+    def _detect_text_drift(
+        self,
+        ref_texts: List[str],
+        prod_texts: List[str],
+    ) -> Dict[str, Any]:
+        """Detect vocabulary/topic shift via TF-IDF centroid similarity."""
+        ref = [str(text) for text in ref_texts if str(text).strip()]
+        prod = [str(text) for text in prod_texts if str(text).strip()]
+        if len(ref) < 2 or len(prod) < 2:
+            return {
+                "drift_detected": False,
+                "method": "tfidf_cosine_similarity_ks",
+                "reason": "insufficient_text_samples",
+                "n_reference": len(ref),
+                "n_production": len(prod),
+            }
+
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            ref = ref[:500]
+            prod = prod[:500]
+            vectorizer = TfidfVectorizer(max_features=1000)
+            vectorizer.fit(ref + prod)
+
+            ref_matrix = vectorizer.transform(ref)
+            prod_matrix = vectorizer.transform(prod)
+            ref_centroid = ref_matrix.mean(axis=0)
+
+            ref_sims = cosine_similarity(ref_matrix, ref_centroid).flatten()
+            prod_sims = cosine_similarity(prod_matrix, ref_centroid).flatten()
+            ks_result = stats.ks_2samp(ref_sims, prod_sims)
+            ks_stat = float(ks_result.statistic)
+            p_value = float(ks_result.pvalue)
+            drifted = bool(ks_stat > 0.15 or p_value < 0.05)
+
+            return {
+                "drift_detected": drifted,
+                "ks_statistic": round(ks_stat, 4),
+                "p_value": round(p_value, 4),
+                "method": "tfidf_cosine_similarity_ks",
+                "n_reference": len(ref),
+                "n_production": len(prod),
+                "info": (
+                    "Measures vocabulary/topic distribution shift via TF-IDF "
+                    "similarity to the reference centroid."
+                ),
+            }
+        except Exception as exc:
+            logger.debug("_detect_text_drift failed: %s", exc)
+            return {
+                "drift_detected": False,
+                "method": "tfidf_cosine_similarity_ks",
+                "reason": str(exc),
+                "n_reference": len(ref),
+                "n_production": len(prod),
+            }
+
+    def _detect_image_drift(
+        self,
+        ref_images: List[Any],
+        prod_images: List[Any],
+    ) -> Dict[str, Any]:
+        """Detect image distribution shift using lightweight embedding KS."""
+        ref = list(ref_images or [])[:200]
+        prod = list(prod_images or [])[:200]
+        if len(ref) < 2 or len(prod) < 2:
+            return {
+                "drift_detected": False,
+                "method": "mobilenet_embedding_ks",
+                "reason": "insufficient_image_samples",
+                "n_reference": len(ref),
+                "n_production": len(prod),
+            }
+
+        try:
+            import torch
+            import torch.nn.functional as torch_f
+            import torchvision.models as tv
+
+            def _as_tensor(img: Any) -> torch.Tensor:
+                if torch.is_tensor(img):
+                    tensor = img.detach().cpu().float()
+                else:
+                    try:
+                        from PIL import Image
+                        from torchvision.transforms import functional as tvf
+
+                        if isinstance(img, (str, bytes)):
+                            pil_img = Image.open(img).convert("RGB")
+                            tensor = tvf.to_tensor(pil_img)
+                        elif isinstance(img, Image.Image):
+                            tensor = tvf.to_tensor(img.convert("RGB"))
+                        else:
+                            arr = np.asarray(img)
+                            tensor = torch.as_tensor(arr).float()
+                    except Exception:
+                        arr = np.asarray(img)
+                        tensor = torch.as_tensor(arr).float()
+
+                if tensor.ndim == 4:
+                    tensor = tensor[0]
+                if tensor.ndim == 2:
+                    tensor = tensor.unsqueeze(0).repeat(3, 1, 1)
+                if tensor.ndim == 3 and tensor.shape[0] not in (1, 3):
+                    tensor = tensor.permute(2, 0, 1)
+                if tensor.ndim != 3:
+                    raise ValueError("image tensor must be 3-D")
+                if tensor.shape[0] == 1:
+                    tensor = tensor.repeat(3, 1, 1)
+                if tensor.shape[0] > 3:
+                    tensor = tensor[:3]
+                if float(tensor.max()) > 2.0:
+                    tensor = tensor / 255.0
+                tensor = tensor.clamp(0.0, 1.0)
+                tensor = torch_f.interpolate(
+                    tensor.unsqueeze(0),
+                    size=(224, 224),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                return (tensor - mean) / std
+
+            model = tv.mobilenet_v3_small(weights=None).eval()
+
+            def _embed(images: List[Any]) -> np.ndarray:
+                tensors = []
+                for image in images:
+                    try:
+                        tensors.append(_as_tensor(image))
+                    except Exception as img_exc:
+                        logger.debug("_detect_image_drift: skipped image: %s", img_exc)
+                if len(tensors) < 2:
+                    return np.zeros((0, 1), dtype=np.float64)
+                batch = torch.stack(tensors)
+                chunks = []
+                with torch.no_grad():
+                    for start in range(0, batch.shape[0], 32):
+                        feats = model.features(batch[start:start + 32])
+                        chunks.append(feats.mean(dim=(2, 3)).cpu().numpy())
+                return np.vstack(chunks).astype(np.float64)
+
+            ref_emb = _embed(ref)
+            prod_emb = _embed(prod)
+            if ref_emb.shape[0] < 2 or prod_emb.shape[0] < 2:
+                return {
+                    "drift_detected": False,
+                    "mean_ks": 0.0,
+                    "method": "mobilenet_embedding_ks",
+                    "reason": "insufficient_decodable_images",
+                    "n_reference": int(ref_emb.shape[0]),
+                    "n_production": int(prod_emb.shape[0]),
+                }
+
+            ks_stats = []
+            for dim in range(min(ref_emb.shape[1], prod_emb.shape[1], 32)):
+                ks_stats.append(self._compute_ks(ref_emb[:, dim], prod_emb[:, dim]))
+            mean_ks = float(np.mean(ks_stats)) if ks_stats else 0.0
+            drifted = bool(mean_ks > 0.20)
+            return {
+                "drift_detected": drifted,
+                "mean_ks": round(mean_ks, 4),
+                "method": "mobilenet_embedding_ks",
+                "n_reference": int(ref_emb.shape[0]),
+                "n_production": int(prod_emb.shape[0]),
+                "info": (
+                    "Measures pixel/feature distribution shift via MobileNet "
+                    "embedding KS tests."
+                ),
+            }
+        except Exception as exc:
+            logger.debug("_detect_image_drift failed: %s", exc)
+            return {
+                "drift_detected": False,
+                "method": "mobilenet_embedding_ks",
+                "reason": str(exc),
+                "n_reference": len(ref),
+                "n_production": len(prod),
+            }
 
     @staticmethod
     def _compute_composite_score(

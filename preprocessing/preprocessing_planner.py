@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class PreprocessingPlanner:
@@ -88,6 +91,18 @@ class PreprocessingPlanner:
             return [384, 384]
         return [224, 224]
 
+    # CLIP/SigLIP encoders require different normalization stats than ImageNet models.
+    _CLIP_ENCODER_KEYS = {"clip", "siglip", "openclip"}
+
+    @staticmethod
+    def _resolve_image_normalization(encoder_name: Optional[str]) -> str:
+        if encoder_name and any(
+            k in str(encoder_name).lower()
+            for k in PreprocessingPlanner._CLIP_ENCODER_KEYS
+        ):
+            return "clip"
+        return "imagenet"
+
     def create_plan(
         self,
         schema_info: Dict[str, Any],
@@ -99,6 +114,7 @@ class PreprocessingPlanner:
         global_schema: Optional[Dict[str, Any]] = None,
         preprocessing_hints: Optional[Dict[str, Any]] = None,
         feature_intelligence: Optional[Dict[str, Any]] = None,
+        selected_image_encoder: Optional[str] = None,
     ) -> Dict[str, Any]:
         schema_info = dict(schema_info or {})
         global_schema = dict(global_schema or {})
@@ -152,7 +168,12 @@ class PreprocessingPlanner:
         ).strip().lower()
 
         image_dataset_size = int(feature_intelligence.get("image_dataset_size", 0) or 0)
-        image_separability = float(feature_intelligence.get("image_label_separability", 0.0) or 0.0)
+        # 0.0 means "encoder was absent, not measured" as often as "truly low signal".
+        # Using 0.0 triggers Strong augmentation (< 0.4 threshold) incorrectly for
+        # mid-size datasets where the image encoder simply wasn't initialized.
+        # Default to 0.5 (neutral) when no score was computed.
+        _raw_image_sep = float(feature_intelligence.get("image_label_separability", 0.0) or 0.0)
+        image_separability = _raw_image_sep if _raw_image_sep > 0.0 else 0.5
         image_class_balance = float(feature_intelligence.get("image_class_balance", 0.0) or 0.0)
 
         schema_confidence = 0.0
@@ -217,6 +238,19 @@ class PreprocessingPlanner:
             image_augment = bool(effective_image_size < 10_000)
 
         fusion_weights = self._as_dict(multimodal_hints.get("weights"))
+        if not fusion_weights and predictability_scores:
+            # Derive weights from per-modality predictability — data-driven and
+            # avoids the hardcoded image=10% bias when image is the dominant signal.
+            _scores = {
+                mod: max(0.01, float(predictability_scores.get(mod, 0.01)))
+                for mod in modalities
+            }
+            _total = sum(_scores.values())
+            fusion_weights = {
+                mod: round(score / _total, 4)
+                for mod, score in _scores.items()
+            }
+            logger.info("Fusion weights derived from predictability: %s", fusion_weights)
         if not fusion_weights:
             fusion_weights = {
                 "tabular": 0.5 if "tabular" in modalities else 0.0,
@@ -283,7 +317,7 @@ class PreprocessingPlanner:
             },
             "image": {
                 "target_size": image_target_size,
-                "normalize": "imagenet",
+                "normalize": self._resolve_image_normalization(selected_image_encoder),
                 "augment_train": image_augment,
                 "mode": str(image_hints.get("mode", "supervised" if image_pred >= 0.25 else "self_supervised")),
                 "label_separability": round(image_separability, 4),

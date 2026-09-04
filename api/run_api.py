@@ -78,6 +78,8 @@ _warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid val
 _warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in true_divide")
 # Suppress HuggingFace sentencepiece byte-fallback tokenizer conversion noise
 _warnings.filterwarnings("ignore", category=UserWarning, message=".*sentencepiece tokenizer.*byte fallback.*")
+# DINOv2 warns about missing optional xFormers dep — it degrades gracefully to standard attention
+_warnings.filterwarnings("ignore", message="xFormers is not available", category=UserWarning)
 
 # Load user-registered encoder plugins (safe import -- file may be empty)
 try:
@@ -996,7 +998,7 @@ def _build_guardrail_snapshot(session_id: str, ctx: Optional[Any]) -> Dict[str, 
         "latency": {
             "status": "configured",
             "implementation": "LatencyGuard.timed",
-            "protected_endpoints": ["/predict-async", "/ws/predict"],
+            "protected_endpoints": ["/predict-async"],
             "budgets_s": {
                 "predict_async": 30.0,
                 "ws_predict": 30.0,
@@ -1077,6 +1079,16 @@ def _build_monitor_retraining_orchestrator(
     if not production_sources:
         return None
 
+    # Read drift_threshold from context (user can configure via API) or env, default 1.0.
+    # Lower for safety-critical pipelines; higher for high-throughput ones.
+    _drift_threshold = 1.0
+    if ctx is not None:
+        _drift_threshold = float(
+            getattr(ctx, "drift_trigger_threshold", None)
+            or (getattr(ctx, "user_overrides", {}) or {}).get("drift_trigger_threshold")
+            or 1.0
+        )
+
     return RetrainingOrchestrator(
         production_sources=production_sources,
         problem_type=problem_type,
@@ -1085,6 +1097,7 @@ def _build_monitor_retraining_orchestrator(
         cooldown_seconds=3600,
         session_id=session_id,
         execution_context=ctx,
+        drift_threshold=_drift_threshold,
     )
 
 
@@ -1124,6 +1137,8 @@ def _sync_monitor_drift_to_context(
                 "retrain_triggered": bool(drift_data.get("retrain_triggered", False)),
                 "model_id": drift_data.get("model_id"),
                 "retrain_info": retrain_info,
+                "text_drift": dict(drift_data.get("text_drift", {}) or {}),
+                "image_drift": dict(drift_data.get("image_drift", {}) or {}),
                 "monitor": dict(drift_data.get("monitor", {}) or {}),
                 "breached_metrics": list((drift_data.get("monitor", {}) or {}).get("breached_metrics", []) or []),
                 "retrain_recommendation": (drift_data.get("monitor", {}) or {}).get("retrain_recommendation"),
@@ -1152,6 +1167,8 @@ def _sync_monitor_drift_to_context(
 
         if session_id:
             session_manager.update_session_context(session_id, ctx)
+    except HTTPException:
+        raise
     except OptimisticLockError:
         raise
     except Exception as exc:
@@ -1293,6 +1310,56 @@ _model_registry_lock = threading.RLock()
 # session_id → task_id for the currently active training task (volatile, cleared on API restart)
 _active_training_tasks: Dict[str, str] = {}
 _active_training_lock = threading.Lock()
+_TRAINING_LOCKS: Dict[str, asyncio.Lock] = {}
+_TRAINING_LOCKS_GUARD = threading.Lock()
+
+# Per-session ablation lock: prevents multiple parallel ablation studies per session.
+# Ablation = multiple full training cycles; 2 simultaneous = guaranteed OOM on most GPUs.
+_active_ablation_tasks: Dict[str, str] = {}
+_active_ablation_lock = threading.Lock()
+
+_GPU_SEMAPHORE = asyncio.Semaphore(2)
+_ENDPOINT_LAST_CALL: Dict[str, float] = collections.defaultdict(float)
+_ENDPOINT_RATE_LOCK = threading.Lock()
+_ENDPOINT_COOLDOWN: Dict[str, float] = {
+    "/select-model": 30.0,
+    "/experiments/run-ablations": 60.0,
+    "/monitor/drift": 10.0,
+}
+
+
+def _get_training_lock(session_id: str) -> asyncio.Lock:
+    """Return the per-session async lock guarding training task creation."""
+    sid = str(session_id or "default")
+    with _TRAINING_LOCKS_GUARD:
+        lock = _TRAINING_LOCKS.get(sid)
+        if lock is None:
+            lock = asyncio.Lock()
+            _TRAINING_LOCKS[sid] = lock
+        return lock
+
+
+def _check_rate_limit(endpoint: str, session_id: Optional[str]) -> None:
+    """Apply a small per-session cooldown to expensive endpoints."""
+    sid = str(session_id or "default")
+    cooldown = float(_ENDPOINT_COOLDOWN.get(endpoint, 0.0) or 0.0)
+    if cooldown <= 0.0:
+        return
+    key = f"{endpoint}:{sid}"
+    now = time.time()
+    with _ENDPOINT_RATE_LOCK:
+        last = float(_ENDPOINT_LAST_CALL[key] or 0.0)
+        elapsed = now - last
+        if elapsed < cooldown:
+            wait = max(0.0, cooldown - elapsed)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit: endpoint {endpoint} is on cooldown. "
+                    f"Retry in {wait:.0f}s."
+                ),
+            )
+        _ENDPOINT_LAST_CALL[key] = now
 
 # Backward-compatible alias (used in /train-pipeline and other endpoints)
 # NOTE:
@@ -2827,9 +2894,13 @@ async def select_model(request: Request) -> Dict[str, Any]:
           "tier":            "primary" | "fallback"
         }
     """
+    gpu_slot_acquired = False
     try:
         body = await request.json()
         _sid = body.get("session_id") if isinstance(body, dict) else None
+        _check_rate_limit("/select-model", _sid)
+        await _GPU_SEMAPHORE.acquire()
+        gpu_slot_acquired = True
         _ctx_for_budget = _get_session_context_or_422(_sid, "/select-model")
         _require_context_artifact(_sid, "global_schema", "/select-model")
         _active_contract = _apply_active_modality_contract(_ctx_for_budget)
@@ -3102,6 +3173,9 @@ async def select_model(request: Request) -> Dict[str, Any]:
 
                 if len(modalities) >= 2 and score_map:
                     try:
+                        _schema_for_fusion = (
+                            getattr(_ctx_for_budget, "global_schema", None) or {}
+                        )
                         probed_fusion, fusion_scores = probe_selector.probe_fusion(
                             {"tabular": top_probe_model},
                             {
@@ -3109,6 +3183,7 @@ async def select_model(request: Request) -> Dict[str, Any]:
                                 "labels": np.asarray(probe_y),
                             },
                             max_samples=min(int(len(probe_y)), 500),
+                            schema_info=_schema_for_fusion,
                         )
                         fusion_probe = {
                             "selected_strategy": probed_fusion,
@@ -3163,10 +3238,14 @@ async def select_model(request: Request) -> Dict[str, Any]:
                 jit_dry_run = {
                     "selected_image_encoder": _jit_result.image_encoder_name,
                     "selected_text_encoder": _jit_result.text_encoder_name,
+                    "image_output_dim": int(getattr(_jit_result, "image_output_dim", 0) or 0),
+                    "text_output_dim": int(getattr(_jit_result, "text_output_dim", 0) or 0),
                     "vram_budget_bytes": int(_jit_result.vram_budget_bytes),
                     "peak_memory_bytes": int(_jit_result.total_peak_memory_bytes),
                     "dry_run_attempts": None,
                     "rationale": dict(_jit_result.rationale or {}),
+                    "image_encoder_family": _jit_result.image_encoder_family,
+                    "text_encoder_family": _jit_result.text_encoder_family,
                 }
             except Exception as jit_exc:
                 logger.warning("/select-model: JIT dry-run rationale unavailable: %s", jit_exc)
@@ -3316,6 +3395,21 @@ async def select_model(request: Request) -> Dict[str, Any]:
                 if _jit_txt_name:
                     recommendations[0]["tier_template_text_encoder"] = recommendations[0].get("text_encoder")
                     recommendations[0]["text_encoder"] = _jit_txt_name
+                # Update candidate rationale to reflect actual JIT selections
+                # (tier template strings name placeholder models, not profiled ones)
+                _peak_mb = jit_dry_run.get("peak_memory_bytes", 0) / 1e6
+                _budget_gb = jit_dry_run.get("vram_budget_bytes", 0) / 1e9
+                _rat = recommendations[0].setdefault("rationale", {})
+                if _jit_img_name:
+                    _rat["image_encoder"] = (
+                        f"JIT-selected: {_jit_img_name} "
+                        f"(peak={_peak_mb:.0f}MB, budget={_budget_gb:.1f}GB)"
+                    )
+                if _jit_txt_name:
+                    _rat["text_encoder"] = (
+                        f"JIT-selected: {_jit_txt_name} "
+                        f"(peak={_peak_mb:.0f}MB, budget={_budget_gb:.1f}GB)"
+                    )
                 _jit_fusion = recommendations[0].get("fusion_strategy", "")
                 _fusion_labels = {
                     "ula": "[ULA]", "attention": "[Attention]",
@@ -3349,9 +3443,14 @@ async def select_model(request: Request) -> Dict[str, Any]:
                         recommendations,
                         model_reason,
                     )
-                    ctx.fusion_strategy = best.get("fusion_strategy")
-                    ctx.fusion_policy_source = "selector_recommendation"
-                    ctx.fusion_policy_locked = bool(best.get("fusion_strategy"))
+                    _user_fusion_locked = (
+                        bool(getattr(ctx, "fusion_policy_locked", False))
+                        and getattr(ctx, "fusion_policy_source", None) == "user_override"
+                    )
+                    if not _user_fusion_locked:
+                        ctx.fusion_strategy = best.get("fusion_strategy")
+                        ctx.fusion_policy_source = "selector_recommendation"
+                        ctx.fusion_policy_locked = False
                     ctx.selected_model = best.get("name")
                     ctx.set_pipeline_stage("model_selection")
                     if probe_scores:
@@ -3376,9 +3475,19 @@ async def select_model(request: Request) -> Dict[str, Any]:
                     ctx.update_fusion(
                         best.get("fusion_strategy"),
                         dict(getattr(ctx, "modality_importance", {}) or {}),
+                        source="selector_recommendation",
                     )
+                    _jit_info = dict(best.get("jit_dry_run", {}) or {})
+                    if _jit_info:
+                        _dims = dict(getattr(ctx, "encoder_output_dims", {}) or {})
+                        if _jit_info.get("image_output_dim"):
+                            _dims["image"] = int(_jit_info["image_output_dim"])
+                        if _jit_info.get("text_output_dim"):
+                            _dims["text"] = int(_jit_info["text_output_dim"])
+                        ctx.encoder_output_dims = _dims
                     _apply_active_modality_contract(ctx)
-                    ctx.fusion_policy_source = "selector_recommendation"
+                    if not _user_fusion_locked:
+                        ctx.fusion_policy_source = "selector_recommendation"
                     session_manager.update_session_context(_sid, ctx)
         except OptimisticLockError:
             raise
@@ -3432,6 +3541,8 @@ async def select_model(request: Request) -> Dict[str, Any]:
             "best_model":         _best_model,
         }
 
+    except HTTPException:
+        raise
     except OptimisticLockError:
         raise
     except Exception as exc:
@@ -3440,6 +3551,9 @@ async def select_model(request: Request) -> Dict[str, Any]:
             {"error": "Model selection failed. Check server logs for details."},
             status_code=500,
         )
+    finally:
+        if gpu_slot_acquired:
+            _GPU_SEMAPHORE.release()
 
 
 # ---------------------------------------------------------------------------
@@ -3474,6 +3588,8 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
           "error":              null | str
         }
     """
+    _training_start_lock: Optional[asyncio.Lock] = None
+    _training_start_lock_acquired = False
     try:
         from pipeline.training_orchestrator import (
             TrainingOrchestrator,
@@ -3483,7 +3599,49 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
 
         body = await request.json()
         _sid = body.get("session_id") if isinstance(body, dict) else None
+        _lock_sid = str(_sid or "default")
+        _training_start_lock = _get_training_lock(_lock_sid)
+        try:
+            # Non-blocking try-acquire: timeout=0 means "take it or 409 immediately".
+            # Replaces the check-then-acquire TOCTOU pattern (no await between check
+            # and acquire, but atomic is still cleaner and future-proof).
+            await asyncio.wait_for(_training_start_lock.acquire(), timeout=0.001)
+            _training_start_lock_acquired = True
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Training already in progress for this session.",
+                    "session_id": _lock_sid,
+                    "hint": "Poll /train-pipeline/status/{task_id} for progress.",
+                },
+            )
+        if _sid:
+            with _active_training_lock:
+                _existing_task_id = _active_training_tasks.get(_sid)
+            if _existing_task_id:
+                _existing_task = task_db.get_task(_existing_task_id)
+                if _existing_task and _existing_task.get("status") == "running":
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": "Training already in progress for this session.",
+                            "session_id": _lock_sid,
+                            "task_id": _existing_task_id,
+                            "hint": "Poll /train-pipeline/status/{task_id} for progress.",
+                        },
+                    )
+                with _active_training_lock:
+                    _active_training_tasks.pop(_sid, None)
         _training_ctx = _get_session_context_or_422(_sid, "/train-pipeline")
+        if _training_ctx is not None and hasattr(_training_ctx, "reset_for_new_run"):
+            try:
+                _training_ctx.reset_for_new_run()
+                if _sid:
+                    _training_ctx = _update_session_context_with_retry(str(_sid), _training_ctx)
+                logger.info("/train-pipeline: reset transient context state for new run")
+            except Exception as _reset_exc:
+                logger.warning("/train-pipeline: context reset skipped: %s", _reset_exc)
         _session_cached_schema = _require_context_artifact(
             _sid,
             "global_schema",
@@ -3785,8 +3943,11 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
                 tracker.add_message(2, "info", "Analyzing column types and problem type...")
                 await asyncio.to_thread(orchestrator._execute_phase_2_schema_detection)
                 schema = orchestrator.phase_results.get(Phase.SCHEMA_DETECTION, {})
-                tracker.add_message(2, "result",
-                    f"Problem: {schema.get('global_problem_type', '?')}")
+                _eff_problem = (
+                    getattr(getattr(orchestrator, "execution_context", None), "problem_type", None)
+                    or schema.get("global_problem_type", "?")
+                )
+                tracker.add_message(2, "result", f"Problem: {_eff_problem}")
                 tracker.add_message(2, "detail",
                     f"Modalities: {', '.join(schema.get('global_modalities', []))}")
                 tracker.add_message(2, "detail",
@@ -3997,9 +4158,13 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
                     with _active_training_lock:
                         if _active_training_tasks.get(_sid) == task_id:
                             _active_training_tasks.pop(_sid, None)
+                with _TRAINING_LOCKS_GUARD:
+                    _lock = _TRAINING_LOCKS.get(_lock_sid)
+                    if _lock is not None and not _lock.locked():
+                        _TRAINING_LOCKS.pop(_lock_sid, None)
 
         # Bug 3: training task timeout — wrap in daemon thread that marks FAILED if hung
-        _MAX_TRAINING_S = int(os.environ.get("APEX_TRAINING_TIMEOUT_S", "3600"))
+        _MAX_TRAINING_S = int(os.environ.get("APEX_TRAINING_TIMEOUT_S", "28800"))
 
         async def _run_training_with_timeout() -> None:
             try:
@@ -4012,8 +4177,25 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-        # Launch as background asyncio task
-        asyncio.create_task(_run_training_with_timeout())
+        # Wrap task to release training lock when training completes/fails/times out.
+        # Lock was acquired in the request handler; passing ownership to the background
+        # task ensures it is held for the full training duration, not just the ~100ms setup.
+        async def _run_training_with_lock() -> None:
+            try:
+                await _run_training_with_timeout()
+            finally:
+                if _training_start_lock is not None and _training_start_lock.locked():
+                    _training_start_lock.release()
+                    logger.info("Training lock released for session %s", _lock_sid)
+                # Remove spent lock from global registry — prevents unbounded accumulation
+                # of asyncio.Lock objects for sessions that have completed training.
+                with _TRAINING_LOCKS_GUARD:
+                    if _TRAINING_LOCKS.get(_lock_sid) is _training_start_lock:
+                        _TRAINING_LOCKS.pop(_lock_sid, None)
+
+        # Suppress the outer finally-block release — lock now belongs to the background task
+        _training_start_lock_acquired = False
+        asyncio.create_task(_run_training_with_lock())
 
         return {
             "status": "started",
@@ -4029,6 +4211,13 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
             {"error": "Training pipeline failed to start. Check server logs for details."},
             status_code=500,
         )
+    finally:
+        if (
+            _training_start_lock_acquired
+            and _training_start_lock is not None
+            and _training_start_lock.locked()
+        ):
+            _training_start_lock.release()
 
 
 @app.get("/train-pipeline/status/{task_id}")
@@ -4095,9 +4284,13 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
     Drift detection against cached session data.
     Retraining is triggered when the session has a retraining-capable context.
     """
+    gpu_slot_acquired = False
     try:
         body = await request.json()
         _sid = body.get("session_id") if isinstance(body, dict) else None
+        _check_rate_limit("/monitor/drift", _sid)
+        await _GPU_SEMAPHORE.acquire()
+        gpu_slot_acquired = True
         _ctx_monitor = _get_session_context_or_422(_sid, "/monitor/drift")
         model_id: Optional[str] = body.get("model_id")
         if model_id:
@@ -4106,22 +4299,15 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
             active_id = getattr(_ctx_monitor, "active_prediction_model_id", None)
             model_id = _sanitize_model_id(str(active_id)) if active_id else None
 
-        if not model_id:
-            return _not_available_monitor_payload(
-                "no_deployment_ready_model_registered",
-                _ctx_monitor,
-                None,
-            )
-        _monitor_metadata = _load_model_registry_metadata(model_id)
-        if not _monitor_metadata:
-            return _not_available_monitor_payload("model_metadata_missing", _ctx_monitor, model_id)
-        if not bool(_monitor_metadata.get("deployment_ready", False)):
-            return _not_available_monitor_payload("model_not_deployment_ready", _ctx_monitor, model_id)
-        # Bug fix: do NOT return NOT_AVAILABLE when reference_sample.npy is missing.
-        # The _drift_sync() closure below has a 70/30 split fallback that produces a
-        # valid reference distribution from the production data — that fallback is the
-        # correct behaviour when Phase 6 didn't persist a reference artifact.
-        # Early-returning here made that fallback permanently unreachable.
+        # model_id is optional — used to load reference_sample.npy and stored drift
+        # metadata, but drift detection can run without it via the 70/30 split fallback.
+        # Only validate model metadata when a model_id is explicitly known.
+        if model_id:
+            _monitor_metadata = _load_model_registry_metadata(model_id)
+            if not _monitor_metadata:
+                return _not_available_monitor_payload("model_metadata_missing", _ctx_monitor, model_id)
+            if not bool(_monitor_metadata.get("deployment_ready", False)):
+                return _not_available_monitor_payload("model_not_deployment_ready", _ctx_monitor, model_id)
 
         # Snapshot under lock to prevent TOCTOU race
         with _session_lock:
@@ -4179,6 +4365,44 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
             if numeric_df.empty:
                 return np.zeros((len(df), 1), dtype=np.float64)
             return numeric_df.fillna(0.0).to_numpy(dtype=np.float64)
+
+        def _modality_columns_from_context() -> Dict[str, List[str]]:
+            schema_info = getattr(_ctx_monitor, "global_schema", {}) or {}
+            columns: Dict[str, List[str]] = {}
+            per_dataset = schema_info.get("per_dataset", []) if isinstance(schema_info, dict) else []
+            if not isinstance(per_dataset, list):
+                return columns
+            for dataset_schema in per_dataset:
+                if not isinstance(dataset_schema, dict):
+                    continue
+                detected = dataset_schema.get("detected_columns", {})
+                if not isinstance(detected, dict):
+                    continue
+                for modality, cols in detected.items():
+                    if not isinstance(cols, list):
+                        continue
+                    bucket = columns.setdefault(str(modality), [])
+                    for col in cols:
+                        if isinstance(col, str) and col not in bucket:
+                            bucket.append(col)
+            return columns
+
+        def _collect_text_values(df: pd.DataFrame, columns: List[str]) -> List[str]:
+            values: List[str] = []
+            for col in columns or []:
+                if col not in df.columns:
+                    continue
+                series = df[col].dropna().astype(str)
+                values.extend(text for text in series.tolist() if text and text.strip())
+            return values
+
+        def _collect_image_values(df: pd.DataFrame, columns: List[str]) -> List[Any]:
+            values: List[Any] = []
+            for col in columns or []:
+                if col not in df.columns:
+                    continue
+                values.extend(df[col].dropna().tolist())
+            return values
 
         def _drift_sync() -> Dict[str, Any]:
             from monitoring.drift_detector import DriftDetector
@@ -4243,11 +4467,41 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
                 )
 
             detector = DriftDetector(retraining_orchestrator=retraining_orchestrator)
+            modality_columns = _modality_columns_from_context()
+            ref_texts = _collect_text_values(ref_df, modality_columns.get("text", []))
+            prod_texts = _collect_text_values(prod_df, modality_columns.get("text", []))
+            ref_images = _collect_image_values(ref_df, modality_columns.get("image", []))
+            prod_images = _collect_image_values(prod_df, modality_columns.get("image", []))
+            detect_kwargs: Dict[str, Any] = {"dataset_id": str(_sid or "default")}
+            if ref_texts or prod_texts:
+                detect_kwargs.update(
+                    {
+                        "reference_texts": ref_texts,
+                        "production_texts": prod_texts,
+                    }
+                )
+            if ref_images or prod_images:
+                detect_kwargs.update(
+                    {
+                        "reference_images": ref_images,
+                        "production_images": prod_images,
+                    }
+                )
             report = detector.detect(
                 _to_numeric_array(ref_df),
                 _to_numeric_array(prod_df),
-                dataset_id=str(_sid or "default"),
+                **detect_kwargs,
             )
+
+            # Fraction of production rows with at least one null column.
+            # Proxy for "inference data has missing modalities" — training data
+            # may be 100% complete while production inputs are partial.
+            _inference_missing_rate = 0.0
+            if not prod_df.empty:
+                try:
+                    _inference_missing_rate = float(prod_df.isnull().any(axis=1).mean())
+                except Exception:
+                    pass
 
             result = {
                 "drift_detected": report.drift_detected,
@@ -4264,6 +4518,8 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
                 "status": report.status,
                 "per_feature_ks": dict(report.per_feature_ks or {}),
                 "per_feature_psi": dict(report.per_feature_psi or {}),
+                "text_drift": dict(getattr(report, "text_drift", {}) or {}),
+                "image_drift": dict(getattr(report, "image_drift", {}) or {}),
                 "n_reference": report.n_reference,
                 "n_production": report.n_production,
                 "n_features": report.n_features,
@@ -4272,7 +4528,33 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
                 "retrain_info": dict(report.retrain_info or {}),
                 "model_id": model_id,
                 "stored_phase6_summary": stored_drift,
+                "inference_missing_modality_rate": _inference_missing_rate,
             }
+
+            # Fusion upgrade recommendation when production data has missing modalities
+            # but the deployed model was trained with a fusion strategy that can't handle them.
+            _current_fusion = (getattr(_ctx_monitor, "fusion_strategy", "") or "").lower()
+            _fusion_handles_missing = _current_fusion in ("fusemoe", "gated")
+            if _inference_missing_rate > 0.05 and not _fusion_handles_missing:
+                result["fusion_upgrade_recommended"] = True
+                result["fusion_upgrade_reason"] = (
+                    f"Inference missing-modality rate={_inference_missing_rate:.1%} "
+                    f"but current fusion={_current_fusion!r} cannot handle partial inputs. "
+                    f"Recommend retraining with FuseMoE."
+                )
+                try:
+                    _ctx_monitor.retraining_depth_required = "full"
+                    if hasattr(_ctx_monitor, "log_decision"):
+                        _ctx_monitor.log_decision(
+                            "fusion_upgrade_recommended",
+                            f"Inference missing-modality rate={_inference_missing_rate:.1%} "
+                            f"with fusion={_current_fusion!r} — recommend FuseMoE retrain",
+                            "Missing modality rate exceeds 5% production threshold",
+                        )
+                except Exception:
+                    pass
+            else:
+                result["fusion_upgrade_recommended"] = False
 
             if retrain_setup_error:
                 retrain_info = dict(result.get("retrain_info", {}) or {})
@@ -4311,6 +4593,8 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
                     "reference_artifact": "reference_sample.npy",
                 },
                 "status_per_metric": data["status"],
+                "text_drift": data.get("text_drift", {}),
+                "image_drift": data.get("image_drift", {}),
                 "n_reference": data["n_reference"],
                 "n_production": data["n_production"],
                 "n_features": data["n_features"],
@@ -4330,6 +4614,9 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
             {"error": "Drift detection failed. Check server logs for details."},
             status_code=500,
         )
+    finally:
+        if gpu_slot_acquired:
+            _GPU_SEMAPHORE.release()
 
 
 @app.post("/monitor")
@@ -4428,6 +4715,54 @@ async def model_stats(model_id: str, refresh: bool = False) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/models/{model_id}/xai/heatmap")
+async def get_xai_heatmap(model_id: str) -> Dict[str, Any]:
+    """Serve GradCAM saliency heatmap as base64-encoded PNG."""
+    from config.paths import MODEL_REGISTRY_DIR as _mrdir
+    _registry_root = _mrdir.resolve()
+    heatmap_path = (_mrdir / model_id / "xai_heatmap_latest.npy").resolve()
+    try:
+        heatmap_path.relative_to(_registry_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid model_id")
+    if not heatmap_path.exists():
+        raise HTTPException(status_code=404, detail="No heatmap for this model. Train with image modality first.")
+    try:
+        import io, base64 as _b64
+        arr = np.load(str(heatmap_path))
+        if arr.ndim != 2:
+            raise HTTPException(status_code=422, detail=f"Unexpected heatmap shape: {arr.shape}")
+        _h, _w = arr.shape
+        if _h > 256 or _w > 256:
+            _scale = min(256 / _h, 256 / _w)
+            _nh, _nw = max(1, int(_h * _scale)), max(1, int(_w * _scale))
+            arr = arr[:_nh * (_h // _nh), :_nw * (_w // _nw)].reshape(_nh, _h // _nh, _nw, _w // _nw).mean(axis=(1, 3))
+        arr_norm = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+        try:
+            from matplotlib.cm import hot as _hot
+            rgba = (_hot(arr_norm)[:, :, :3] * 255).astype(np.uint8)
+        except ImportError:
+            rgba = np.stack([(arr_norm * 255).astype(np.uint8)] * 3, axis=-1)
+        try:
+            from PIL import Image as _PILImage
+            buf = io.BytesIO()
+            _PILImage.fromarray(rgba).save(buf, format="PNG")
+            b64str = _b64.b64encode(buf.getvalue()).decode()
+        except ImportError:
+            raise HTTPException(status_code=503, detail="PIL not available — pip install Pillow")
+        return {
+            "heatmap_b64": b64str,
+            "shape": list(arr.shape),
+            "min": round(float(arr.min()), 6),
+            "max": round(float(arr.max()), 6),
+            "mean": round(float(arr.mean()), 6),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Heatmap encoding failed: {exc}")
+
+
 @app.post("/experiments/run-ablations")
 @require_context("preprocessing_planning", required_fields=["global_schema"], require_session=True)
 async def run_ablations(request: Request) -> Dict[str, Any]:
@@ -4441,6 +4776,25 @@ async def run_ablations(request: Request) -> Dict[str, Any]:
             body = {}
 
         session_id = body.get("session_id") if isinstance(body, dict) else None
+        _check_rate_limit("/experiments/run-ablations", session_id)
+
+        # Per-session ablation lock: one ablation study per session at a time.
+        # Multiple parallel ablation studies = multiple full training cycles = OOM.
+        _abl_sid = str(session_id or "default")
+        with _active_ablation_lock:
+            _existing_abl = _active_ablation_tasks.get(_abl_sid)
+        if _existing_abl:
+            _existing_abl_task = task_db.get_task(_existing_abl)
+            if _existing_abl_task and _existing_abl_task.get("status") in ("PENDING", "PROCESSING"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Ablation study already running for this session "
+                        f"(task_id={_existing_abl}). "
+                        f"Poll /experiments/ablation-results to check progress."
+                    ),
+                )
+
         ctx = _get_session_context_or_422(session_id, "/experiments/run-ablations")
         _require_context_artifact(session_id, "global_schema", "/experiments/run-ablations")
 
@@ -4536,10 +4890,15 @@ async def run_ablations(request: Request) -> Dict[str, Any]:
             },
         )
 
+        # Register this task as the active ablation for the session
+        with _active_ablation_lock:
+            _active_ablation_tasks[_abl_sid] = task_id
+
         async def _run() -> None:
             task_db.update_status(task_id, "PROCESSING")
             try:
-                await asyncio.to_thread(manager.run_ablations, selected_conditions)
+                async with _GPU_SEMAPHORE:
+                    await asyncio.to_thread(manager.run_ablations, selected_conditions)
                 rows = manager.to_rows()
                 task_db.update_result(
                     task_id,
@@ -4552,6 +4911,10 @@ async def run_ablations(request: Request) -> Dict[str, Any]:
             except Exception as exc:
                 logger.error("/experiments/run-ablations task %s failed: %s", task_id, exc, exc_info=True)
                 task_db.update_error(task_id, "FAILED", str(exc))
+            finally:
+                with _active_ablation_lock:
+                    if _active_ablation_tasks.get(_abl_sid) == task_id:
+                        _active_ablation_tasks.pop(_abl_sid, None)
 
         asyncio.create_task(_run())
 
@@ -5626,266 +5989,12 @@ async def get_task_status(task_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket streaming inference
+# WebSocket streaming inference — REMOVED 2026-05-17
+# /ws/predict was unused (no frontend calls, no tests).
+# Reserved for future real-time streaming UI.
 # ---------------------------------------------------------------------------
-
-@app.websocket("/ws/predict")
-async def ws_predict(websocket: WebSocket) -> None:
-    """
-    WebSocket inference endpoint with real-time status streaming.
-
-    Protocol
-    --------
-    1. Client connects, server sends ``{"type": "status", "status": "CONNECTED"}``.
-    2. Client sends a JSON message with ``model_id``, ``inputs``, etc.
-    3. Server streams status updates as processing progresses.
-    4. Server sends ``{"type": "complete", "result": {...}}`` with the
-       full prediction payload.
-    5. On error: ``{"type": "error", "error": "..."}``.
-    6. Connection closes after the result is sent.
-    """
-    await websocket.accept()
-
-    try:
-        # 1. Acknowledge connection
-        await websocket.send_json({"type": "status", "status": "CONNECTED"})
-
-        # 2. Receive the inference request
-        raw_message: Optional[str] = None
-        while True:
-            try:
-                raw_message = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=float(os.getenv("APEX_WS_IDLE_TIMEOUT_SEC", "30.0")),
-                )
-                break
-            except asyncio.TimeoutError:
-                try:
-                    await websocket.send_json({"type": "ping", "ts": datetime.now(timezone.utc).isoformat()})
-                except Exception:
-                    break
-                continue
-
-        if raw_message is None:
-            return
-
-        body: Dict[str, Any] = json.loads(raw_message)
-        _sid = body.get("session_id") if isinstance(body, dict) else None
-        if not _sid:
-            await websocket.send_json({"type": "error", "error": "session_id is required."})
-            return
-
-        _ctx = session_manager.get_session(str(_sid))
-        if _ctx is None:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "error": f"No ExecutionContext for session {_sid}.",
-                }
-            )
-            return
-        if _is_missing_context_value(getattr(_ctx, "global_schema", None)):
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "error": "Session ExecutionContext is missing global_schema.",
-                }
-            )
-            return
-        _contract = _context_contract_payload(_ctx)
-
-        model_id: Optional[str] = body.get("model_id")
-        if not model_id:
-            await websocket.send_json({"type": "error", "error": "model_id is required."})
-            return
-        try:
-            model_id = _sanitize_model_id(model_id)
-        except HTTPException as exc:
-            await websocket.send_json({"type": "error", "error": exc.detail})
-            return
-
-        raw_inputs: List[Dict[str, Any]] = body.get("inputs", [])
-        if not raw_inputs:
-            await websocket.send_json({"type": "error", "error": "inputs list is empty."})
-            return
-
-        _MAX_BATCH: int = 10_000
-        if len(raw_inputs) > _MAX_BATCH:
-            await websocket.send_json({
-                "type": "error",
-                "error": f"Batch too large ({len(raw_inputs)} rows). Maximum is {_MAX_BATCH}.",
-            })
-            return
-
-        try:
-            _metadata = _require_prediction_ready_model(_ctx, model_id, "/ws/predict")
-            _schema = _load_model_schema(model_id) or dict(getattr(_ctx, "global_schema", {}) or {})
-            _prediction_contract = _build_prediction_contract(
-                model_id=model_id,
-                metadata=_metadata,
-                schema=_schema,
-                ctx=_ctx,
-                class_labels=_load_model_class_labels(model_id),
-            )
-            raw_inputs, _io_audit = _normalise_prediction_inputs(raw_inputs, _prediction_contract)
-        except HTTPException as exc:
-            await websocket.send_json({"type": "error", "error": exc.detail})
-            return
-
-        explain: bool = bool(body.get("explain", False))
-        target_class: int = int(body.get("target_class", -1))
-        n_steps: int = int(body.get("n_steps", 50))
-
-        # 3. Load or retrieve inference engine
-        await websocket.send_json({"type": "status", "status": "LOADING_MODEL"})
-
-        from pipeline.inference_engine import MultimodalInferenceEngine
-
-        with _engine_cache_lock:
-            if model_id in _engine_cache:
-                _engine_cache.move_to_end(model_id)
-                engine = _engine_cache[model_id]
-            else:
-                engine = None
-
-        if engine is None:
-            engine = await asyncio.to_thread(
-                MultimodalInferenceEngine, model_id=model_id,
-            )
-            with _engine_cache_lock:
-                _engine_cache[model_id] = engine
-                while len(_engine_cache) > _MAX_ENGINES:
-                    _engine_cache.popitem(last=False)
-
-        # 4. Run inference — chunk large batches for progress streaming
-        await websocket.send_json({
-            "type": "status",
-            "status": "PROCESSING",
-            "n_samples": len(raw_inputs),
-        })
-
-        CHUNK_SIZE: int = 100
-        df_full: pd.DataFrame = pd.DataFrame(raw_inputs)
-
-        # Bug 15: wrap inference in per-call timeout — prevents indefinite hang on OOM/deadlock
-        _WS_INFER_TIMEOUT = float(os.environ.get("APEX_WS_INFERENCE_TIMEOUT_S", "120"))
-
-        async def _predict_with_timeout(df_chunk: pd.DataFrame) -> Dict[str, Any]:
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(engine.predict_batch, df_chunk, execution_context=_ctx),
-                    timeout=_WS_INFER_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                await websocket.send_json({
-                    "type": "error",
-                    "error": f"Inference timed out after {_WS_INFER_TIMEOUT:.0f}s (APEX_WS_INFERENCE_TIMEOUT_S)",
-                })
-                raise
-
-        if len(raw_inputs) <= CHUNK_SIZE:
-            try:
-                result = await _predict_with_timeout(df_full)
-            except asyncio.TimeoutError:
-                return
-        else:
-            all_predictions: List[Any] = []
-            all_confidences: List[Any] = []
-            n_chunks = (len(raw_inputs) + CHUNK_SIZE - 1) // CHUNK_SIZE
-            problem_type = ""
-
-            for chunk_idx in range(n_chunks):
-                start = chunk_idx * CHUNK_SIZE
-                end = min(start + CHUNK_SIZE, len(raw_inputs))
-                chunk_df = df_full.iloc[start:end]
-
-                try:
-                    chunk_result = await _predict_with_timeout(chunk_df)
-                except asyncio.TimeoutError:
-                    return
-                all_predictions.extend(chunk_result["predictions"])
-                all_confidences.extend(chunk_result["confidences"])
-                problem_type = chunk_result["problem_type"]
-
-                await websocket.send_json({
-                    "type": "progress",
-                    "chunk": chunk_idx + 1,
-                    "total_chunks": n_chunks,
-                    "samples_completed": end,
-                    "samples_total": len(raw_inputs),
-                })
-
-            result = {
-                "predictions": all_predictions,
-                "confidences": all_confidences,
-                "problem_type": problem_type,
-                "n_samples": len(all_predictions),
-            }
-
-        # 5. Optional XAI explanations
-        explanations: Optional[Dict[str, Any]] = None
-        if explain:
-            await websocket.send_json({
-                "type": "status",
-                "status": "GENERATING_EXPLANATIONS",
-            })
-
-            effective_target = _resolve_xai_target(target_class, result)
-
-            try:
-                explanations = await asyncio.to_thread(
-                    engine.generate_explanations,
-                    df_full,
-                    target_class=effective_target,
-                    n_steps=n_steps,
-                )
-            except Exception as xai_exc:
-                explanations = {
-                    "status": "unavailable",
-                    "unavailable_reasons": {"global": str(xai_exc)},
-                    "availability": _prediction_contract.get("xai_availability", {}),
-                }
-
-        # 6. Send complete result
-        payload = _prediction_output_payload(
-            model_id=model_id,
-            result=result,
-            explanations=explanations,
-            prediction_contract=_prediction_contract,
-            io_audit=_io_audit,
-            ctx=_ctx,
-        )
-        _cal = getattr(engine, "probability_calibrator", None)
-        payload["calibration_applied"] = _cal is not None or payload.get("calibration_applied", False)
-        payload["calibration_method"] = getattr(_cal, "method", None) if _cal else None
-        payload["context_stage"] = _contract["context_stage"]
-        payload["context_version"] = _contract["context_version"]
-        payload["artifact_versions"] = _contract["artifact_versions"]
-        await websocket.send_json({"type": "complete", "result": payload})
-
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected during inference")
-    except json.JSONDecodeError as e:
-        try:
-            await websocket.send_json({"type": "error", "error": f"Invalid JSON: {e}"})
-        except Exception:
-            pass
-    except FileNotFoundError:
-        try:
-            await websocket.send_json({"type": "error", "error": "Model not found."})
-        except Exception:
-            pass
-    except Exception as exc:
-        logger.error("WebSocket /ws/predict error: %s", exc, exc_info=True)
-        try:
-            await websocket.send_json({"type": "error", "error": "Internal inference error."})
-        except Exception:
-            pass
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+# Placeholder to preserve line-number stability for imports that reference this file.
+_WS_PREDICT_REMOVED = True  # noqa: F841
 
 
 # ---------------------------------------------------------------------------
@@ -6044,6 +6153,118 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
         logger.error("/predict error: %s", exc, exc_info=True)
         return JSONResponse(
             {"error": "Prediction failed. Check server logs for details."},
+            status_code=500,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sessionless inference — previously trained registry model
+# ---------------------------------------------------------------------------
+
+@app.post("/predict-registry")
+async def predict_from_registry(request: Request) -> Dict[str, Any]:
+    """
+    Run inference against any deployment-ready registry model without
+    requiring an active training session.  Loads schema and class labels
+    directly from the model's saved artifacts.
+
+    REQUEST BODY
+    ------------
+    ``model_id``     : str          – required; must exist in models/registry/
+    ``inputs``       : List[Dict]   – list of feature dicts (one per sample)
+    ``explain``      : bool         – default false; triggers Captum IG
+    ``target_class`` : int          – default -1 (auto)
+    ``n_steps``      : int          – default 50
+
+    RESPONSE
+    --------
+    Same contract as POST /predict.
+    """
+    try:
+        body: Dict[str, Any] = await request.json()
+        model_id: Optional[str] = body.get("model_id")
+        if not model_id:
+            raise HTTPException(
+                status_code=400,
+                detail="model_id is required. Use GET /model-registry to list available models.",
+            )
+        model_id = _sanitize_model_id(model_id)
+
+        raw_inputs: List[Dict[str, Any]] = body.get("inputs", [])
+        if not raw_inputs:
+            raise HTTPException(status_code=400, detail="inputs list is empty.")
+        if len(raw_inputs) > 10_000:
+            raise HTTPException(status_code=400, detail=f"Batch too large ({len(raw_inputs)}). Max 10 000.")
+
+        # Validate model exists + deployment-ready (no session ctx required)
+        _metadata = _require_prediction_ready_model(ctx=None, model_id=model_id, endpoint="/predict-registry")
+        _schema   = _load_model_schema(model_id)
+        _prediction_contract = _build_prediction_contract(
+            model_id=model_id,
+            metadata=_metadata,
+            schema=_schema,
+            ctx=None,
+            class_labels=_load_model_class_labels(model_id),
+        )
+        raw_inputs, _io_audit = _normalise_prediction_inputs(raw_inputs, _prediction_contract)
+
+        explain: bool     = bool(body.get("explain", False))
+        target_class: int = int(body.get("target_class", -1))
+        n_steps: int      = int(body.get("n_steps", 50))
+
+        from pipeline.inference_engine import MultimodalInferenceEngine
+
+        with _engine_cache_lock:
+            if model_id in _engine_cache:
+                _engine_cache.move_to_end(model_id)
+                engine = _engine_cache[model_id]
+            else:
+                engine = None
+
+        if engine is None:
+            engine = await asyncio.to_thread(MultimodalInferenceEngine, model_id=model_id)
+            with _engine_cache_lock:
+                _engine_cache[model_id] = engine
+                while len(_engine_cache) > _MAX_ENGINES:
+                    _engine_cache.popitem(last=False)
+
+        df: pd.DataFrame = pd.DataFrame(raw_inputs)
+        result: Dict[str, Any] = await asyncio.to_thread(
+            engine.predict_batch, df, execution_context=None,
+        )
+
+        explanations: Optional[Dict[str, Any]] = None
+        if explain:
+            effective_target = _resolve_xai_target(target_class, result)
+            try:
+                explanations = await asyncio.to_thread(
+                    engine.generate_explanations, df,
+                    target_class=effective_target, n_steps=n_steps,
+                )
+            except Exception as xai_exc:
+                explanations = {
+                    "status": "unavailable",
+                    "unavailable_reasons": {"global": str(xai_exc)},
+                    "availability": _prediction_contract.get("xai_availability", {}),
+                }
+
+        return _prediction_output_payload(
+            model_id=model_id,
+            result=result,
+            explanations=explanations,
+            prediction_contract=_prediction_contract,
+            io_audit=_io_audit,
+            ctx=None,
+        )
+
+    except HTTPException:
+        raise
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except Exception as exc:
+        logger.error("/predict-registry error: %s", exc, exc_info=True)
+        return JSONResponse(
+            {"error": "Registry prediction failed. Check server logs."},
             status_code=500,
         )
 
@@ -6604,25 +6825,24 @@ async def get_intelligence_drift(session_id: str) -> Dict[str, Any]:
     # ── Covariate drift snapshot from context ────────────────────────────────
     covariate_drift: Dict[str, Any] = {}
     try:
-        drift_state = getattr(ctx, "drift_state", None) or {}
-        if isinstance(drift_state, dict) and drift_state:
-            report = drift_state.get("last_report") or {}
+        # Read aggregate metrics from drift_details (set by update_drift())
+        _drift_details = getattr(ctx, "drift_details", {}) or {}
+        _drift_detected = getattr(ctx, "drift_detected", False)
+        _drift_severity = getattr(ctx, "drift_severity", 0.0)
+        # Read per-feature data from per_feature_drift (set by apply_drift_feedback())
+        _pf_drift = getattr(ctx, "per_feature_drift", {}) or {}
+        _per_feature_ks = _pf_drift.get("per_feature_ks", {})
+        _per_feature_psi = _pf_drift.get("per_feature_psi", {})
+        if _drift_detected or _drift_details or _per_feature_ks:
             covariate_drift = {
-                "detected": bool(report.get("drift_detected", False)),
-                "composite_score": float(report.get("composite_score", 0.0) or 0.0),
-                "per_feature": dict(report.get("per_feature_ks", {})),
-                "ks_statistic": float(report.get("ks_statistic", 0.0) or 0.0),
-                "psi": float(report.get("psi", 0.0) or 0.0),
-                "fdd": float(report.get("fdd", 0.0) or 0.0),
+                "detected": bool(_drift_detected),
+                "composite_score": float(_drift_severity),
+                "ks_statistic": float(_drift_details.get("ks", 0.0) or 0.0),
+                "psi": float(_drift_details.get("psi", 0.0) or 0.0),
+                "fdd": float(_drift_details.get("mmd", 0.0) or 0.0),
+                "per_feature_ks": _per_feature_ks,
+                "per_feature_psi": _per_feature_psi,
             }
-        elif hasattr(ctx, "latest_drift_report"):
-            raw = getattr(ctx, "latest_drift_report", None) or {}
-            if isinstance(raw, dict):
-                covariate_drift = {
-                    "detected": bool(raw.get("drift_detected", False)),
-                    "composite_score": float(raw.get("composite_score", 0.0) or 0.0),
-                    "per_feature": dict(raw.get("per_feature_ks", {})),
-                }
     except Exception:
         pass
 
@@ -7820,6 +8040,46 @@ async def override_target_per_modality(
             except Exception as val_exc:
                 logger.warning("G11 image validation error (non-fatal): %s", val_exc)
 
+        # UNCHARTED-8: trainer uses a single output head / loss function.
+        # Multi-task (different problem_type per modality) is not implemented.
+        # Reject overrides whose task_type conflicts with the session's global problem_type.
+        if request.task_type:
+            _gpt = (getattr(ctx, "global_schema", {}) or {}).get("global_problem_type", "") or ""
+            _new_is_reg = "regression" in request.task_type.lower()
+            _gpt_is_reg = "regression" in _gpt.lower()
+            if _gpt and (_new_is_reg != _gpt_is_reg):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Multi-task learning is not supported: the session's global "
+                        f"problem_type='{_gpt}' conflicts with task_type='{request.task_type}'. "
+                        f"All per-modality targets must belong to the same problem class "
+                        f"(all regression or all classification). "
+                        f"To change the global problem type, use POST /train-pipeline with "
+                        f"problem_type override."
+                    ),
+                )
+            # Also check consistency with any other already-stored per-modality task_types
+            _existing_task_types = {
+                mod: (ctx.user_overrides or {}).get(f"task_type_{mod}")
+                for mod in (getattr(ctx, "per_modality_target_override", {}) or {})
+                if mod != modality
+            }
+            for _other_mod, _other_tt in _existing_task_types.items():
+                if _other_tt and (("regression" in _other_tt) != _new_is_reg):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Multi-task conflict: modality '{_other_mod}' already has "
+                            f"task_type='{_other_tt}', incompatible with '{request.task_type}'. "
+                            f"All per-modality targets must share the same problem class."
+                        ),
+                    )
+            # Store task_type for future cross-modality consistency checks
+            if not isinstance(getattr(ctx, "user_overrides", None), dict):
+                ctx.user_overrides = {}
+            ctx.user_overrides[f"task_type_{modality}"] = request.task_type
+
         if not hasattr(ctx, "per_modality_target_override"):
             ctx.per_modality_target_override = {}
         ctx.per_modality_target_override[modality] = target_col
@@ -8018,6 +8278,54 @@ async def set_active_prediction_model(
         raise
     except Exception as exc:
         logger.error("/v2/sessions/%s/active-model: %s", session_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/v2/sessions/{session_id}/adopt-model")
+async def adopt_registry_model(session_id: str, request: Request) -> Dict[str, Any]:
+    """
+    Import a previously trained registry model into an active session so it
+    becomes available for session-scoped prediction and monitoring.
+
+    Sets the model as both registered and active in the session context.
+
+    REQUEST BODY
+    ------------
+    ``model_id`` : str – must exist in models/registry/ and be deployment-ready
+    """
+    try:
+        body: Dict[str, Any] = await request.json()
+        model_id = _sanitize_model_id(str(body.get("model_id", "") or ""))
+        if not model_id:
+            raise HTTPException(status_code=400, detail="model_id required")
+
+        _metadata = _require_prediction_ready_model(ctx=None, model_id=model_id, endpoint="/adopt-model")
+
+        ctx = _get_session_context_or_422(session_id, "adopt_model")
+        registered = list(getattr(ctx, "registered_model_ids", []) or [])
+        if model_id not in registered:
+            registered.append(model_id)
+            ctx.registered_model_ids = registered
+        ctx.active_prediction_model_id = model_id
+        ctx.log_decision(
+            "adopted_registry_model",
+            f"adopted '{model_id}' from registry into session",
+        )
+        session_manager.update_session_context(session_id, ctx)
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "model_id": model_id,
+            "active_prediction_model_id": model_id,
+            "registered_model_ids": registered,
+            "deployment_ready": bool(_metadata.get("deployment_ready", False)),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("/v2/sessions/%s/adopt-model: %s", session_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 

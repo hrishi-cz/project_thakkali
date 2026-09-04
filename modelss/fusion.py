@@ -94,6 +94,23 @@ def apply_modality_mask(
     return masked
 
 
+def _named_modality_scores(
+    scores: List[float],
+    modality_names: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """Map ordered modality scores to stable modality names."""
+    names = list(modality_names or [])
+    if len(names) < len(scores):
+        names.extend(
+            f"modality_{idx}"
+            for idx in range(len(names), len(scores))
+        )
+    return {
+        str(name): float(score)
+        for name, score in zip(names, scores)
+    }
+
+
 # ---------------------------------------------------------------------------
 # ConcatenationFusion
 # ---------------------------------------------------------------------------
@@ -388,7 +405,7 @@ class GraphFusion(nn.Module):
     def get_output_dim(self) -> int:
         return self.dim
 
-    def get_attention_summary(self) -> dict:
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
         if self.last_attention_weights is None:
             return {
                 "modality_importance": {},
@@ -397,10 +414,10 @@ class GraphFusion(nn.Module):
 
         weights = self.last_attention_weights  # [N, H, M]
         modality_mean = weights.mean(dim=(0, 1))
-        modality_importance = {
-            f"modality_{idx}": float(score)
-            for idx, score in enumerate(modality_mean.cpu().tolist())
-        }
+        modality_importance = _named_modality_scores(
+            modality_mean.cpu().tolist(),
+            modality_names,
+        )
 
         head_profiles = weights.mean(dim=0)  # [H, M]
         if head_profiles.shape[0] > 1:
@@ -478,7 +495,7 @@ class UncertaintyFusion(nn.Module):
     def get_output_dim(self) -> int:
         return self.latent_dim
 
-    def get_attention_summary(self) -> dict:
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
         """Return modality importance inferred from uncertainty weights."""
         if self.last_uncertainty_weights is None:
             return {
@@ -488,10 +505,7 @@ class UncertaintyFusion(nn.Module):
             }
 
         mean_w = self.last_uncertainty_weights.mean(dim=0)
-        importance = {
-            f"modality_{i}": float(v)
-            for i, v in enumerate(mean_w.cpu().tolist())
-        }
+        importance = _named_modality_scores(mean_w.cpu().tolist(), modality_names)
         return {
             "modality_importance": importance,
             "uncertainty_importance": importance,
@@ -564,18 +578,18 @@ class UncertaintyGraphFusion(nn.Module):
     def get_output_dim(self) -> int:
         return self.latent_dim
 
-    def get_attention_summary(self) -> dict:
-        base = self.graph_branch.get_attention_summary()
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
+        base = self.graph_branch.get_attention_summary(modality_names=modality_names)
         base["branch_weights"] = self.get_branch_weights()
         if self.uncertainty_branch.last_uncertainty_weights is None:
             base["uncertainty_importance"] = {}
             return base
 
         mean_w = self.uncertainty_branch.last_uncertainty_weights.mean(dim=0)
-        base["uncertainty_importance"] = {
-            f"modality_{i}": float(v)
-            for i, v in enumerate(mean_w.cpu().tolist())
-        }
+        base["uncertainty_importance"] = _named_modality_scores(
+            mean_w.cpu().tolist(),
+            modality_names,
+        )
         return base
 
     def get_branch_weights(self) -> dict:
@@ -620,13 +634,11 @@ def graph_sparsity_loss(adjacency: torch.Tensor) -> torch.Tensor:
 
 def select_fusion_strategy(schema_info: dict) -> str:
     """
-    Choose a fusion strategy from schema modalities and cross-modal signals.
-
-    The routing hierarchy:
-      1. Modality count hard rules (single → concat, 3+ → complementarity).
-      2. Well-known 2-modality pairs (image+text → structural_semantic, etc.).
-      3. Cross-modal intelligence signals (alignment_strength,
-         complementarity_score) fine-tune within the 2-modality case.
+    Signal-driven fusion routing. Priority order:
+      1. Missing modality rate → FuseMoE (only strategy designed for partial inputs).
+      2. Cross-modal conflict → GatedFusion (suppresses contradicting modalities).
+      3. Modality count: 3+ → complementarity / structural_semantic / fusemoe.
+      4. 2-modality pair rules refined by alignment_strength and comp_score.
     """
     if not isinstance(schema_info, dict):
         return "concat"
@@ -640,38 +652,50 @@ def select_fusion_strategy(schema_info: dict) -> str:
 
     if len(modset) <= 1:
         return "concat"
+
+    mm_signals   = schema_info.get("multimodal_signals") or {}
+    align_score  = float(mm_signals.get("alignment_strength",    0.5) or 0.5)
+    comp_score   = float(mm_signals.get("complementarity_score", 0.0) or 0.0)
+    conflict_score = float(mm_signals.get("conflict_score",      0.0) or 0.0)
+    missing_rate = float(schema_info.get("missing_modality_rate", 0.0) or 0.0)
+    n_rows       = int(schema_info.get("n_rows", 10_000) or 10_000)
+
+    # Universal rule: FuseMoE when >15% rows have missing modality data.
+    # It is the only strategy natively designed for partial inputs at inference time.
+    if missing_rate > 0.15:
+        return "fusemoe"
+
+    # Conflict detection: gated learns to suppress the contradicting modality per-sample.
+    if conflict_score > 0.4:
+        return "gated"
+
     if len(modset) >= 3:
-        return "complementarity"       # CrossFuse [4] for 3+ modalities
+        if missing_rate > 0.05:
+            return "fusemoe"
+        if align_score > 0.6 and comp_score > 0.4:
+            return "complementarity"
+        if n_rows >= 50_000:
+            return "structural_semantic"  # ICML 2025 SSRouter for large 3+ mod data
+        return "complementarity"
 
-    # --- 2-modality routing with cross-modal signal refinement ---
-
-    # Read cross-modal signals from GlobalSchema.multimodal_signals
-    mm_signals = schema_info.get("multimodal_signals") or {}
-    float(mm_signals.get("alignment_strength",   0.5) or 0.5)
-    comp_score  = float(mm_signals.get("complementarity_score", 0.0) or 0.0)
-
+    # ── 2-modality routing ────────────────────────────────────────────────────
     if modset == {"image", "text"}:
-        # Bug 5 fix: ULA (Unified Latent Alignment) is the primary strategy for
-        # image+text. Cross-modal Transformer lets image patches and text tokens
-        # attend to each other before classification — strictly superior to
-        # structural_semantic or complementarity for paired vision+language tasks.
-        return "ula"
+        if align_score < 0.2:
+            return "attention"   # domain mismatch → simpler weighted fusion
+        return "ula"             # cross-modal Transformer (image patches × text tokens)
 
     if modset == {"tabular", "text"}:
-        # High complementarity variance → modalities bring distinct signals
-        # → graph captures cross-entity relations
         if comp_score > 0.3:
-            return "graph"
-        return "attention"             # default: text attends over tabular
+            return "graph"       # distinct signals → graph cross-entity fusion
+        return "attention"
 
     if modset == {"tabular", "image"}:
-        # Uncertainty-weighted: image embedding quality is variable
-        return "uncertainty"
+        return "uncertainty"     # variable image quality → uncertainty-weighted
 
     if "timeseries" in modset:
-        return "attention"             # sequential data → attention over context
+        return "attention"
 
-    return "attention"                 # safe default
+    return "attention"
 
 
 # ---------------------------------------------------------------------------
@@ -834,12 +858,12 @@ class ComplementarityFusion(nn.Module):
     def get_output_dim(self) -> int:
         return self.latent_dim
 
-    def get_attention_summary(self) -> dict:
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
         return {
-            "modality_importance": {
-                f"modality_{i}": float(w)
-                for i, w in enumerate(self.last_fusion_weights)
-            },
+            "modality_importance": _named_modality_scores(
+                list(self.last_fusion_weights),
+                modality_names,
+            ),
             "complementarity_matrix": self.last_complementarity_matrix,
             "mi_nats": self.last_mi_nats,   # NEW: interpretable in nats
             "head_diversity": 0.0,
@@ -934,8 +958,8 @@ class StructuralSemanticRouter(nn.Module):
     def get_output_dim(self) -> int:
         return self.latent_dim
 
-    def get_attention_summary(self) -> dict:
-        base = self.structural.get_attention_summary()
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
+        base = self.structural.get_attention_summary(modality_names=modality_names)
         base["gate_value"] = self.last_gate_value
         base["branch_weights"] = {
             "structural": self.last_gate_value,
@@ -1019,7 +1043,7 @@ class GatedFusion(nn.Module):
     def get_output_dim(self) -> int:
         return self.output_dim
 
-    def get_attention_summary(self) -> dict:
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
         return {"gate_weights": self._last_gates or []}
 
 
@@ -1107,6 +1131,19 @@ class UnifiedLatentFusion(nn.Module):
         # token_mode=True → accept (N,T,D) token sequences from ViT/BERT
         self.token_mode: bool = token_mode
         self._last_token_count: int = 0
+        self._last_projected_tokens: List[torch.Tensor] = []
+
+        # C1: Learnable NT-Xent temperature — initialized at log(0.07) per CLIP.
+        # Dedicated 10× LR param group (see configure_optimizers in trainer) because
+        # the temperature gradient is weak at small batch sizes (B=16, 15 negatives).
+        import math as _math
+        self.log_temperature = nn.Parameter(torch.tensor(_math.log(0.07)))
+
+        # C5: Cross-step embedding buffer for NT-Xent/SupCon.
+        # Stores (emb_buffer, label_buffer) from previous forward step.
+        # Detached — no gradient flows backward through the buffer.
+        self._emb_buffer: List[torch.Tensor] = []
+        self._label_buffer: Optional[torch.Tensor] = None
 
     def _project_modality(
         self,
@@ -1143,10 +1180,27 @@ class UnifiedLatentFusion(nn.Module):
         features: List[torch.Tensor],
         modality_mask: Optional[Dict[str, bool]] = None,
         modality_names: Optional[List[str]] = None,
+        padding_masks: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        features : List[Tensor]
+            Per-modality feature tensors (pooled [N,D] or sequence [N,T,D]).
+        modality_mask : dict, optional
+            G25 modality dropout mask {name: bool}.
+        modality_names : list, optional
+            Names matching features order — used with modality_mask.
+        padding_masks : List[Optional[Tensor]], optional
+            Per-modality attention masks [N, T] — 1=valid token, 0=PAD.
+            None entries mean all tokens are valid (e.g. image patches).
+            Used to build src_key_padding_mask for the ULA transformer,
+            preventing softmax dilution by PAD tokens in reasoning sequences.
+        """
         N = features[0].shape[0]
         device = features[0].device
         tokens: List[torch.Tensor] = []
+        active_masks: List[Optional[torch.Tensor]] = []
 
         for i, feat in enumerate(features):
             if modality_mask is not None and modality_names is not None:
@@ -1156,8 +1210,12 @@ class UnifiedLatentFusion(nn.Module):
 
             tok = self._project_modality(feat, self.proj_linears[i], self.proj_norms[i], i)
             tokens.append(tok)  # each is (N, T_i, latent_dim)
+            # Carry the padding mask for this modality (None if no padding)
+            m = (padding_masks[i] if padding_masks is not None and i < len(padding_masks) else None)
+            active_masks.append(m)
 
         self._last_token_count = sum(t.shape[1] for t in tokens)
+        self._last_projected_tokens = list(tokens)  # List[(N, T_i, latent_dim)] for alignment
 
         # CLS token
         cls_idx = torch.zeros(N, 1, dtype=torch.long, device=device)
@@ -1167,41 +1225,131 @@ class UnifiedLatentFusion(nn.Module):
             return self.norm(self.transformer(cls)[:, 0, :])
 
         sequence = torch.cat([cls] + tokens, dim=1)   # (N, 1+ΣT_i, latent_dim)
-        output = self.transformer(sequence)
+
+        # Build src_key_padding_mask to block PAD tokens in reasoning sequences.
+        # PyTorch convention: True = IGNORE this position.
+        # Tokenizer convention: 1=valid, 0=PAD → invert to get PyTorch mask.
+        src_key_padding_mask: Optional[torch.Tensor] = None
+        _has_any_mask = any(m is not None for m in active_masks)
+        if _has_any_mask:
+            try:
+                mask_parts: List[torch.Tensor] = []
+                # CLS token: always valid (never PAD)
+                mask_parts.append(torch.zeros(N, cls.shape[1], dtype=torch.bool, device=device))
+                for tok_i, m_i in zip(tokens, active_masks):
+                    if m_i is not None:
+                        # Invert: tokenizer 0 (PAD) → True (ignore); 1 (valid) → False (attend)
+                        mask_parts.append(m_i.to(device=device, dtype=torch.bool).logical_not())
+                    else:
+                        # No mask: assume all valid (image patches, tabular tokens)
+                        mask_parts.append(torch.zeros(N, tok_i.shape[1], dtype=torch.bool, device=device))
+                src_key_padding_mask = torch.cat(mask_parts, dim=1)  # (N, 1+ΣT_i)
+            except Exception:
+                src_key_padding_mask = None  # safe fallback — lose PAD masking but don't crash
+
+        output = self.transformer(sequence, src_key_padding_mask=src_key_padding_mask)
         return self.norm(output[:, 0, :])              # CLS read-out → (N, latent_dim)
 
-    def alignment_loss(self, features: List[torch.Tensor]) -> torch.Tensor:
+    def alignment_loss(
+        self,
+        features: List[torch.Tensor],
+        labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        In-batch NT-Xent contrastive loss between all projected modality pairs.
-        Encourages the same sample's representations across modalities to
-        cluster together in the shared latent space.
+        Contrastive alignment loss between projected modality pairs.
 
-        Called by ``ApexLightningModule._apply_adaptive_loss`` when this
-        fusion class is active — replaces the separate CLIPProjectionHead path.
+        When ``labels`` are provided (classification tasks): SupCon — same-class
+        cross-modal pairs are treated as positives, eliminating false negatives.
+
+        Without ``labels`` (regression / unsupervised): SigLIP-style per-pair
+        sigmoid loss — no softmax normalisation, no false-negative issue.
+
+        C1: uses learnable ``log_temperature`` (initialized at log(0.07), adapts
+        toward 0.10-0.20 at small batch sizes for stable gradients).
+
+        C5: cross-step embedding buffer doubles effective negatives (B → 2B)
+        at zero VRAM cost. Buffer stores labels too for SupCon correctness.
         """
         if len(features) < 2:
             return torch.tensor(0.0, device=features[0].device)
 
+        # C1: learnable temperature — clamped to [0.01, 100] range
+        tau = self.log_temperature.clamp(-4.6, 4.6).exp()
+
+        # Build current-step projected embeddings
         projs = []
         for i, feat in enumerate(features):
-            # Pool token sequences to one vector before contrastive loss
-            flat = feat.detach()
+            flat = feat
             if flat.dim() == 3:
                 flat = flat.mean(dim=1)  # (N, T, D) → (N, D)
-            projected = self.proj_norms[i](self.proj_linears[i](flat))  # (N, latent_dim)
-            projs.append(F.normalize(projected, dim=-1))
+            if flat.shape[-1] == self.latent_dim:
+                projected = F.normalize(flat, dim=-1)
+            else:
+                projected = F.normalize(
+                    self.proj_norms[i](self.proj_linears[i](flat)), dim=-1
+                )
+            projs.append(projected)
+
+        # C5: augment with cross-step buffer (doubles effective negatives)
+        augmented = []
+        combined_labels = labels
+        if (
+            self._emb_buffer
+            and len(self._emb_buffer) == len(projs)
+            and all(
+                b.shape == p.shape and b.device == p.device
+                for b, p in zip(self._emb_buffer, projs)
+            )
+        ):
+            augmented = [torch.cat([buf, cur], dim=0) for buf, cur in zip(self._emb_buffer, projs)]
+            if labels is not None and self._label_buffer is not None:
+                try:
+                    combined_labels = torch.cat([self._label_buffer, labels], dim=0)
+                except Exception:
+                    combined_labels = labels
+        else:
+            augmented = projs
+
+        # Update buffer for next step (detached — no gradient through buffer)
+        self._emb_buffer = [p.detach() for p in projs]
+        self._label_buffer = labels.detach() if labels is not None else None
+
         loss = torch.tensor(0.0, device=features[0].device)
         n_pairs = 0
-        temperature = 0.07
 
-        for i in range(len(projs)):
-            for j in range(i + 1, len(projs)):
-                N = projs[i].shape[0]
-                if N < 2:
+        for i in range(len(augmented)):
+            for j in range(i + 1, len(augmented)):
+                N_aug = augmented[i].shape[0]
+                if N_aug < 2:
                     continue
-                sim = torch.matmul(projs[i], projs[j].T) / temperature  # (N, N)
-                labels = torch.arange(N, device=sim.device)
-                loss += (F.cross_entropy(sim, labels) + F.cross_entropy(sim.T, labels)) / 2
+                sim = torch.matmul(augmented[i], augmented[j].T) / tau  # (N_aug, N_aug)
+
+                if combined_labels is not None:
+                    # C9: SupCon — same-class pairs are positives
+                    # Eliminates false negatives (e.g. 57 per batch on Hateful Memes)
+                    same_class = (
+                        combined_labels.unsqueeze(0) == combined_labels.unsqueeze(1)
+                    )  # (N_aug, N_aug) bool
+                    eye = torch.eye(N_aug, dtype=torch.bool, device=sim.device)
+                    pos_mask = same_class | eye
+                    neg_mask = ~pos_mask
+
+                    # Log-sum-exp over negatives; normalise over positives
+                    # Guard: if a row has NO negatives, skip it
+                    has_neg = neg_mask.any(dim=1)
+                    if not has_neg.any():
+                        continue
+                    neg_logits = sim.masked_fill(pos_mask, -1e9)
+                    log_denom = torch.logsumexp(neg_logits, dim=1)  # (N_aug,)
+                    n_pos = pos_mask.sum(dim=1).clamp(min=1).float()
+                    pos_logits = (sim - log_denom.unsqueeze(1)) * pos_mask.float()
+                    row_loss = -(pos_logits.sum(dim=1) / n_pos)
+                    loss += row_loss[has_neg].mean()
+                else:
+                    # SigLIP-style sigmoid loss — immune to false negatives
+                    sig_labels = 2.0 * torch.eye(N_aug, device=sim.device) - 1.0
+                    loss += -F.logsigmoid(sig_labels * sim).mean()
+
                 n_pairs += 1
 
         return loss / max(1, n_pairs)
@@ -1209,7 +1357,7 @@ class UnifiedLatentFusion(nn.Module):
     def get_output_dim(self) -> int:
         return self.output_dim
 
-    def get_attention_summary(self) -> dict:
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
         return {"token_count": self._last_token_count, "latent_dim": self.latent_dim}
 
 
@@ -1285,19 +1433,22 @@ class FuseMoE(nn.Module):
         N = features[0].shape[0]
         device = features[0].device
 
-        # Build modality-presence vector from mask (or all-ones if no mask)
+        # Apply batch-level modality dropout (zeros out entire modality for the batch)
         if modality_mask is not None and modality_names is not None:
-            presence = torch.tensor(
-                [float(modality_mask.get(modality_names[i] if i < len(modality_names) else "", True))
-                 for i in range(len(features))],
-                device=device,
-            ).unsqueeze(0).expand(N, -1)           # (N, n_mods)
-            # Zero-fill absent modalities in the concatenated input
             features = apply_modality_mask(features, modality_names, modality_mask)
-        else:
-            presence = torch.ones(N, len(features), device=device)
 
         concat = torch.cat(features, dim=-1)        # (N, total_dim)
+
+        # Per-sample presence detection — the critical fix for real-world missing data.
+        # Batch-level modality_mask is blind to individual rows: if sample 3 has a
+        # zero image vector (sensor failure, upload timeout) but sample 5 does not,
+        # the batch mask says "image present" for everyone and routes sample 3 through
+        # the wrong expert. Instead, detect per-sample presence from the actual feature
+        # norms: a fully-zero vector means "this modality is missing for THIS sample".
+        presence = torch.stack(
+            [(feat.norm(dim=-1) > 1e-6).float() for feat in features],
+            dim=-1,
+        )  # (N, n_mods) — per-sample, not batch-level
 
         # Router: select top-k experts per sample
         router_logits = self.router(presence)                          # (N, n_experts)
@@ -1322,5 +1473,5 @@ class FuseMoE(nn.Module):
     def get_output_dim(self) -> int:
         return self.output_dim
 
-    def get_attention_summary(self) -> dict:
+    def get_attention_summary(self, modality_names: Optional[List[str]] = None) -> dict:
         return {"expert_routing": self._last_routing or [], "n_experts": self.n_experts}

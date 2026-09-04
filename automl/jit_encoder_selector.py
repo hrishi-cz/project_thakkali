@@ -93,6 +93,11 @@ class EncoderSpec:
     output_dim: int
     capacity: int
     dummy_input_fn: Callable
+    availability_check: Optional[Callable[[], bool]] = None
+    encoder_family: str = "generic"
+    # "clip"    — CLIP joint space (softmax NT-Xent pre-training)
+    # "siglip"  — SigLIP joint space (sigmoid per-pair pre-training)
+    # "generic" — standard backbone, no pre-aligned partner requirement
 
 
 @dataclass(frozen=True)
@@ -121,6 +126,108 @@ def _freeze_and_eval(module: nn.Module) -> nn.Module:
     for p in module.parameters():
         p.requires_grad = False
     return module
+
+
+# ── Availability checks (called once at registration time) ────────────────
+
+def _sentencepiece_available() -> bool:
+    try:
+        import sentencepiece  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _transformers_available() -> bool:
+    try:
+        import transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _tiktoken_available() -> bool:
+    """DeBERTa-v3 requires tiktoken at the transformer level (not just tokenizer).
+    Even with use_fast=False, the first forward pass triggers a tiktoken file read
+    in newer HuggingFace versions. Hard-exclude DeBERTa when tiktoken is absent."""
+    try:
+        import tiktoken  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _register_if_available(
+    registry_fn: Callable,
+    name: str,
+    factory: Callable[[], nn.Module],
+    output_dim: int,
+    capacity: int,
+    dummy_input_fn: Callable,
+    availability_check: Optional[Callable[[], bool]] = None,
+    encoder_family: str = "generic",
+) -> bool:
+    """Formal plugin contract: construct EncoderSpec and append to a registry.
+
+    Returns True on success. When availability_check is provided and returns
+    False (or raises), logs INFO and returns False — never raises.
+
+    Adding a future encoder (Qwen-VL, LLaVA, Flamingo, SigLIP):
+        _register_if_available(
+            VISION_REGISTRY.append,
+            name="SigLIP-ViT-L/14",
+            factory=_make_siglip_vitl14,
+            output_dim=1024, capacity=307_000_000,
+            dummy_input_fn=_dummy_image,
+            availability_check=_transformers_available,
+        )
+    """
+    if availability_check is not None:
+        try:
+            if not availability_check():
+                logger.info("JIT: %s skipped (availability_check=False)", name)
+                return False
+        except Exception as exc:
+            logger.info("JIT: %s skipped (%s)", name, exc)
+            return False
+    spec = EncoderSpec(
+        name=name, factory=factory, output_dim=output_dim,
+        capacity=capacity, dummy_input_fn=dummy_input_fn,
+        availability_check=availability_check,
+        encoder_family=encoder_family,
+    )
+    registry_fn(spec)
+    return True
+
+
+def _safe_register_vision(spec: "EncoderSpec") -> None:
+    """Register a pre-constructed EncoderSpec into VISION_REGISTRY.
+
+    Respects spec.availability_check when set. Kept for backward compatibility
+    with external plugin authors who construct EncoderSpec directly.
+    """
+    _register_if_available(
+        VISION_REGISTRY.append,
+        name=spec.name, factory=spec.factory,
+        output_dim=spec.output_dim, capacity=spec.capacity,
+        dummy_input_fn=spec.dummy_input_fn,
+        availability_check=spec.availability_check,
+    )
+
+
+def _safe_register_text(spec: "EncoderSpec") -> None:
+    """Register a pre-constructed EncoderSpec into TEXT_REGISTRY.
+
+    Respects spec.availability_check when set. Kept for backward compatibility
+    with external plugin authors who construct EncoderSpec directly.
+    """
+    _register_if_available(
+        TEXT_REGISTRY.append,
+        name=spec.name, factory=spec.factory,
+        output_dim=spec.output_dim, capacity=spec.capacity,
+        dummy_input_fn=spec.dummy_input_fn,
+        availability_check=spec.availability_check,
+    )
 
 
 # ── Vision encoder factories ──────────────────────────────────────────────
@@ -298,9 +405,13 @@ def _dummy_image(batch_size: int, device: torch.device) -> torch.Tensor:
     return torch.randn(batch_size, 3, 224, 224, device=device)
 
 
-def _dummy_text(batch_size: int, device: torch.device) -> list:
-    """List of N dummy text strings (TextEncoder.forward accepts strings)."""
-    return ["dummy text input for profiling"] * batch_size
+def _dummy_text(batch_size: int, device: torch.device) -> dict:
+    """Pre-tokenized dummy inputs — bypasses model-specific tokenizer deps during JIT profiling."""
+    seq_len = 32
+    return {
+        "input_ids": torch.zeros(batch_size, seq_len, dtype=torch.long, device=device),
+        "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long, device=device),
+    }
 
 
 # ── Registry construction ─────────────────────────────────────────────────
@@ -356,26 +467,39 @@ def _make_dinov2_vitb14() -> nn.Module:
     from modelss.encoders.image import ViTImageEncoder
     return ViTImageEncoder("facebook/dinov2-base", freeze_backbone=True)
 
-try:
-    # Register ViT encoders only if transformers is importable
-    import transformers as _tf_check  # noqa: F401
-    VISION_REGISTRY.append(EncoderSpec(
-        name="CLIP-ViT-B/16",
-        factory=_make_clip_vit_b16,
-        output_dim=768,
-        capacity=86_000_000,
-        dummy_input_fn=_dummy_image,
-    ))
-    VISION_REGISTRY.append(EncoderSpec(
-        name="DINOv2-ViT-B/14",
-        factory=_make_dinov2_vitb14,
-        output_dim=768,
-        capacity=86_000_000,
-        dummy_input_fn=_dummy_image,
-    ))
-    logger.info("JIT registry: CLIP-ViT-B/16 and DINOv2-ViT-B/14 added")
-except ImportError:
-    logger.debug("JIT registry: transformers not installed — ViT encoders unavailable")
+_register_if_available(
+    VISION_REGISTRY.append,
+    name="CLIP-ViT-B/16",
+    factory=_make_clip_vit_b16,
+    output_dim=768, capacity=86_000_000,
+    dummy_input_fn=_dummy_image,
+    encoder_family="clip",
+)
+_register_if_available(
+    VISION_REGISTRY.append,
+    name="DINOv2-ViT-B/14",
+    factory=_make_dinov2_vitb14,
+    output_dim=768, capacity=86_000_000,
+    dummy_input_fn=_dummy_image,
+)
+
+
+def _make_siglip_b16() -> nn.Module:
+    """SigLIP-B/16 — 86M params, 768-dim, sigmoid-loss pre-training.
+    Better than CLIP at small batch sizes (no false-negative softmax normalisation)."""
+    from modelss.encoders.image import SigLIPEncoder
+    return SigLIPEncoder("google/siglip-base-patch16-224", freeze_backbone=True)
+
+
+_register_if_available(
+    VISION_REGISTRY.append,
+    name="SigLIP-B/16",
+    factory=_make_siglip_b16,
+    output_dim=768, capacity=86_000_000,
+    dummy_input_fn=_dummy_image,
+    encoder_family="siglip",
+    availability_check=_transformers_available,
+)
 
 TEXT_REGISTRY: List[EncoderSpec] = [
     EncoderSpec(
@@ -399,14 +523,50 @@ TEXT_REGISTRY: List[EncoderSpec] = [
         capacity=109_500_000,     # ~109.5M params
         dummy_input_fn=_dummy_text,
     ),
-    EncoderSpec(
-        name="DeBERTa-v3-base",
-        factory=_make_deberta,
-        output_dim=768,
-        capacity=183_800_000,     # ~183.8M params
-        dummy_input_fn=_dummy_text,
-    ),
 ]
+
+_register_if_available(
+    TEXT_REGISTRY.append,
+    name="DeBERTa-v3-base",
+    factory=_make_deberta,
+    output_dim=768, capacity=183_800_000,
+    dummy_input_fn=_dummy_text,
+    availability_check=_tiktoken_available,  # hard dep: forward pass needs tiktoken
+)
+
+
+def _make_clip_text_b16() -> nn.Module:
+    """CLIP text encoder — 63M params, 512-dim, 77-token BPE limit.
+    Family: 'clip' — pair only with CLIP-ViT-B/16."""
+    from modelss.encoders.text import CLIPTextEncoder
+    return CLIPTextEncoder("openai/clip-vit-base-patch16", freeze_backbone=True)
+
+
+def _make_siglip_text_b16() -> nn.Module:
+    """SigLIP text encoder — ~43M params, 768-dim, 64-token limit.
+    Family: 'siglip' — pair only with SigLIP-B/16."""
+    from modelss.encoders.text import SigLIPTextEncoder
+    return SigLIPTextEncoder("google/siglip-base-patch16-224", freeze_backbone=True)
+
+
+_register_if_available(
+    TEXT_REGISTRY.append,
+    name="CLIP-Text-ViT-B/16",
+    factory=_make_clip_text_b16,
+    output_dim=512, capacity=63_000_000,
+    dummy_input_fn=_dummy_text,
+    encoder_family="clip",
+    availability_check=_transformers_available,
+)
+_register_if_available(
+    TEXT_REGISTRY.append,
+    name="SigLIP-Text-B/16",
+    factory=_make_siglip_text_b16,
+    output_dim=768, capacity=43_000_000,
+    dummy_input_fn=_dummy_text,
+    encoder_family="siglip",
+    availability_check=_transformers_available,
+)
 
 # Sorted descending by capacity for the constrained optimizer
 VISION_REGISTRY.sort(key=lambda s: s.capacity, reverse=True)
@@ -659,6 +819,8 @@ class JITSelectionResult:
     text_encoder: Optional[nn.Module] = None
     image_encoder_name: Optional[str] = None
     text_encoder_name: Optional[str] = None
+    image_output_dim: int = 0
+    text_output_dim: int = 0
     tabular_encoder_name: Optional[str] = None
     tabular_encoder_class: Optional[type] = None
     tabular_encoder_output_dim: int = 16
@@ -668,6 +830,8 @@ class JITSelectionResult:
     vram_budget_bytes: int = 0          # η · V_avail
     selection_method: str = "jit_profiler"
     rationale: Dict[str, str] = field(default_factory=dict)
+    image_encoder_family: str = "generic"
+    text_encoder_family: str = "generic"
 
 
 class JITEncoderSelector:
@@ -813,11 +977,11 @@ class JITEncoderSelector:
 
         # ── CPU SAFEGUARD ─────────────────────────────────────────────
         if not torch.cuda.is_available():
-            logger.info(
-                "JITEncoderSelector: CUDA unavailable -- selecting "
-                "lightest encoders without profiling."
+            logger.warning(
+                "JITEncoderSelector: CUDA unavailable — lightweight encoders on CPU. "
+                "Set APEX_REQUIRE_GPU=1 to error instead of falling back."
             )
-            return self._cpu_fallback(need_image, need_text, _tab_spec)
+            return self._cpu_fallback(need_image, need_text, _tab_spec, device=None)
 
         if device is None:
             device = torch.device("cuda:0")
@@ -859,13 +1023,15 @@ class JITEncoderSelector:
                 best.tabular_encoder_output_dim = _tab_spec.output_dim
             return best
 
-        # ── All combinations exceeded budget — absolute fallback ──────
+        # ── All combinations exceeded budget — lightweight fallback ──────
+        # GPU exists but full encoders don't fit. Run lightest encoders ON the
+        # GPU rather than falling back to CPU — still ~10× faster than CPU.
         logger.warning(
-            "JITEncoderSelector: no feasible combination found within "
-            "VRAM budget (%.2f GB).  Falling back to lightest encoders.",
-            budget_bytes / 1e9,
+            "JITEncoderSelector: no feasible combination within "
+            "VRAM budget (%.2f GB) — using lightest encoders on device=%s.",
+            budget_bytes / 1e9, device,
         )
-        return self._cpu_fallback(need_image, need_text, _tab_spec)
+        return self._cpu_fallback(need_image, need_text, _tab_spec, device=device)
 
     # ------------------------------------------------------------------ #
     #  Constrained search
@@ -893,6 +1059,17 @@ class JITEncoderSelector:
         if vision_candidates and text_candidates:
             for v in vision_candidates:
                 for t in text_candidates:
+                    # Homogeneous pairing constraint: CLIP must pair with CLIP text,
+                    # SigLIP must pair with SigLIP text. Mixing latent families
+                    # causes alignment loss to start at maximum distance.
+                    v_fam = getattr(v, "encoder_family", "generic")
+                    t_fam = getattr(t, "encoder_family", "generic")
+                    if (v_fam != "generic" and t_fam != "generic" and v_fam != t_fam):
+                        logger.debug(
+                            "JIT: skipping cross-family pair (%s=%s, %s=%s)",
+                            v.name, v_fam, t.name, t_fam,
+                        )
+                        continue
                     combos.append((v, t, v.capacity + t.capacity))
         # Case: vision only
         elif vision_candidates:
@@ -912,16 +1089,37 @@ class JITEncoderSelector:
         combos.sort(key=lambda c: c[2], reverse=True)
 
         # ── Profile each combination until one fits ───────────────────
+        # Track individual encoders that have already failed so we can skip any
+        # subsequent combination that uses them without redundant weight loads.
+        _failed_image_names: set = set()
+        _failed_text_names:  set = set()
+
         for v_spec, t_spec, total_cap in combos:
             combo_name = (
                 f"[{v_spec.name if v_spec else '-'} + "
                 f"{t_spec.name if t_spec else '-'}]"
             )
+
+            # Skip immediately if either encoder already failed a previous profile
+            if v_spec and v_spec.name in _failed_image_names:
+                logger.info(
+                    "  -- Skipping %s: image encoder %s failed earlier",
+                    combo_name, v_spec.name,
+                )
+                continue
+            if t_spec and t_spec.name in _failed_text_names:
+                logger.info(
+                    "  -- Skipping %s: text encoder %s failed earlier",
+                    combo_name, t_spec.name,
+                )
+                continue
+
             logger.info("  Profiling %s (capacity=%d) ...", combo_name, total_cap)
 
             total_peak = 0
             img_enc = None
             txt_enc = None
+            _img_done = False   # True once image encoder profiled successfully
 
             try:
                 # Profile vision encoder
@@ -934,6 +1132,7 @@ class JITEncoderSelector:
                         "    %s peak: %.2f MB",
                         v_spec.name, v_peak / 1e6,
                     )
+                _img_done = True  # image succeeded (or no image spec)
 
                 # Profile text encoder
                 if t_spec is not None:
@@ -978,10 +1177,18 @@ class JITEncoderSelector:
                         text_encoder=txt_enc,
                         image_encoder_name=v_spec.name if v_spec else None,
                         text_encoder_name=t_spec.name if t_spec else None,
+                        image_output_dim=int(
+                            getattr(img_enc, "get_output_dim", lambda: v_spec.output_dim)()
+                        ) if v_spec and img_enc is not None else 0,
+                        text_output_dim=int(
+                            getattr(txt_enc, "get_output_dim", lambda: t_spec.output_dim)()
+                        ) if t_spec and txt_enc is not None else 0,
                         total_capacity=total_cap,
                         total_peak_memory_bytes=total_peak,
                         selection_method="jit_profiler",
                         rationale=rationale,
+                        image_encoder_family=v_spec.encoder_family if v_spec else "generic",
+                        text_encoder_family=t_spec.encoder_family if t_spec else "generic",
                     )
 
                 else:
@@ -995,7 +1202,27 @@ class JITEncoderSelector:
                     img_enc = None
                     txt_enc = None
 
+            except ImportError as exc:
+                # Optional dependency missing — record which encoder caused it
+                # so we can skip all subsequent combinations using that encoder.
+                if not _img_done and v_spec:
+                    _failed_image_names.add(v_spec.name)
+                elif _img_done and t_spec:
+                    _failed_text_names.add(t_spec.name)
+                logger.info(
+                    "  -- Skipping %s: optional dependency not installed (%s)",
+                    combo_name, exc,
+                )
+                self._cleanup_encoder(img_enc)
+                self._cleanup_encoder(txt_enc)
+                img_enc = None
+                txt_enc = None
             except Exception as exc:
+                # Record failing encoder for skip-ahead on remaining combos
+                if not _img_done and v_spec:
+                    _failed_image_names.add(v_spec.name)
+                elif _img_done and t_spec:
+                    _failed_text_names.add(t_spec.name)
                 logger.warning(
                     "  xx Profiling failed for %s: %s", combo_name, exc,
                 )
@@ -1016,41 +1243,66 @@ class JITEncoderSelector:
         need_image: bool,
         need_text: bool,
         tab_spec: Optional[TabularEncoderSpec] = None,
+        device: Optional[Any] = None,
     ) -> JITSelectionResult:
         """
-        Instantiate the lightest encoder per modality without any VRAM
-        probing.  Used on CPU-only systems or when the constrained search
-        finds no feasible GPU combination.
+        Instantiate the lightest encoder per modality without VRAM probing.
+        Used on CPU-only systems or when the constrained search finds no
+        feasible GPU combination.
+
+        When ``device`` is provided and points to a CUDA device, encoders are
+        moved there so training runs on GPU even with lightweight models.
         """
         img_enc = None
         txt_enc = None
         img_name = None
         txt_name = None
+        img_output_dim = 0
+        txt_output_dim = 0
         total_cap = 0
         rationale: Dict[str, str] = {}
 
+        lightest_img: Optional[Any] = None
+        lightest_txt: Optional[Any] = None
+
         if need_image:
             # Lightest = last in descending-sorted list
-            lightest = VISION_REGISTRY[-1]
-            img_enc = lightest.factory()
-            img_name = lightest.name
-            total_cap += lightest.capacity
-            rationale["image_encoder"] = (
-                f"CPU fallback: {lightest.name} "
-                f"(lightest, capacity={lightest.capacity:,})"
+            lightest_img = VISION_REGISTRY[-1]
+            img_enc = lightest_img.factory()
+            img_name = lightest_img.name
+            img_output_dim = int(
+                getattr(img_enc, "get_output_dim", lambda: lightest_img.output_dim)()
             )
-            logger.info("  CPU fallback image: %s", lightest.name)
+            total_cap += lightest_img.capacity
+            rationale["image_encoder"] = (
+                f"lightweight fallback: {lightest_img.name} "
+                f"(capacity={lightest_img.capacity:,})"
+            )
+            logger.info("  Lightweight fallback image: %s", lightest_img.name)
 
         if need_text:
-            lightest = TEXT_REGISTRY[-1]
-            txt_enc = lightest.factory()
-            txt_name = lightest.name
-            total_cap += lightest.capacity
-            rationale["text_encoder"] = (
-                f"CPU fallback: {lightest.name} "
-                f"(lightest, capacity={lightest.capacity:,})"
+            lightest_txt = TEXT_REGISTRY[-1]
+            txt_enc = lightest_txt.factory()
+            txt_name = lightest_txt.name
+            txt_output_dim = int(
+                getattr(txt_enc, "get_output_dim", lambda: lightest_txt.output_dim)()
             )
-            logger.info("  CPU fallback text: %s", lightest.name)
+            total_cap += lightest_txt.capacity
+            rationale["text_encoder"] = (
+                f"lightweight fallback: {lightest_txt.name} "
+                f"(capacity={lightest_txt.capacity:,})"
+            )
+            logger.info("  Lightweight fallback text: %s", lightest_txt.name)
+
+        # Move encoders to the requested device even for the lightweight path.
+        # When VRAM was exceeded but a GPU exists, running the smallest encoders
+        # on GPU is still ~10× faster than CPU.
+        if device is not None:
+            if img_enc is not None:
+                img_enc.to(device)
+            if txt_enc is not None:
+                txt_enc.to(device)
+            logger.info("  Lightweight encoders moved to device=%s", device)
 
         # Tabular: only set if tab_spec was provided (meaning tabular modality
         # was requested). Don't unconditionally fallback to a tabular encoder
@@ -1064,12 +1316,16 @@ class JITEncoderSelector:
             text_encoder=txt_enc,
             image_encoder_name=img_name,
             text_encoder_name=txt_name,
+            image_output_dim=img_output_dim,
+            text_output_dim=txt_output_dim,
             tabular_encoder_name=tab_name,
             tabular_encoder_class=tab_class,
             tabular_encoder_output_dim=tab_out_dim,
             total_capacity=total_cap,
             selection_method="cpu_fallback",
             rationale=rationale,
+            image_encoder_family=getattr(lightest_img, "encoder_family", "generic"),
+            text_encoder_family=getattr(lightest_txt, "encoder_family", "generic"),
         )
 
     # ------------------------------------------------------------------ #

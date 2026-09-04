@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import pandas as pd
 import logging
-from typing import Dict, Any, Optional, TYPE_CHECKING
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from datetime import datetime, timezone
 
 if TYPE_CHECKING:
@@ -275,7 +275,7 @@ class XAIExplainer:
 
         # Fusion Importance
         try:
-            artifacts["fusion"] = self._explain_fusion_batch()
+            artifacts["fusion"] = self._explain_fusion_batch(batch)
             logger.info("  ✓ Fusion importance extracted")
         except Exception as e:
             logger.warning(f"  Fusion XAI failed: {e}")
@@ -293,14 +293,16 @@ class XAIExplainer:
         return artifacts
 
     def _explain_tabular_batch(self, X: np.ndarray) -> Dict[str, Any]:
-        """Return lightweight tabular feature-importance proxy for training artifacts."""
+        """Estimate tabular feature importance by encoder permutation sensitivity."""
         try:
             # Get tabular encoder
             tabular_enc = getattr(self.model, "tabular_encoder", None)
+            if tabular_enc is None and hasattr(self.model, "model"):
+                tabular_enc = getattr(self.model.model, "tabular_encoder", None)
             if tabular_enc is None:
                 return {
                     "type": "feature_importance",
-                    "method": "dummy",
+                    "method": "unavailable",
                     "feature_importances": [],
                     "error": "No tabular encoder",
                 }
@@ -308,33 +310,64 @@ class XAIExplainer:
             if X.ndim != 2 or X.shape[1] == 0:
                 return {
                     "type": "feature_importance",
-                    "method": "dummy",
+                    "method": "unavailable",
                     "feature_importances": [],
                     "error": "Tabular batch must be 2-D with at least one feature",
                 }
 
-            # Use a deterministic proxy (feature std-dev) to avoid returning
-            # fake equal SHAP weights during training-time snapshots.
             X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-            proxy = np.std(X_clean, axis=0)
-            proxy = np.maximum(proxy, 0.0)
-            total = float(np.sum(proxy))
-            if total <= 0.0:
-                proxy = np.ones(X_clean.shape[1], dtype=np.float64)
-                total = float(np.sum(proxy))
-            normalized = (proxy / total).tolist()
+            X_t = torch.as_tensor(X_clean, dtype=torch.float32, device=self.device)
+
+            was_training = bool(getattr(tabular_enc, "training", False))
+            tabular_enc.eval()
+            try:
+                with torch.no_grad():
+                    baseline_emb = tabular_enc(X_t)
+                    if isinstance(baseline_emb, tuple):
+                        baseline_emb = baseline_emb[0]
+                    baseline_score = float(baseline_emb.norm(dim=-1).mean())
+
+                    # Batched permutation: all columns permuted in parallel.
+                    # Replaces O(n_features) sequential passes with 1 batched pass.
+                    n_samples, n_features = X_clean.shape
+                    rng = np.random.default_rng(42)
+                    X_stacked = np.tile(X_clean, (n_features, 1))  # (n_feat*n_samp, n_feat)
+                    for col in range(n_features):
+                        s, e = col * n_samples, (col + 1) * n_samples
+                        X_stacked[s:e, col] = rng.permutation(X_stacked[s:e, col])
+
+                    X_batch_t = torch.as_tensor(X_stacked, dtype=torch.float32, device=self.device)
+                    _chunk = 512
+                    _norms: List[torch.Tensor] = []
+                    for _i in range(0, X_batch_t.shape[0], _chunk):
+                        _emb = tabular_enc(X_batch_t[_i:_i + _chunk])
+                        if isinstance(_emb, tuple):
+                            _emb = _emb[0]
+                        _norms.append(_emb.norm(dim=-1))
+                    _perm_norms = torch.cat(_norms).view(n_features, n_samples).mean(dim=1)
+                    importances = (
+                        baseline_score - _perm_norms.cpu().numpy()
+                    ).clip(min=0.0).tolist()
+            finally:
+                if was_training:
+                    tabular_enc.train()
+
+            total = float(sum(importances))
+            normalized = (
+                [float(v / total) for v in importances]
+                if total > 0.0
+                else [0.0 for _ in importances]
+            )
 
             return {
                 "type": "feature_importance",
-                "method": "variance_proxy",
-                "proxy_method": "variance_proxy",
+                "method": "permutation_importance",
                 "feature_importance": normalized,
                 "feature_importances": normalized,
                 "n_features": int(X_clean.shape[1]),
                 "info": (
-                    "Training-time proxy: feature importance estimated by column variance "
-                    "on the final training batch. Run XAIEngine.explain_tabular() for "
-                    "real DeepExplainer SHAP attributions."
+                    "Batched permutation importance: all features permuted in parallel, "
+                    "single forward pass. ~n_features× faster than sequential."
                 ),
             }
         except Exception as e:
@@ -368,8 +401,93 @@ class XAIExplainer:
                 img_tensor = torch.as_tensor(img_tensor, dtype=torch.float32)
 
             img_tensor = img_tensor.to(self.device)
+
+            # ── Dispatch: AttentionRollout for ViT, GradCAM for CNN ─────────
+            # ViT encoders (SigLIP, CLIP-ViT, DINOv2) return per-layer attention
+            # weights when called with output_attentions=True.
+            # Rollout: Abnar & Zuidema 2020 (ACL Findings) — recursively
+            # multiplies augmented attention matrices across all layers:
+            #   A_aug[l] = 0.5*I + 0.5*mean_heads(attn[l])
+            #   rollout  = A_aug[L-1] @ ... @ A_aug[0]  →  CLS row = patch scores
+            _is_vit = False
+            _rollout_result: Optional[Dict[str, Any]] = None
+            try:
+                import inspect as _insp
+                _sig = _insp.signature(image_enc.forward)
+                if "return_all_tokens" in _sig.parameters or "output_attentions" in _sig.parameters:
+                    _is_vit = True
+            except Exception:
+                pass
+
+            if not _is_vit:
+                # Check for transformer blocks (no Conv2d dominant path)
+                _has_conv = any(isinstance(m, torch.nn.Conv2d) for m in image_enc.modules())
+                _has_transformer = any(
+                    "TransformerEncoder" in type(m).__name__ or "Attention" in type(m).__name__
+                    for m in image_enc.modules()
+                )
+                if _has_transformer and not _has_conv:
+                    _is_vit = True
+
+            if _is_vit:
+                try:
+                    # Run encoder with output_attentions=True (HuggingFace API)
+                    img_in = img_tensor.unsqueeze(0) if img_tensor.ndim == 3 else img_tensor
+                    with torch.no_grad():
+                        # Try HuggingFace style: model returns BaseModelOutput with attentions
+                        _inner = None
+                        for _attr in ("transformer", "model", "vision_model"):
+                            _inner = getattr(image_enc, _attr, None)
+                            if _inner is not None:
+                                break
+                        if _inner is None:
+                            _inner = image_enc
+                        _out = _inner(img_in, output_attentions=True, return_dict=True)
+                        _attentions = _out.get("attentions") if hasattr(_out, "get") else getattr(_out, "attentions", None)
+
+                    if _attentions and len(_attentions) > 0:
+                        # Rollout: Abnar & Zuidema 2020
+                        B = _attentions[0].shape[0]
+                        T = _attentions[0].shape[-1]   # sequence length
+                        rollout = torch.eye(T, device="cpu")
+                        for attn_layer in _attentions:
+                            # attn_layer: [B, n_heads, T, T]
+                            heads_mean = attn_layer[0].mean(dim=0).cpu()  # [T, T]
+                            aug = 0.5 * torch.eye(T) + 0.5 * heads_mean
+                            aug = aug / aug.sum(dim=-1, keepdim=True)     # row-normalize
+                            rollout = aug @ rollout
+
+                        # CLS token at index 0; patch tokens at 1..T-1
+                        cls_row = rollout[0, 1:]    # [P] patch attention from CLS
+                        patch_scores = cls_row.numpy()
+                        patch_scores = (patch_scores - patch_scores.min()) / (patch_scores.max() - patch_scores.min() + 1e-8)
+
+                        n_patches = len(patch_scores)
+                        grid_size = int(n_patches ** 0.5)
+
+                        _rollout_result = {
+                            "type": "attention_rollout",
+                            "method": "attention_rollout",
+                            "n_layers": len(_attentions),
+                            "n_patches": n_patches,
+                            "grid_size": grid_size,
+                            "patch_scores": patch_scores.tolist(),
+                            "heatmap_shape": [grid_size, grid_size] if grid_size * grid_size == n_patches else [n_patches],
+                            "heatmap_mean": float(patch_scores.mean()),
+                            "heatmap_max": float(patch_scores.max()),
+                            "info": "Attention Rollout (Abnar & Zuidema 2020): A_aug[l]=0.5I+0.5mean_heads(A[l]), rollout=product of A_aug",
+                        }
+                except Exception as _rollout_exc:
+                    # ViT detected but rollout failed — fall through to GradCAM
+                    _is_vit = False
+                    logger.debug("AttentionRollout failed (%s), falling back to GradCAM", _rollout_exc)
+
+            if _rollout_result is not None:
+                return _rollout_result
+
             img_tensor.requires_grad = True
 
+            # ── GradCAM for CNN encoders ─────────────────────────────────────
             # Find last Conv2d for CAM hook
             last_conv: Optional[torch.nn.Module] = None
             activations: list = []
@@ -560,6 +678,8 @@ class XAIExplainer:
             with torch.no_grad():
                 try:
                     outputs = text_enc(text_tensor, output_attentions=True)
+                    if isinstance(outputs, torch.Tensor):
+                        raise AttributeError("TextEncoder returned tensor, not HF output")
                     if hasattr(outputs, "attentions") and outputs.attentions:
                         attn = outputs.attentions[-1]   # (N, heads, seq, seq)
                         # CLS-row attention: how much each token attends to CLS
@@ -573,8 +693,10 @@ class XAIExplainer:
                             "seq_len": int(text_tensor.shape[1]),
                             "attention_shape": list(attn[0].shape),
                         }
-                except Exception:
+                except (AttributeError, TypeError):
                     pass
+                except Exception as attn_exc:
+                    logger.debug("Attention text attribution failed: %s", attn_exc)
 
             return {
                 "type": "attention",
@@ -655,7 +777,7 @@ class XAIExplainer:
         total = sum(contributions.values()) or 1.0
         return {k: round(v / total, 4) for k, v in contributions.items()}
 
-    def _explain_fusion_batch(self) -> Dict[str, Any]:
+    def _explain_fusion_batch(self, batch: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Extract fusion importance (weights)."""
         try:
             # Try to access fusion module
@@ -669,19 +791,14 @@ class XAIExplainer:
                     return {m: 1.0 / len(self.modalities) for m in self.modalities}
                 return {k: v / total for k, v in positive.items()}
 
-            if fusion is None:
-                # Default: equal weights for all modalities
-                weights = {m: 1.0 / len(self.modalities) for m in self.modalities}
-                return {
-                    "type": "fusion",
-                    "method": "dummy",
-                    "weights": weights,
-                    "strategy": "equal",
-                }
-
             # Preferred path: consume model-provided attention summary.
-            if hasattr(fusion, "get_attention_summary"):
-                summary = fusion.get_attention_summary() or {}
+            if fusion is not None and hasattr(fusion, "get_attention_summary"):
+                try:
+                    summary = fusion.get_attention_summary(
+                        modality_names=self.modalities,
+                    ) or {}
+                except TypeError:
+                    summary = fusion.get_attention_summary() or {}
                 raw = summary.get("modality_importance") if isinstance(summary, dict) else {}
                 if isinstance(raw, dict) and raw:
                     mapped: Dict[str, float] = {}
@@ -696,7 +813,7 @@ class XAIExplainer:
                     }
 
             # GraphFusion fallback: use adjacency diagonal as self-importance.
-            if hasattr(fusion, "graph"):
+            if fusion is not None and hasattr(fusion, "graph"):
                 diag_weights: Dict[str, float] = {}
                 try:
                     adj = fusion.graph()
@@ -717,13 +834,31 @@ class XAIExplainer:
                     "strategy": "graph_attention",
                 }
 
-            # Default
+            # Final real-signal fallback: modality ablation attribution.
+            if batch is not None and len(self.modalities) > 1:
+                try:
+                    ablation = self.modality_ablation_attribution(batch)
+                    if ablation and any(float(v) > 0.0 for v in ablation.values()):
+                        return {
+                            "type": "fusion",
+                            "method": "ablation_attribution",
+                            "weights": ablation,
+                            "strategy": "ablation_derived",
+                            "info": (
+                                "Importance estimated by confidence drop when "
+                                "each modality is zeroed."
+                            ),
+                        }
+                except Exception as _e:
+                    logger.debug("Ablation fusion fallback failed: %s", _e)
+
+            # Last resort: equal weights, labelled as such.
             weights = {m: 1.0 / len(self.modalities) for m in self.modalities}
             return {
                 "type": "fusion",
-                "method": "dummy",
+                "method": "equal_weight_fallback",
                 "weights": weights,
-                "strategy": "unknown",
+                "strategy": "equal",
             }
         except Exception as e:
             logger.warning(f"Fusion importance extraction failed: {e}")

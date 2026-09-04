@@ -33,27 +33,51 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = 10
 
+# Tiered TTL constants (seconds)
+_TTL_STATIC = 120   # config, cache metadata, ablation results — never change mid-run
+_TTL_SLOW   = 30    # schema, target, intelligence, retrain history — between-phase updates
+_TTL_FAST   = 10    # phase timings, fit analysis, drift, decision trace — mid-training
 
-def _safe_get(url: str, label: str = "data") -> Optional[Dict]:
-    """GET with error handling, returns None on failure.
 
-    404 and 422 are treated as silent "not ready yet" states — no warning shown.
-    Warnings are reserved for genuine server errors (5xx) and connection failures.
-    """
+@st.cache_data(ttl=_TTL_STATIC, show_spinner=False)
+def _get_static(url: str) -> Optional[Dict]:
     try:
         r = requests.get(url, timeout=_TIMEOUT)
-        if r.status_code == 200:
-            return r.json()
-        elif r.status_code in (404, 422):
-            # Expected pre-ingestion / pre-pipeline states — return None silently
-            return None
-        else:
-            st.warning(f"Could not load {label} ({r.status_code})")
-    except requests.exceptions.ConnectionError:
-        st.warning(f"API unavailable for {label}")
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=_TTL_SLOW, show_spinner=False)
+def _get_slow(url: str) -> Optional[Dict]:
+    try:
+        r = requests.get(url, timeout=_TIMEOUT)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=_TTL_FAST, show_spinner=False)
+def _get_fast(url: str) -> Optional[Dict]:
+    try:
+        r = requests.get(url, timeout=_TIMEOUT)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def _safe_get(url: str, label: str = "data", ttl: str = "slow") -> Optional[Dict]:
+    """GET with tiered TTL caching.
+
+    ttl: "static" (120s), "slow" (30s, default), "fast" (10s)
+    404/422 and connection errors return None silently.
+    """
+    _fn = {"static": _get_static, "slow": _get_slow, "fast": _get_fast}.get(ttl, _get_slow)
+    try:
+        return _fn(url)
     except Exception as e:
         st.warning(f"Error loading {label}: {e}")
-    return None
+        return None
 
 
 def _safe_post(url: str, json_body: Dict, label: str = "action") -> Optional[Dict]:
@@ -77,7 +101,7 @@ def _safe_post(url: str, json_body: Dict, label: str = "action") -> Optional[Dic
 def render_decision_trace(sid: str) -> None:
     """Render the full decision trace with CSV download."""
     with st.expander("📋 Decision Audit Log", expanded=False):
-        data = _safe_get(ep.decision_trace(sid), "decision trace")
+        data = _safe_get(ep.decision_trace(sid), "decision trace", ttl="fast")
         if not data:
             st.info("No decision trace available yet. Run the pipeline to generate decisions.")
             return
@@ -109,7 +133,7 @@ def render_decision_trace(sid: str) -> None:
 def render_phase_timings(sid: str) -> None:
     """Render pipeline phase timing breakdown."""
     with st.expander("⏱️ Phase Timings", expanded=False):
-        data = _safe_get(ep.context_phase_timings(sid), "phase timings")
+        data = _safe_get(ep.context_phase_timings(sid), "phase timings", ttl="fast")
         if not data:
             st.info("No phase timing data available yet.")
             return
@@ -136,7 +160,7 @@ def render_phase_timings(sid: str) -> None:
 def render_fit_analysis(sid: str) -> None:
     """Render training fit analysis (overfitting/underfitting diagnostics)."""
     with st.expander("📈 Fit Analysis", expanded=False):
-        data = _safe_get(ep.context_fit_analysis(sid), "fit analysis")
+        data = _safe_get(ep.context_fit_analysis(sid), "fit analysis", ttl="fast")
         if not data:
             st.info("No fit analysis available. Complete training first.")
             return
@@ -282,21 +306,21 @@ def render_cache_management() -> None:
     with st.expander("💾 Cache Management", expanded=False):
         # MISMATCH-2 FIX: /embedding-cache/stats has the correct keys;
         # /cache/stats is the preprocessor artifact cache with different keys.
-        emb_data = _safe_get(ep.EMBEDDING_CACHE_STATS, "embedding cache stats")
+        emb_data = _safe_get(ep.EMBEDDING_CACHE_STATS, "embedding cache stats", ttl="static")
         if emb_data:
             col1, col2, col3 = st.columns(3)
             col1.metric("Cache Files", emb_data.get("cache_file_count", emb_data.get("total_files", "?")))
             col2.metric("Cache Size (MB)", emb_data.get("cache_size_mb", emb_data.get("total_size_mb", "?")))
             col3.metric("Latest Model", str(emb_data.get("latest_model_id", "—"))[:30])
 
-        pp_data = _safe_get(ep.CACHE_STATS, "preprocessor cache")
+        pp_data = _safe_get(ep.CACHE_STATS, "preprocessor cache", ttl="static")
         if pp_data and isinstance(pp_data, dict):
             st.caption(
                 f"Preprocessor cache — files: {pp_data.get('total_files', '?')} "
                 f"| size: {pp_data.get('total_size_mb', '?')} MB"
             )
 
-        meta = _safe_get(ep.CACHE_METADATA, "cache metadata")
+        meta = _safe_get(ep.CACHE_METADATA, "cache metadata", ttl="static")
         if meta and isinstance(meta, dict):
             with st.expander("Cache Metadata", expanded=False):
                 st.json(meta)
@@ -315,7 +339,7 @@ def render_ablation_runner() -> None:
     """UI to trigger and view ablation experiments."""
     with st.expander("🧪 Ablation Studies", expanded=False):
         # View existing results
-        data = _safe_get(ep.ABLATION_RESULTS, "ablation results")
+        data = _safe_get(ep.ABLATION_RESULTS, "ablation results", ttl="static")
         if data:
             results = data.get("results", data)
             if isinstance(results, list):
@@ -575,7 +599,7 @@ def render_global_target(sid: str) -> None:
 def render_config() -> None:
     """Show current API server configuration."""
     with st.expander("⚙️ Server Configuration", expanded=False):
-        data = _safe_get(ep.CONFIG, "config")
+        data = _safe_get(ep.CONFIG, "config", ttl="static")
         if data:
             for key, val in data.items():
                 st.write(f"- **{key}:** `{val}`")

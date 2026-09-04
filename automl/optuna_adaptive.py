@@ -18,6 +18,7 @@ class AdaptiveOptunaController:
         dataset_size: int,
         modalities: List[str],
         problem_type: str,
+        schema_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         space: Dict[str, Any] = deepcopy(base_space or {})
         dataset_size = int(max(0, dataset_size))
@@ -48,6 +49,16 @@ class AdaptiveOptunaController:
                 "high": 0.2,
             }
 
+        # Contrastive weight: let HPO discover the right value rather than hardcoding 0.1.
+        # Kept at 0.0 lower bound so Optuna can discover "no contrastive loss" is optimal
+        # for non-paired datasets.
+        if n_modalities >= 2 and "contrastive_weight" not in space:
+            space["contrastive_weight"] = {
+                "type": "float",
+                "low": 0.0,
+                "high": 0.3,
+            }
+
         if n_modalities >= 2 and "modality_dropout_prob" not in space:
             space["modality_dropout_prob"] = {
                 "type": "float",
@@ -55,20 +66,72 @@ class AdaptiveOptunaController:
                 "high": 0.30,
             }
 
+        # batch_size must be tuned jointly with learning_rate (linear scaling rule).
+        if "batch_size" not in space:
+            if dataset_size <= 5_000:
+                space["batch_size"] = {"type": "categorical", "choices": [16, 32, 64]}
+            elif dataset_size <= 50_000:
+                space["batch_size"] = {"type": "categorical", "choices": [32, 64, 128]}
+            else:
+                space["batch_size"] = {"type": "categorical", "choices": [64, 128, 256]}
+
+        # fusion_strategy: actual Optuna parameter so HPO can discover that gated
+        # outperforms uncertainty for a specific dataset within the trial budget.
+        if n_modalities >= 2 and "fusion_strategy" not in space and schema_info is not None:
+            try:
+                from modelss.fusion import select_fusion_strategy
+                _recommended = select_fusion_strategy(schema_info)
+                _alternatives: Dict[str, List[str]] = {
+                    "ula":             ["ula", "attention"],
+                    "graph":           ["graph", "attention"],
+                    "uncertainty":     ["uncertainty", "attention", "gated"],
+                    "fusemoe":         ["fusemoe", "gated", "attention"],
+                    "gated":           ["gated", "attention", "uncertainty"],
+                    "complementarity": ["complementarity", "fusemoe", "attention"],
+                    "structural_semantic": ["structural_semantic", "complementarity"],
+                }
+                _choices = _alternatives.get(_recommended, [_recommended, "attention"])
+                if len(_choices) > 1:
+                    space["fusion_strategy"] = {"type": "categorical", "choices": _choices}
+            except Exception:
+                pass
+
         return space
 
-    def suggest_trial_count(self, dataset_size: int, gpu_available: bool) -> int:
+    def suggest_trial_count(
+        self,
+        dataset_size: int,
+        gpu_available: bool,
+        time_budget_minutes: float = 30.0,
+        n_extra_hpo_dims: int = 0,
+    ) -> int:
+        """Return trial count large enough for TPE surrogate to be meaningful (≥8).
+
+        Previously returned 2–4 which is a coin-flip, not HPO.
+        TPE needs ~10 startup trials before it builds a useful surrogate model.
+
+        ``n_extra_hpo_dims`` adds 3 trials per extra categorical/int dimension
+        beyond the base search space — e.g. ULA adds 4 extra params (latent_dim,
+        n_layers, n_heads, lora_r) so pass 4 to get adequate coverage.
+        """
         dataset_size = int(max(0, dataset_size))
         if dataset_size <= 5_000:
-            trials = 4
+            base = 25   # small data → fast trials → can afford 25
+            est_sec = 30
         elif dataset_size <= 50_000:
-            trials = 3
+            base = 20
+            est_sec = 90
         else:
-            trials = 2
+            base = 15   # large data: each trial slow, prune aggressively
+            est_sec = 300
 
         if not gpu_available:
-            trials = max(1, trials - 1)
-        return int(trials)
+            base = max(8, base // 2)
+
+        base = base + int(n_extra_hpo_dims) * 3
+
+        time_cap = int((time_budget_minutes * 60) / max(est_sec, 1))
+        return max(8, min(base, time_cap))
 
     def seed_from_warm_start(
         self,
@@ -172,58 +235,46 @@ class AdaptiveOptunaController:
                 low, high = dropout_bounds
                 overrides["dropout"] = low + (high - low) * 0.20
 
-        # G20: hard cap from recent pruned steps
-        _pruned_steps = [
-            int(t.user_attrs.get("pruned_at_step"))
-            for t in (recent_trials or [])
-            if getattr(t, "user_attrs", {}).get("pruned_at_step") is not None
-        ]
-        if _pruned_steps:
-            import numpy as _np_g20
-            _median_prune = int(_np_g20.median(_pruned_steps))
-            _upper_bound = max(int(_median_prune * 1.5), 8)
-            _epoch_spec = (hpo_space or {}).get("epochs", {})
-            _ep_min = int((_epoch_spec.get("low") or 3))
-            _ep_cap = min(int((_epoch_spec.get("high") or 40)), _upper_bound)
-            try:
-                from automl.trial_intelligence import TrialIntelligence as _TI_G20
-                _ti_g20 = _TI_G20()
-                _last_d = (feedback_state or {}).get("last_diagnostics") or {}
-                if _last_d:
-                    _ti_g20.update_memory(_last_d)
-                _suggestion = _ti_g20.estimate_epochs(
-                    base=_ep_cap,
-                    fit_type=_last_d.get("fit_type", "good"),
-                    flat_epoch=_median_prune,
-                )
-                overrides["epochs"] = int(max(_ep_min, min(_ep_cap, _suggestion)))
-                logger.info(
-                    "G20: prune-capped epochs=%d (median_prune=%d, cap=%d)",
-                    overrides["epochs"], _median_prune, _ep_cap,
-                )
-            except Exception as _g20_exc:
-                logger.debug("G20: epoch cap failed: %s", _g20_exc)
-
-        # Merge epoch suggestion from TrialIntelligence based on last diagnostics
+        # Unified epoch computation — single authoritative block.
+        # Previously two separate TrialIntelligence instances both wrote
+        # overrides["epochs"], with the second silently discarding the G20
+        # prune cap from the first. Now: one instance, G20 cap applied after.
         last_diag = (feedback_state or {}).get("last_diagnostics") or {}
         if last_diag.get("fit_type") in {"overfitting", "underfitting", "good"}:
             try:
-                from automl.trial_intelligence import TrialIntelligence
-                _ti = TrialIntelligence()
+                import numpy as _np_ep
+                from automl.trial_intelligence import TrialIntelligence as _TI
+                epoch_spec = (hpo_space or {}).get("epochs", {})
+                ep_min = int(epoch_spec.get("low", 3))
+                ep_max = int(epoch_spec.get("high", 40))
+
+                _ti = _TI()
                 _ti.update_memory(last_diag)
                 _ti_adj = _ti.adjust_hyperparams(overrides or {})
-                if "epochs" in _ti_adj:
-                    epoch_spec = (hpo_space or {}).get("epochs", {})
-                    ep_min = int(epoch_spec.get("low", 3))
-                    ep_max = int(epoch_spec.get("high", 40))
-                    overrides["epochs"] = int(max(ep_min, min(ep_max, _ti_adj["epochs"])))
+                suggestion = int(_ti_adj.get("epochs", ep_max))
+
+                # G20: cap at median_prune * 1.5 when recent trials were pruned
+                _pruned_steps = [
+                    int(t.user_attrs.get("pruned_at_step"))
+                    for t in (recent_trials or [])
+                    if getattr(t, "user_attrs", {}).get("pruned_at_step") is not None
+                ]
+                if _pruned_steps:
+                    _median_prune = int(_np_ep.median(_pruned_steps))
+                    prune_cap = min(ep_max, max(8, int(_median_prune * 1.5)))
+                    suggestion = min(suggestion, prune_cap)
                     logger.info(
-                        "AdaptiveOptunaController: epoch override -> %d (fit_type=%s)",
-                        overrides["epochs"],
-                        last_diag.get("fit_type"),
+                        "G20: epoch prune cap=%d (median_prune=%d)",
+                        prune_cap, _median_prune,
                     )
-            except Exception as _e:
-                logger.debug("AdaptiveOptunaController: epoch adaptation failed: %s", _e)
+
+                overrides["epochs"] = int(max(ep_min, min(ep_max, suggestion)))
+                logger.info(
+                    "AdaptiveOptunaController: epoch override=%d (fit_type=%s)",
+                    overrides["epochs"], last_diag.get("fit_type"),
+                )
+            except Exception as _ep_exc:
+                logger.debug("AdaptiveOptunaController: epoch adaptation failed: %s", _ep_exc)
 
         return overrides
 

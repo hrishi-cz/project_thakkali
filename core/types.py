@@ -8,24 +8,46 @@ the ExecutionContext which serves as the primary state container.
 
 from __future__ import annotations
 
+import os
+import warnings
+
 import torch
 from dataclasses import dataclass, field
 from typing import List, Optional
 from enum import Enum
 
 
+def _auto_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    msg = (
+        "CUDA unavailable — training will be ~15-20× slower on CPU. "
+        f"torch.version.cuda={getattr(torch.version, 'cuda', None)!r}. "
+        "Fix: pip install torch --index-url https://download.pytorch.org/whl/cu121"
+    )
+    if os.environ.get("APEX_REQUIRE_GPU", "0") == "1":
+        raise RuntimeError(msg)
+    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    return "cpu"
+
+
 class Phase(Enum):
     """
-    Workflow phases in the APEX/AutoVision+ pipeline.
+    Internal phases of the TrainingOrchestrator pipeline.
 
-    The 7-phase architecture:
-    1. DATA_INGESTION: Multi-source async data loading
-    2. SCHEMA_DETECTION: COGMA 6-stage column type inference
-    3. PREPROCESSING: Modality-specific transformation
-    4. MODEL_SELECTION: GPU-aware architecture search
-    5. TRAINING: Optuna HPO + Lightning training
-    6. DRIFT_DETECTION: Statistical distribution monitoring
-    7. MODEL_REGISTRY: Artifact serialization + versioning
+    These map to the paper's eight-phase description (ExecutionContext docstring)
+    as follows:
+      paper Phase 1-4 (Data Ingestion → Preprocessing Planning) are handled
+      upstream by Orchestrator before TrainingOrchestrator runs; the enum
+      below covers paper Phases 5-8.
+
+      DATA_INGESTION  = pre-run setup          (paper Phase 1)
+      SCHEMA_DETECTION= schema resolution       (paper Phase 2)
+      PREPROCESSING   = feature engineering     (paper Phases 3-4)
+      MODEL_SELECTION = JIT encoder + HPO setup (paper Phase 5)
+      TRAINING        = warm-start + Optuna + LoRA (paper Phases 6-7)
+      DRIFT_DETECTION = PSI/KS/MMD/DDM/DriftLens (paper Phase 8)
+      MODEL_REGISTRY  = artifact serialization
     """
     DATA_INGESTION = 1
     SCHEMA_DETECTION = 2
@@ -42,8 +64,13 @@ class TrainingConfig:
     Configuration for complete training workflow.
 
     This dataclass encapsulates all parameters needed to execute
-    the 7-phase training pipeline, from data ingestion through
-    model registry.
+    the 8-phase training pipeline, from data ingestion through
+    drift monitoring.
+
+    Note: TrainingOrchestrator uses VAL_SPLIT=0.10 / TEST_SPLIT=0.10
+    constants internally (stratified 80/10/10 split). The fields here
+    serve as defaults for callers that construct TrainingConfig directly;
+    update them if you change the orchestrator constants.
 
     Attributes
     ----------
@@ -56,9 +83,9 @@ class TrainingConfig:
     target_column : str | None
         Name of the target column (auto-detected if None)
     test_split : float
-        Proportion of data for test set (default: 0.2)
+        Proportion of data for held-out test set (default: 0.1, matches orchestrator)
     val_split : float
-        Proportion of training data for validation (default: 0.2)
+        Proportion of training data for validation (default: 0.1, matches orchestrator)
     seed : int
         Random seed for reproducibility (default: 42)
     device : str
@@ -68,16 +95,16 @@ class TrainingConfig:
     problem_type: str
     modalities: List[str]
     target_column: Optional[str] = None
-    test_split: float = 0.2
-    val_split: float = 0.2
+    test_split: float = 0.1
+    val_split: float = 0.1
     seed: int = 42
-    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+    device: str = field(default_factory=_auto_device)
 
 
 @dataclass
 class ModelSelectionResult:
     """
-    Result from Phase 4 model selection.
+    Result from Phase 5 (model selection) / Phase 6 (training).
 
     Captures the architecture decisions made by the AutoML engine,
     including encoder choices, fusion strategy, and hyperparameters.

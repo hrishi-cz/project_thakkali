@@ -10,6 +10,8 @@ pytorch-lightning>=2.0.0
 
 # Transformers & NLP
 transformers>=4.30.0
+sentencepiece>=0.1.99
+tokenizers>=0.13.0
 
 # Computer Vision
 pillow>=10.0.0

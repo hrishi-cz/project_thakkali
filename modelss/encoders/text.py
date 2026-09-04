@@ -28,6 +28,8 @@ Supported models (non-exhaustive)
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -35,6 +37,13 @@ import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _is_hf_cached(model_name: str) -> bool:
+    """Return True if model weights exist in the local HuggingFace cache."""
+    cache = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+    safe = model_name.replace("/", "--")
+    return (cache / "hub" / f"models--{safe}").exists()
 
 # Architectural constant – fusion layer expects exactly this dim
 TEXT_OUTPUT_DIM: int = 768
@@ -67,8 +76,50 @@ class TextEncoder(nn.Module):
         self.max_length: int = max_length
 
         # ── Transformer backbone ──────────────────────────────────────────
-        self.transformer: nn.Module = AutoModel.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _cached = _is_hf_cached(model_name)
+        # Suppress HF LOAD REPORT and update-check noise during model load.
+        # transformers.utils.logging is the canonical path across all versions.
+        _restore_verbosity = lambda: None  # noqa: E731
+        try:
+            from transformers.utils import logging as _hf_log
+            _prev_verbosity = _hf_log.get_verbosity()
+            _hf_log.set_verbosity_error()
+            _restore_verbosity = lambda: _hf_log.set_verbosity(_prev_verbosity)  # noqa: E731
+        except Exception:
+            pass
+        def _load_tokenizer(name: str, **kwargs: object) -> object:
+            """Load tokenizer; fallback to slow (use_fast=False) on any fast-tokenizer failure.
+
+            Handles tiktoken/sentencepiece/protobuf incompatibilities generically.
+            Re-raises the original exception only when slow tokenizer also fails.
+            """
+            try:
+                return AutoTokenizer.from_pretrained(name, **kwargs)
+            except Exception as _e:
+                logger.info(
+                    "TextEncoder: fast tokenizer failed for '%s' (%s: %s) — "
+                    "falling back to slow tokenizer (use_fast=False)",
+                    name, type(_e).__name__, _e,
+                )
+                try:
+                    return AutoTokenizer.from_pretrained(
+                        name, use_fast=False,
+                        **{k: v for k, v in kwargs.items() if k != "use_fast"},
+                    )
+                except Exception:
+                    raise _e  # slow also failed → surface original error
+
+        try:
+            try:
+                self.transformer: nn.Module = AutoModel.from_pretrained(
+                    model_name, local_files_only=_cached
+                )
+                self.tokenizer = _load_tokenizer(model_name, local_files_only=_cached)
+            except OSError:
+                self.transformer = AutoModel.from_pretrained(model_name)
+                self.tokenizer = _load_tokenizer(model_name)
+        finally:
+            _restore_verbosity()
 
         # GPT-2 has no pad token by default; reuse eos so that padding works
         if self.tokenizer.pad_token is None:
@@ -130,20 +181,25 @@ class TextEncoder(nn.Module):
 
     def forward(
         self,
-        texts: List[str],
+        texts: Any,
         return_all_tokens: bool = False,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
         """
         Tokenise and encode a batch of raw text strings.
 
         Parameters
         ----------
-        texts : List[str]
-            Batch of N raw text strings.
+        texts : List[str] | dict | torch.Tensor
+            Batch of N raw text strings, a HuggingFace tokenizer dict, or
+            pre-tokenised input ids.
         return_all_tokens : bool
             False (default): return pooled sentence embedding ``(N, 768)``.
             True: return full last-hidden-state ``(N, T, hidden_size)`` for
             use by ``UnifiedLatentFusion`` token-sequence mode.
+        output_attentions : bool
+            True: return the full HuggingFace output object with attention
+            tensors for XAI callers.
 
         Returns
         -------
@@ -155,18 +211,42 @@ class TextEncoder(nn.Module):
         device: torch.device = next(self.transformer.parameters()).device
 
         # ── Tokenise ─────────────────────────────────────────────────────
-        encoded: Dict[str, torch.Tensor] = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
+        if isinstance(texts, dict):
+            encoded: Dict[str, torch.Tensor] = {
+                k: v
+                for k, v in texts.items()
+                if isinstance(v, torch.Tensor)
+            }
+        elif torch.is_tensor(texts):
+            input_ids = texts.long()
+            if input_ids.ndim == 1:
+                input_ids = input_ids.unsqueeze(0)
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = 0
+            encoded = {
+                "input_ids": input_ids,
+                "attention_mask": (input_ids != int(pad_id)).long(),
+            }
+        else:
+            encoded = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
         # Move tokeniser outputs to the model device
         encoded = {k: v.to(device) for k, v in encoded.items()}
 
         # ── Transformer forward ──────────────────────────────────────────
-        outputs = self.transformer(**encoded)
+        outputs = self.transformer(
+            **encoded,
+            output_attentions=bool(output_attentions),
+            return_dict=True,
+        )
+        if output_attentions:
+            return outputs
         last_hidden: torch.Tensor = outputs.last_hidden_state  # (N, seq, hidden)
 
         # ── Token-sequence mode (for ULA cross-modal fusion) ─────────────
@@ -201,3 +281,139 @@ class TextEncoder(nn.Module):
     def get_output_dim(self) -> int:
         """Return the fixed output dimensionality (768)."""
         return TEXT_OUTPUT_DIM
+
+
+# ---------------------------------------------------------------------------
+# CLIP Text Encoder (77-token BPE, 512-dim CLIP joint space)
+# ---------------------------------------------------------------------------
+
+class CLIPTextEncoder(nn.Module):
+    """
+    CLIP text encoder producing 512-dim embeddings in the CLIP joint latent space.
+
+    Max context: 77 BPE tokens (hard CLIP limit — do NOT use for long sequences).
+    Use only for short meme captions (typically ≤ 40 tokens).
+
+    Encoder family: "clip" — MUST be paired with a CLIP vision encoder.
+    Pairing with SigLIP vision encoder will cause latent space misalignment.
+    """
+
+    ENCODER_FAMILY: str = "clip"
+
+    def __init__(
+        self,
+        model_name: str = "openai/clip-vit-base-patch16",
+        freeze_backbone: bool = True,
+    ) -> None:
+        super().__init__()
+        self.model_name = model_name
+        self.max_length = 77
+        self._output_dim = 512
+
+        try:
+            from transformers import CLIPTextModel, CLIPTokenizer
+            _cached = _is_hf_cached(model_name)
+            try:
+                self._model = CLIPTextModel.from_pretrained(model_name, local_files_only=_cached)
+                self.tokenizer = CLIPTokenizer.from_pretrained(model_name, local_files_only=_cached)
+            except OSError:
+                self._model = CLIPTextModel.from_pretrained(model_name)
+                self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
+        except Exception as exc:
+            logger.warning("CLIPTextEncoder: failed to load '%s': %s", model_name, exc)
+            self._model = None
+            self.tokenizer = None
+
+        if self._model is not None and freeze_backbone:
+            for p in self._model.parameters():
+                p.requires_grad_(False)
+
+        logger.info("CLIPTextEncoder: model=%s  freeze=%s  output_dim=%d  max_length=%d",
+                    model_name, freeze_backbone, self._output_dim, self.max_length)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **_: Any,
+    ) -> torch.Tensor:
+        if self._model is None:
+            return torch.zeros(input_ids.shape[0], self._output_dim, device=input_ids.device)
+        out = self._model(input_ids=input_ids, attention_mask=attention_mask)
+        return out.pooler_output  # (N, 512) — CLS-equivalent in CLIP space
+
+    def get_output_dim(self) -> int:
+        return self._output_dim
+
+    def configure(self, plan: Optional[Dict[str, Any]]) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# SigLIP Text Encoder (64-token, 768-dim SigLIP joint space)
+# ---------------------------------------------------------------------------
+
+class SigLIPTextEncoder(nn.Module):
+    """
+    SigLIP text encoder producing 768-dim embeddings in the SigLIP joint latent space.
+
+    Max context: 64 tokens. Trained with per-pair sigmoid loss (not softmax NT-Xent),
+    making it more stable at small batch sizes.
+
+    Encoder family: "siglip" — MUST be paired with a SigLIP vision encoder.
+    Pairing with CLIP vision encoder will cause latent space misalignment.
+    """
+
+    ENCODER_FAMILY: str = "siglip"
+
+    def __init__(
+        self,
+        model_name: str = "google/siglip-base-patch16-224",
+        freeze_backbone: bool = True,
+    ) -> None:
+        super().__init__()
+        self.model_name = model_name
+        self.max_length = 64
+        self._output_dim = 768
+
+        try:
+            from transformers import SiglipTextModel, AutoTokenizer
+            _cached = _is_hf_cached(model_name)
+            try:
+                self._model = SiglipTextModel.from_pretrained(model_name, local_files_only=_cached)
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=_cached)
+            except OSError:
+                self._model = SiglipTextModel.from_pretrained(model_name)
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            # Detect actual hidden size
+            hidden = getattr(self._model.config, "hidden_size", 768)
+            if isinstance(hidden, int) and hidden > 0:
+                self._output_dim = hidden
+        except Exception as exc:
+            logger.warning("SigLIPTextEncoder: failed to load '%s': %s", model_name, exc)
+            self._model = None
+            self.tokenizer = None
+
+        if self._model is not None and freeze_backbone:
+            for p in self._model.parameters():
+                p.requires_grad_(False)
+
+        logger.info("SigLIPTextEncoder: model=%s  freeze=%s  output_dim=%d  max_length=%d",
+                    model_name, freeze_backbone, self._output_dim, self.max_length)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **_: Any,
+    ) -> torch.Tensor:
+        if self._model is None:
+            return torch.zeros(input_ids.shape[0], self._output_dim, device=input_ids.device)
+        out = self._model(input_ids=input_ids, attention_mask=attention_mask)
+        return out.pooler_output  # (N, 768)
+
+    def get_output_dim(self) -> int:
+        return self._output_dim
+
+    def configure(self, plan: Optional[Dict[str, Any]]) -> None:
+        pass

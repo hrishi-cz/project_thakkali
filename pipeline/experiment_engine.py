@@ -92,12 +92,46 @@ class ExperimentManager:
             config_overrides=dict(condition.config_overrides),
         )
 
+    @staticmethod
+    def _vram_cleanup(orchestrator: Optional[Any]) -> None:
+        """Aggressively free GPU memory after each ablation condition.
+
+        Without this, each run accumulates:
+        - ApexLightningModule (~200MB–2GB depending on fusion strategy)
+        - Frozen JIT encoders: BERT ~1.5GB, ResNet ~200MB, ViT ~700MB
+        - PyTorch computation graphs kept alive by cyclic references
+        Runs 3–4 OOM-crash without explicit cleanup.
+        """
+        import gc
+        if orchestrator is not None:
+            # Sever the largest object references explicitly before del
+            for attr in (
+                "best_lightning_module",
+                "torch_dataset", "train_torch_dataset", "val_torch_dataset",
+                "fitted_transformers",
+            ):
+                try:
+                    setattr(orchestrator, attr, None)
+                except Exception:
+                    pass
+            del orchestrator
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        gc.collect()  # second pass after CUDA cleanup
+
     def run_ablations(self, conditions: Optional[List[AblationCondition]] = None) -> List[AblationCondition]:
         selected = [self._clone_condition(c) for c in (conditions or PREDEFINED_ABLATIONS)]
 
         for condition in selected:
             logger.info("ExperimentManager: running ablation '%s'", condition.name)
             t0 = time.perf_counter()
+            orchestrator: Optional[Any] = None
             try:
                 cfg_dict = asdict(self._base_config)
                 config_fields = set(TrainingConfig.__dataclass_fields__.keys())
@@ -136,6 +170,8 @@ class ExperimentManager:
                 condition.error = str(exc)
             finally:
                 condition.duration_s = round(time.perf_counter() - t0, 2)
+                self._vram_cleanup(orchestrator)
+                orchestrator = None
 
             self._results.append(condition)
 

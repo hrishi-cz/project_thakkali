@@ -109,9 +109,21 @@ class PipelineOrchestrator:
         if image_cols:
             modalities.append("image")
 
+        def _id_like(col: str, series) -> bool:
+            """High-cardinality numeric column that's almost certainly an identifier."""
+            try:
+                return (
+                    any(kw in str(col).lower() for kw in ("id", "index", "key", "_no"))
+                    and series.nunique() / max(1, len(series)) > 0.8
+                )
+            except Exception:
+                return False
+
         tabular_cols = [
             col for col in df.columns
-            if col != target_col and pd.api.types.is_numeric_dtype(df[col])
+            if col != target_col
+            and pd.api.types.is_numeric_dtype(df[col])
+            and not _id_like(col, df[col])   # exclude IDs before schema detection
         ]
         if not tabular_cols and "tabular" in modalities:
             modalities.remove("tabular")
@@ -829,6 +841,11 @@ class PipelineOrchestrator:
                 avg_image_dataset_size = sum(image_size_vals) / len(image_size_vals)
             if image_sep_vals:
                 mean_image_separability = sum(image_sep_vals) / len(image_sep_vals)
+            else:
+                # No image separability computed (encoder absent).
+                # Default to 0.5 (neutral) so preprocessing planner doesn't
+                # incorrectly trigger Strong augmentation via the < 0.4 threshold.
+                mean_image_separability = 0.5
             if image_balance_vals:
                 mean_image_class_balance = sum(image_balance_vals) / len(image_balance_vals)
             if uncertainty_vals:
@@ -912,13 +929,14 @@ class PipelineOrchestrator:
                 "grn" if (total_features > 32 or mean_uncertainty > 0.25) else "mlp"
             )
 
-        # --- Encoder output dims ---
-        if total_features > 200:
-            ctx.encoder_output_dims["tabular"] = 64
-        elif total_features < 10 and total_features > 0:
-            ctx.encoder_output_dims["tabular"] = 8
-        else:
-            ctx.encoder_output_dims["tabular"] = 16
+        # --- Encoder output dims (only when tabular modality is actually present) ---
+        if "tabular" in modalities:
+            if total_features > 200:
+                ctx.encoder_output_dims["tabular"] = 64
+            elif total_features < 10:
+                ctx.encoder_output_dims["tabular"] = 8
+            else:
+                ctx.encoder_output_dims["tabular"] = 16
 
         # Scale text encoder dim by average sequence length
         if "text" in modalities:

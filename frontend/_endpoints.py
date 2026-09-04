@@ -214,6 +214,36 @@ def choose_primary_dataset(sid: str) -> str:
     return f"{API_BASE_URL}/v2/sessions/{sid}/choose-primary-dataset"
 
 
+def model_rename(model_id: str) -> str:
+    """Build ``/model-registry/{model_id}/rename`` URL."""
+    return f"{API_BASE_URL}/model-registry/{model_id}/rename"
+
+
+def model_download(model_id: str) -> str:
+    """Build ``/model-registry/{model_id}/download`` URL."""
+    return f"{API_BASE_URL}/model-registry/{model_id}/download"
+
+
+def model_export_onnx(model_id: str) -> str:
+    """Build ``/model-registry/{model_id}/export-onnx`` URL."""
+    return f"{API_BASE_URL}/model-registry/{model_id}/export-onnx"
+
+
+def adopt_model(sid: str) -> str:
+    """Build ``/v2/sessions/{sid}/adopt-model`` URL."""
+    return f"{API_BASE_URL}/v2/sessions/{sid}/adopt-model"
+
+
+def model_xai_heatmap(model_id: str) -> str:
+    """Build ``/models/{model_id}/xai/heatmap`` URL."""
+    return f"{API_BASE_URL}/models/{model_id}/xai/heatmap"
+
+
+def compute_budget(model_id: str) -> str:
+    """Build ``/intelligence/compute-budget/{model_id}`` URL."""
+    return f"{API_BASE_URL}/intelligence/compute-budget/{model_id}"
+
+
 # ---------------------------------------------------------------------------
 # Convenience namespace (use as ep.intelligence(sid) etc.)
 # ---------------------------------------------------------------------------
@@ -272,6 +302,12 @@ class _Endpoints:
     override_global_target       = staticmethod(override_global_target)
     active_model                 = staticmethod(active_model)
     choose_primary_dataset       = staticmethod(choose_primary_dataset)
+    model_rename                 = staticmethod(model_rename)
+    model_download               = staticmethod(model_download)
+    model_export_onnx            = staticmethod(model_export_onnx)
+    adopt_model                  = staticmethod(adopt_model)
+    model_xai_heatmap            = staticmethod(model_xai_heatmap)
+    compute_budget               = staticmethod(compute_budget)
 
 
 ep = _Endpoints()
